@@ -30,8 +30,12 @@ use crate::types::{GearRun, GpsPoint, Route, RouteAggregates, RouteSummary, Stor
 pub const DEFAULT_DATA_PATH: &str = "/backingfiles/drive-data.db";
 
 /// JSON staging mirror — regenerated on demand by `ExportJSONForSync` so
-/// `post-archive-process.sh` can ship it to the archive server.
-pub const DEFAULT_JSON_MIRROR_PATH: &str = "/mutable/drive-data.json";
+/// `post-archive-process.sh` can ship it to the archive server. Lives on
+/// `/backingfiles` (same partition as the DB) because the export can
+/// reach hundreds of MB on a long-used Pi and the 2 GB `/mutable` partition
+/// can't hold two copies during atomic write. The local copy is retained
+/// after upload so rsync's delta-transfer protocol only sends changed bytes.
+pub const DEFAULT_JSON_MIRROR_PATH: &str = "/backingfiles/drive-data.json";
 
 /// Pre-SQLite data file on the read-only root. The JSON importer reads
 /// this on first boot if the primary mirror is missing.
@@ -51,11 +55,51 @@ pub const ARCHIVE_DATA_PATH: &str = "/mnt/archive/drive-data.json";
 const DRIVE_LIST_CACHE_ALGO_VERSION: &str = "3";
 
 /// Ordered list of paths the one-shot importer checks on first boot.
-/// The first that exists wins.
+/// The first that exists wins. `/mutable/drive-data.json` is kept as a
+/// fallback so upgraders whose DB is still empty (mid-migration) still
+/// get their legacy export imported — once the marker is set, this list
+/// never runs again, and `cleanup_legacy_mutable_files` clears the
+/// orphaned file in the steady-state.
 pub const IMPORT_SOURCE_CANDIDATES: &[&str] = &[
-    DEFAULT_JSON_MIRROR_PATH, // /mutable/drive-data.json
-    LEGACY_JSON_PATH,         // /root/drive-data.json
+    DEFAULT_JSON_MIRROR_PATH,        // /backingfiles/drive-data.json (new canonical)
+    "/mutable/drive-data.json",      // legacy pre-2026-05 location (upgrade fallback)
+    LEGACY_JSON_PATH,                // /root/drive-data.json (pre-SQLite)
 ];
+
+/// Files this binary used to write under `/mutable` that are now obsolete.
+/// Removed once at startup so the small `/mutable` partition doesn't carry
+/// stale megabytes across upgrades. Order doesn't matter; each is best-effort.
+const LEGACY_MUTABLE_ORPHANS: &[&str] = &[
+    "/mutable/drive-data.json",            // moved to /backingfiles/drive-data.json
+    "/mutable/drive-data.json.tmp",        // half-written atomic-rename leftover
+    "/mutable/.notification_history.json", // pre-Rust notification queue
+    "/mutable/sentryusb-prefs.json",       // pre-Rust preferences file
+];
+
+/// Remove orphaned `/mutable` files left behind by older binaries that wrote
+/// state to paths since moved to `/backingfiles`. Best-effort and idempotent:
+/// missing files are silently skipped, removal failures are logged but never
+/// abort startup. Safe to call on every boot. Sized so calling once at startup
+/// is enough to keep the 2 GB `/mutable` partition stable across upgrades.
+pub fn cleanup_legacy_mutable_files() {
+    use std::path::Path;
+    for path in LEGACY_MUTABLE_ORPHANS {
+        if !Path::new(path).exists() {
+            continue;
+        }
+        match std::fs::remove_file(path) {
+            Ok(()) => tracing::info!(
+                "cleanup_legacy_mutable_files: removed orphaned {}",
+                path
+            ),
+            Err(e) => tracing::warn!(
+                "cleanup_legacy_mutable_files: failed to remove {}: {}",
+                path,
+                e
+            ),
+        }
+    }
+}
 
 /// Drive data store.
 pub struct DriveStore {
@@ -538,7 +582,7 @@ impl DriveStore {
         Ok(())
     }
 
-    /// Regenerate the canonical `/mutable/drive-data.json` mirror for
+    /// Regenerate the canonical `/backingfiles/drive-data.json` mirror for
     /// `post-archive-process.sh`. Idempotent; safe alongside reads.
     pub fn export_json_for_sync(&self) -> Result<()> {
         self.export_json_to_file(DEFAULT_JSON_MIRROR_PATH)
@@ -661,7 +705,7 @@ impl DriveStore {
         )
     }
 
-    /// Copy `/mnt/archive/drive-data.json` to `/mutable/drive-data.json`
+    /// Copy `/mnt/archive/drive-data.json` to `/backingfiles/drive-data.json`
     /// so the next `Load()` picks it up via the one-shot importer.
     /// Useful after reflashing a Pi that still has an archive backup.
     pub fn restore_from_archive(&self) -> Result<()> {

@@ -36,6 +36,12 @@ function log() {
 DRIVE_DATA_SYNC_CACHE="/mutable/.drive-data-last-sync"
 DRIVE_DATA_SYNC_MIN_THRESHOLD=$((10 * 1024 * 1024)) # 10 MB
 
+# Local path of the regenerated drive-data.json mirror. Lives on /backingfiles
+# alongside the SQLite DB so the 2 GB /mutable partition can't be filled by
+# the export (which can reach hundreds of MB on a long-used Pi). Kept after
+# upload so rsync's delta-transfer protocol only ships changed bytes each cycle.
+DRIVE_DATA_JSON="/backingfiles/drive-data.json"
+
 # drive_data_size_guard_ok <local_file> <destination_label>
 # Returns 0 (allow) if the sync may proceed, 1 (refuse) otherwise.
 # On refuse, logs the reason and sends a mobile notification.
@@ -78,7 +84,7 @@ function drive_data_size_guard_ok() {
   log "SIZE GUARD: refusing ${dest_label} sync — new=${new_size} bytes < 50% of last-good=${last_size} bytes. Local file may be corrupted; archive preserved."
   if [ -x /root/bin/send-push-message ]; then
     /root/bin/send-push-message "${NOTIFICATION_TITLE:-SentryUSB}:" \
-      "Drive data sync blocked — local file shrunk to $((new_size / 1024 / 1024)) MB from $((last_size / 1024 / 1024)) MB. Archive backup preserved. Check /mutable/drive-data.json." \
+      "Drive data sync blocked — local file shrunk to $((new_size / 1024 / 1024)) MB from $((last_size / 1024 / 1024)) MB. Archive backup preserved. Check ${DRIVE_DATA_JSON}." \
       warning drives > /dev/null 2>&1 || true
   fi
   return 1
@@ -261,10 +267,11 @@ if [ -x /root/bin/archive-is-reachable.sh ]; then
   fi
 fi
 
-# Regenerate /mutable/drive-data.json from the SQLite store before any
-# remote sync. Post-SQLite-migration the live store is /mutable/drive-data.db
-# and the JSON file is rebuilt on demand for archive consumers (Sentry
-# Studio reads the archive-side JSON copy).
+# Regenerate the drive-data.json mirror from the SQLite store before any
+# remote sync. The canonical live store is /backingfiles/drive-data.db; the
+# JSON file at $DRIVE_DATA_JSON (/backingfiles/drive-data.json) is rebuilt
+# on demand for archive consumers — Sentry Studio reads the archive-side
+# JSON copy, not the Pi-local one.
 #
 # On older binaries that don't yet expose /api/drives/data/export-for-sync
 # this is a no-op (curl returns non-zero) and the rsync/rclone blocks
@@ -276,7 +283,7 @@ if [ "$ARCHIVE_REACHABLE" = "true" ] && { [ -n "${RSYNC_SERVER:-}" ] || [ -n "${
     EXPORT_BYTES=$(echo "$EXPORT_RESULT" | grep -o '"bytes":[0-9]*' | cut -d: -f2)
     log "Regenerated drive-data.json mirror (${EXPORT_BYTES:-?} bytes)."
   else
-    log "Note: export-for-sync endpoint unavailable; shipping existing /mutable/drive-data.json (pre-SQLite binary?)."
+    log "Note: export-for-sync endpoint unavailable; shipping existing ${DRIVE_DATA_JSON} (pre-SQLite binary?)."
   fi
 fi
 
@@ -287,14 +294,14 @@ fi
 #
 # Size-guard: refuse if local file is dramatically smaller than the last
 # successful sync (see drive_data_size_guard_ok above).
-if [ "$ARCHIVE_REACHABLE" = "true" ] && [ -n "${RSYNC_SERVER:-}" ] && [ -n "${RSYNC_USER:-}" ] && [ -f /mutable/drive-data.json ]; then
-  if drive_data_size_guard_ok /mutable/drive-data.json "rsync archive"; then
+if [ "$ARCHIVE_REACHABLE" = "true" ] && [ -n "${RSYNC_SERVER:-}" ] && [ -n "${RSYNC_USER:-}" ] && [ -f "$DRIVE_DATA_JSON" ]; then
+  if drive_data_size_guard_ok "$DRIVE_DATA_JSON" "rsync archive"; then
     log "Syncing drive-data.json to rsync archive..."
     if rsync -avh --no-perms --omit-dir-times --timeout=60 \
-        /mutable/drive-data.json \
+        "$DRIVE_DATA_JSON" \
         "$RSYNC_USER@$RSYNC_SERVER:${RSYNC_PATH}/drive-data.json" > /dev/null 2>&1; then
-      log "Synced drive-data.json to archive ($(wc -c < /mutable/drive-data.json) bytes)."
-      update_drive_data_sync_cache /mutable/drive-data.json
+      log "Synced drive-data.json to archive ($(wc -c < "$DRIVE_DATA_JSON") bytes)."
+      update_drive_data_sync_cache "$DRIVE_DATA_JSON"
     else
       log "Warning: failed to sync drive-data.json to rsync archive."
     fi
@@ -302,13 +309,13 @@ if [ "$ARCHIVE_REACHABLE" = "true" ] && [ -n "${RSYNC_SERVER:-}" ] && [ -n "${RS
 fi
 
 # For rclone archive (no local mount; rclone pushes directly to cloud storage).
-if [ "$ARCHIVE_REACHABLE" = "true" ] && [ -n "${RCLONE_DRIVE:-}" ] && [ -f /mutable/drive-data.json ]; then
-  if drive_data_size_guard_ok /mutable/drive-data.json "rclone archive"; then
+if [ "$ARCHIVE_REACHABLE" = "true" ] && [ -n "${RCLONE_DRIVE:-}" ] && [ -f "$DRIVE_DATA_JSON" ]; then
+  if drive_data_size_guard_ok "$DRIVE_DATA_JSON" "rclone archive"; then
     log "Syncing drive-data.json to rclone archive..."
     if rclone --config /root/.config/rclone/rclone.conf copy \
-        /mutable/drive-data.json "$RCLONE_DRIVE:${RCLONE_PATH}/drive-data.json" > /dev/null 2>&1; then
-      log "Synced drive-data.json to rclone archive ($(wc -c < /mutable/drive-data.json) bytes)."
-      update_drive_data_sync_cache /mutable/drive-data.json
+        "$DRIVE_DATA_JSON" "$RCLONE_DRIVE:${RCLONE_PATH}/drive-data.json" > /dev/null 2>&1; then
+      log "Synced drive-data.json to rclone archive ($(wc -c < "$DRIVE_DATA_JSON") bytes)."
+      update_drive_data_sync_cache "$DRIVE_DATA_JSON"
     else
       log "Warning: failed to sync drive-data.json to rclone archive."
     fi

@@ -157,6 +157,11 @@ async fn main() {
             Arc::new(sentryusb_drives::DriveStore::open_memory().expect("failed to create in-memory DB"))
         }
     };
+    // Remove orphaned files older binaries wrote to /mutable (drive-data.json
+    // moved to /backingfiles, plus a couple of pre-Rust state files). Runs
+    // after DriveStore::open so any one-shot importer that needs the legacy
+    // path has already had a chance to consume it.
+    sentryusb_drives::cleanup_legacy_mutable_files();
     phase!("drive_store_opened");
 
     // Legacy-JSON migration is now handled automatically inside
