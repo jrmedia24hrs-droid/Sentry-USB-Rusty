@@ -278,9 +278,22 @@ pub fn disable() -> Result<()> {
     let cfg_strings = cfg_dir.join(format!("strings/{}", LANG));
     let _ = fs::remove_dir(&cfg_strings);
 
-    // Remove all LUNs (lun.0 through lun.4)
+    // Remove the non-default LUNs (lun.1 through lun.4). lun.0 is the
+    // *implicit* default LUN that the mass_storage function creates as part of
+    // its own configfs node — on most kernels `rmdir lun.0` returns EBUSY/ENOTEMPTY
+    // and the kernel only releases lun.0 when the parent `mass_storage.0` is
+    // removed. The shell-script reference at `run/disable_gadget.sh:23-26` skips
+    // lun.0 for exactly this reason.
+    //
+    // Previously this iterated `0..=4`. The rmdir on lun.0 silently failed (the
+    // result was discarded), but that left lun.0 sitting under `mass_storage.0`,
+    // which made the subsequent `rmdir mass_storage.0` fail, which made the
+    // gadget-root rmdir fail, which left configfs pinning `libcomposite`. The
+    // next `enable()` would then log "Module libcomposite is in use" from
+    // `modprobe -r` and bail out without rebuilding — so the web-UI toggle
+    // appeared to error out and only a reboot could unstick it.
     let func_dir = gadget.join("functions/mass_storage.0");
-    for i in 0..=4 {
+    for i in 1..=4 {
         let _ = fs::remove_dir(func_dir.join(format!("lun.{}", i)));
     }
     let _ = fs::remove_dir(&func_dir);
