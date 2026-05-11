@@ -115,9 +115,18 @@ pub fn enable() -> Result<()> {
         disable()?;
     }
 
-    // Load the composite module
+    // Load the composite module AND the mass_storage function module.
+    // Listing both is necessary because `disable()` unloads
+    // `usb_f_mass_storage` at the end of every teardown, and on Pi 5 /
+    // Linux 6.12 the kernel's request_module auto-load *doesn't*
+    // reliably re-trigger when we mkdir `functions/mass_storage.0`
+    // below — so the mkdir fails with ENOENT and the rest of the
+    // rebuild path silently bails out, leaving the gadget half-built
+    // (configs/strings present, functions/ empty). The shell
+    // `enable_gadget.sh:25` happens to work at boot only because the
+    // function module is still loaded from initramfs at that point.
     let _ = std::process::Command::new("modprobe")
-        .arg("libcomposite")
+        .args(["libcomposite", "usb_f_mass_storage"])
         .status();
 
     // Create gadget directory structure
