@@ -43,6 +43,31 @@ fn write_file(path: &Path, content: &str) -> Result<()> {
         .with_context(|| format!("failed to write {}", path.display()))
 }
 
+/// Create `link -> target`, replacing any stale entry at `link` first.
+/// Uses `symlink_metadata()` (which does NOT follow symlinks) so a dangling
+/// symlink — e.g. a previous `disable()` left `configs/c.1/mass_storage.0`
+/// pointing at a now-torn-down `functions/mass_storage.0` — is detected and
+/// removed instead of triggering EEXIST on the recreate. The plain
+/// `Path::exists()` check this replaces returned `false` for dangling links
+/// because it follows the link to the missing target, then `symlink()` would
+/// fail because the link path itself still exists.
+#[cfg(unix)]
+fn ensure_symlink(target: &Path, link: &Path) -> Result<()> {
+    match link.symlink_metadata() {
+        Ok(_) => fs::remove_file(link)
+            .with_context(|| format!("failed to remove stale symlink {}", link.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("failed to stat {}", link.display())),
+    }
+    std::os::unix::fs::symlink(target, link)
+        .with_context(|| format!("failed to symlink {} -> {}", link.display(), target.display()))
+}
+
+#[cfg(not(unix))]
+fn ensure_symlink(_target: &Path, _link: &Path) -> Result<()> {
+    bail!("USB gadget control requires Linux")
+}
+
 /// Get the SBC model and return the appropriate MaxPower value (mA).
 fn get_max_power() -> u32 {
     let model = fs::read_to_string("/proc/device-tree/model").unwrap_or_default();
@@ -131,7 +156,8 @@ pub fn enable() -> Result<()> {
 
     // Create gadget directory structure
     let cfg_dir = gadget.join(format!("configs/{}.1", CFG));
-    fs::create_dir_all(&cfg_dir)?;
+    fs::create_dir_all(&cfg_dir)
+        .with_context(|| format!("failed to create {}", cfg_dir.display()))?;
 
     // Common USB descriptor setup
     write_file(&gadget.join("idVendor"), "0x1d6b")?;  // Linux Foundation
@@ -141,9 +167,11 @@ pub fn enable() -> Result<()> {
 
     // String descriptors
     let strings_dir = gadget.join(format!("strings/{}", LANG));
-    fs::create_dir_all(&strings_dir)?;
+    fs::create_dir_all(&strings_dir)
+        .with_context(|| format!("failed to create {}", strings_dir.display()))?;
     let cfg_strings = gadget.join(format!("configs/{}.1/strings/{}", CFG, LANG));
-    fs::create_dir_all(&cfg_strings)?;
+    fs::create_dir_all(&cfg_strings)
+        .with_context(|| format!("failed to create {}", cfg_strings.display()))?;
 
     write_file(&strings_dir.join("serialnumber"), &get_machine_serial())?;
     write_file(&strings_dir.join("manufacturer"), "SentryUSB")?;
@@ -158,7 +186,8 @@ pub fn enable() -> Result<()> {
 
     // Mass storage function with LUNs for each disk image
     let func_dir = gadget.join("functions/mass_storage.0");
-    fs::create_dir_all(&func_dir)?;
+    fs::create_dir_all(&func_dir)
+        .with_context(|| format!("failed to create {}", func_dir.display()))?;
 
     let mut lun = 0;
     for (image_path, label) in DISK_IMAGES {
@@ -168,7 +197,8 @@ pub fn enable() -> Result<()> {
             // kernel's configfs version, lun.0 is NOT guaranteed to be
             // auto-created when the mass_storage function is instantiated.
             // Writing to `lun.0/file` before the dir exists silently fails.
-            fs::create_dir_all(&lun_dir)?;
+            fs::create_dir_all(&lun_dir)
+                .with_context(|| format!("failed to create lun.{} at {}", lun, lun_dir.display()))?;
             write_file(&lun_dir.join("file"), image_path)?;
 
             // Get file size for inquiry string
@@ -184,14 +214,11 @@ pub fn enable() -> Result<()> {
         }
     }
 
-    // Link the function to the configuration
-    let link_target = cfg_dir.join("mass_storage.0");
-    if !link_target.exists() {
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&func_dir, &link_target)?;
-        #[cfg(not(unix))]
-        bail!("USB gadget control requires Linux");
-    }
+    // Link the function to the configuration. `ensure_symlink` handles the
+    // dangling-symlink case where a previous teardown left the link pointing
+    // at a no-longer-existent function dir — plain `Path::exists` returned
+    // false for that and led to EEXIST on the recreate.
+    ensure_symlink(&func_dir, &cfg_dir.join("mass_storage.0"))?;
 
     info!("USB gadget configured with {} LUN(s)", lun);
     bind_udc(&gadget)
@@ -335,6 +362,17 @@ pub fn disable() -> Result<()> {
         .args(["-r", "usb_f_mass_storage", "g_ether", "usb_f_ecm", "usb_f_rndis", "libcomposite"])
         .status();
 
+    // Best-effort teardown — every rmdir above used `let _ =`, so residue
+    // from kernel-version-specific quirks (lun.0 implicit-default behavior,
+    // cascade timing) is invisible to the caller. Surface it in the journal
+    // so future flakes are diagnosable without code changes.
+    if gadget.exists() {
+        tracing::warn!(
+            "disable() completed but {} still present (incomplete teardown)",
+            gadget.display()
+        );
+    }
+
     info!("USB gadget disabled");
     Ok(())
 }
@@ -381,5 +419,49 @@ fn format_size(bytes: u64) -> String {
         format!("{}K", bytes / 1024)
     } else {
         format!("{}B", bytes)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ensure_symlink_creates_fresh_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        fs::create_dir(&target).unwrap();
+        let link = dir.path().join("link");
+        ensure_symlink(&target, &link).unwrap();
+        assert_eq!(fs::read_link(&link).unwrap(), target);
+    }
+
+    #[test]
+    fn ensure_symlink_replaces_valid_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        fs::create_dir(&target).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        ensure_symlink(&target, &link).unwrap();
+        assert_eq!(fs::read_link(&link).unwrap(), target);
+    }
+
+    #[test]
+    fn ensure_symlink_replaces_dangling_link() {
+        // Exact regression scenario for the EEXIST bug: a previous teardown
+        // left the symlink pointing at a function dir that no longer exists.
+        // Plain `Path::exists()` follows the link and returns false, the old
+        // code then called `symlink()` which failed with EEXIST. With
+        // symlink_metadata-based detection we replace it instead.
+        let dir = tempfile::tempdir().unwrap();
+        let stale_target = dir.path().join("gone");
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&stale_target, &link).unwrap();
+        assert!(!link.exists(), "dangling link should report not-existent");
+        let new_target = dir.path().join("real");
+        fs::create_dir(&new_target).unwrap();
+        ensure_symlink(&new_target, &link).unwrap();
+        assert_eq!(fs::read_link(&link).unwrap(), new_target);
     }
 }

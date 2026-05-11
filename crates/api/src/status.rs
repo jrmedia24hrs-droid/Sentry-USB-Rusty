@@ -106,8 +106,11 @@ pub async fn get_status(
         }
     }
 
-    // USB gadget status
-    if std::path::Path::new("/sys/kernel/config/usb_gadget/sentryusb").exists() {
+    // USB gadget status: report active only when UDC is bound AND lun.0 has a
+    // backing file. A bare directory-exists check reports "yes" through a
+    // partial teardown where the car has already lost the device — that drove
+    // a UI bug where the dashboard stayed green after a failed toggle.
+    if sentryusb_gadget::is_active() {
         s.drives_active = "yes".into();
     }
 
