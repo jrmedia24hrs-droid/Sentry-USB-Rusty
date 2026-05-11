@@ -269,18 +269,37 @@ pub fn disable() -> Result<()> {
         return Ok(());
     }
 
-    // Deactivate UDC
-    let _ = fs::write(gadget.join("UDC"), "");
+    // Deactivate UDC. Write a newline rather than a zero-byte string —
+    // some configfs UDC handlers reject empty writes outright. If the
+    // gadget already wasn't bound (e.g. a prior `disable()` that ran
+    // halfway through, or boot before the first enable), the kernel
+    // returns ENODEV; that's harmless and we discard it.
+    let _ = fs::write(gadget.join("UDC"), "\n");
 
-    // Remove config symlinks and string dirs
+    // Detach the function from the configuration. While this symlink exists
+    // the kernel treats the function as "in use" — LUN `file` attributes are
+    // pinned read-only with EBUSY and `rmdir functions/mass_storage.0` fails.
+    // Removing the symlink first is what unblocks the rest of the cascade.
     let cfg_dir = gadget.join(format!("configs/{}.1", CFG));
     let _ = fs::remove_file(cfg_dir.join("mass_storage.0"));
     let cfg_strings = cfg_dir.join(format!("strings/{}", LANG));
     let _ = fs::remove_dir(&cfg_strings);
 
+    // Now that the function is detached, release each LUN's backing-file
+    // handle by clearing its `file` attribute. On kernels that aggressively
+    // cascade-cleanup the function once its last symlink is removed (Pi 5
+    // / Linux 6.x), the LUN paths may already be gone — writes to
+    // non-existent paths are silently ignored. On kernels that don't
+    // cascade, this is the step that lets the LUN/function rmdirs below
+    // succeed instead of hitting EBUSY.
+    let func_dir = gadget.join("functions/mass_storage.0");
+    for i in 0..=4 {
+        let _ = fs::write(func_dir.join(format!("lun.{}/file", i)), "\n");
+    }
+
     // Remove the non-default LUNs (lun.1 through lun.4). lun.0 is the
     // *implicit* default LUN that the mass_storage function creates as part of
-    // its own configfs node — on most kernels `rmdir lun.0` returns EBUSY/ENOTEMPTY
+    // its own configfs node — on most kernels `rmdir lun.0` returns EPERM
     // and the kernel only releases lun.0 when the parent `mass_storage.0` is
     // removed. The shell-script reference at `run/disable_gadget.sh:23-26` skips
     // lun.0 for exactly this reason.
@@ -292,7 +311,6 @@ pub fn disable() -> Result<()> {
     // next `enable()` would then log "Module libcomposite is in use" from
     // `modprobe -r` and bail out without rebuilding — so the web-UI toggle
     // appeared to error out and only a reboot could unstick it.
-    let func_dir = gadget.join("functions/mass_storage.0");
     for i in 1..=4 {
         let _ = fs::remove_dir(func_dir.join(format!("lun.{}", i)));
     }
