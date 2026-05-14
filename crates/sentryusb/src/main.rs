@@ -237,10 +237,13 @@ async fn main() {
     // Add compression
     app = app.layer(CompressionLayer::new());
 
-    // Serve TeslaCam video files directly from the cam disk-image mount.
+    // Serve TeslaCam video files through the cttseraser FUSE mount, which
+    // strips the `ctts` atom from Tesla MP4s so Chromium-based browsers can
+    // play them. The setup crate (`sentryusb_setup::cttseraser_mount`) mounts
+    // it over the snapshot symlink tree at `/mutable/TeslaCam`.
     app = app.nest_service(
         "/TeslaCam",
-        tower_http::services::ServeDir::new("/mnt/cam/TeslaCam"),
+        tower_http::services::ServeDir::new("/var/www/html/TeslaCam"),
     );
 
     // Serve /fs/ for music/lightshow/boombox autofs mounts
