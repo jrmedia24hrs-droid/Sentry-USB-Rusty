@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react"
-import { Cloud, CloudOff, Loader2, Trash2, Upload } from "lucide-react"
+import { Cloud, CloudOff, Loader2, RotateCw, Trash2, Upload } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { wsClient } from "@/lib/ws"
 
@@ -30,6 +30,7 @@ export default function CloudPairingSection({ compact = false }: Props) {
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [confirmUnpair, setConfirmUnpair] = useState(false)
+  const [retrying, setRetrying] = useState(false)
 
   const sessionStartRef = useRef<{ pending: number; uploaded: number } | null>(null)
 
@@ -112,6 +113,29 @@ export default function CloudPairingSection({ compact = false }: Props) {
     try {
       await fetch("/api/cloud/pair/cancel", { method: "POST" })
     } catch {}
+  }
+
+  // Nudge the uploader to retry immediately. Used when `lastUploadError`
+  // is showing — the uploader is event-driven (fires at the end of each
+  // archive cycle), so a transient failure (server reload, network blip)
+  // can leave the queue stuck until the next clip finishes archiving.
+  // This button just calls `nudge()` on the uploader; the queued routes
+  // get another shot and the error string clears on success.
+  async function retryUpload() {
+    if (retrying) return
+    setRetrying(true)
+    setError(null)
+    try {
+      const res = await fetch("/api/cloud/upload-now", { method: "POST" })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "retry failed")
+    } finally {
+      // Brief delay so the user sees the spinner — the actual upload
+      // completes async and the cloud_upload WS event will refetch
+      // status when it lands.
+      setTimeout(() => setRetrying(false), 800)
+    }
   }
 
   async function unpair() {
@@ -261,9 +285,24 @@ export default function CloudPairingSection({ compact = false }: Props) {
             </div>
 
             {status.lastUploadError && (
-              <p className="text-[11px] text-red-400">
-                Last error: <span className="font-mono">{status.lastUploadError}</span>
-              </p>
+              <div className="flex items-start gap-2 rounded-md border border-red-500/30 bg-red-500/5 p-2">
+                <p className="flex-1 text-[11px] text-red-400">
+                  Last error: <span className="font-mono break-all">{status.lastUploadError}</span>
+                </p>
+                <button
+                  onClick={retryUpload}
+                  disabled={retrying}
+                  className="flex shrink-0 items-center gap-1 rounded-md border border-red-500/40 bg-red-500/15 px-2 py-1 text-[11px] font-medium text-red-200 hover:bg-red-500/25 disabled:opacity-50"
+                  title="Retry queued uploads now"
+                >
+                  {retrying ? (
+                    <Loader2 className="h-3 w-3 animate-spin" />
+                  ) : (
+                    <RotateCw className="h-3 w-3" />
+                  )}
+                  Retry
+                </button>
+              </div>
             )}
 
             {confirmUnpair ? (

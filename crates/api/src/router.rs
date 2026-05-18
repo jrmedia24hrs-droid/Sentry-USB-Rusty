@@ -178,9 +178,12 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/ws", get(ws_handler))
         // Memory HTML page
         .route("/memory", get(crate::memory::memory_page))
-        // SentryCloud upload pipeline (paired-Pi cloud sync). Production
-        // uploads are automatic at the tail of the archive lifecycle —
-        // the `upload-now` endpoint is dev/debug.
+        // Cloud upload pipeline (paired-Pi cloud sync). Production uploads
+        // are automatic at the tail of the archive lifecycle. `upload-now`
+        // nudges the uploader manually — wired to the Retry button in the
+        // cloud-pairing UI when `lastUploadError` is showing (uploader is
+        // event-driven, so a transient failure can leave the queue stuck
+        // until the next clip archives).
         .route("/api/cloud/status", get(crate::cloud::get_status))
         .route("/api/cloud/queue", get(crate::cloud::get_queue))
         .route("/api/cloud/pair/begin", post(crate::cloud::pair_begin))

@@ -1,5 +1,3 @@
-
-
 fn concat(parts: &[&[u8]]) -> Vec<u8> {
     let total: usize = parts.iter().map(|p| p.len()).sum();
     let mut out = Vec::with_capacity(total);

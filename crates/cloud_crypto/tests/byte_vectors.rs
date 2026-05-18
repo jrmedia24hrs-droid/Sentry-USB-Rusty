@@ -1,9 +1,7 @@
-//! Byte-for-byte parity test against the browser's `format.js`.
+//! Byte-for-byte parity test against the server-side reference implementation.
 //!
-//! `aad-vectors.json` is emitted from `SentryCloud/scripts/emit-aad-vectors.mjs`
-//! (see that file's header for re-run instructions). If the vectors here ever
-//! drift from the browser, the protocol is broken — every packet between
-//! Pi and browser will fail AEAD verification.
+//! If the vectors in `aad-vectors.json` ever drift from the server, the
+//! protocol is broken — every packet will fail AEAD verification.
 
 use serde::Deserialize;
 use sentryusb_cloud_crypto::aad;

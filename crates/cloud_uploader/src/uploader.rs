@@ -1,5 +1,3 @@
-
-
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -41,9 +39,7 @@ pub async fn run_sweep_loop(state: Arc<CloudStateInner>) {
             Ok(uploaded) if uploaded > 0 => {
                 info!("cloud sweep complete: {} routes uploaded", uploaded);
             }
-            Ok(_) => {
-
-            }
+            Ok(_) => {}
             Err(e) => {
                 warn!("cloud sweep error: {}", e);
                 let mut last_err = state.last_upload_error.lock().await;
@@ -264,9 +260,7 @@ async fn sweep_once(state: Arc<CloudStateInner>) -> Result<u32> {
                         }
                     }
                 }
-                "rejected_stale_generation" => {
-
-                }
+                "rejected_stale_generation" => {}
                 other => {
                     warn!("cloud upload: unexpected status `{}`", other);
                 }

@@ -1,5 +1,3 @@
-
-
 use ring::agreement;
 use ring::rand::{SecureRandom, SystemRandom};
 use x25519_dalek::{PublicKey as DalekPublic, StaticSecret};

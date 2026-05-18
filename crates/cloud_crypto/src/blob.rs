@@ -1,5 +1,3 @@
-
-
 use crate::errors::CryptoError;
 
 pub const VERSION: u8 = 0x01;

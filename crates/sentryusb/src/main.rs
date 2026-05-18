@@ -171,8 +171,7 @@ async fn main() {
 
     // Cloud-uploader wake channel. Threaded into Processor so do_process
     // calls notify_one() at the tail of every successful run; the cloud
-    // sweep loop is the only subscriber. See ENCRYPTION.md + project plan
-    // for the archive-lifecycle hook design.
+    // sweep loop is the only subscriber.
     let cloud_notify = Arc::new(tokio::sync::Notify::new());
 
     // Drive processor

@@ -1,5 +1,3 @@
-
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::SystemTime;
@@ -100,9 +98,7 @@ impl CloudStateInner {
                 let mut guard = self.creds.lock().await;
                 *guard = Some(creds);
             }
-            Err(_) => {
-
-            }
+            Err(_) => {}
         }
     }
 

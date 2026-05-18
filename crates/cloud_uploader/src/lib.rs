@@ -1,5 +1,3 @@
-
-
 pub mod client;
 pub mod credentials_store;
 pub mod db_ext;

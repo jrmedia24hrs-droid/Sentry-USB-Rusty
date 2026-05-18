@@ -1,5 +1,3 @@
-
-
 use std::time::Duration;
 
 use base64::Engine;

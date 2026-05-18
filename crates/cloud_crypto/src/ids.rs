@@ -1,5 +1,3 @@
-
-
 use ring::digest;
 
 use crate::errors::CredentialsError;

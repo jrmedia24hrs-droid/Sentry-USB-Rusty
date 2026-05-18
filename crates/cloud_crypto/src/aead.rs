@@ -1,5 +1,3 @@
-
-
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM, NONCE_LEN as RING_NONCE_LEN};
 use ring::rand::{SecureRandom, SystemRandom};
 

@@ -1,5 +1,3 @@
-
-
 use anyhow::{anyhow, Result};
 
 use sentryusb_cloud_crypto::credentials::CloudCredentialsV1;
