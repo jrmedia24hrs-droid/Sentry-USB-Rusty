@@ -11,9 +11,14 @@ pub struct PendingRoute {
 
 pub fn select_pending(store: &DriveStore, limit: i64) -> Result<Vec<PendingRoute>> {
     let files: Vec<(String, Option<String>)> = store.with_locked_conn(|conn| -> Result<_> {
+        // Skip Tessie-imported routes. Tessie data already lives in Tessie's
+        // service; uploading it would burn the user's cloud storage budget
+        // and the cloud has no way to distinguish it later (encrypt.rs
+        // strips `source` from the payload). NULL source = native dashcam.
         let mut stmt = conn.prepare(
             "SELECT file, cloud_route_id FROM routes \
              WHERE cloud_uploaded_at IS NULL \
+               AND (source IS NULL OR source != 'tessie') \
              ORDER BY start_ts ASC LIMIT ?1",
         )?;
         let iter = stmt.query_map(params![limit], |row| {
@@ -92,7 +97,9 @@ pub fn pending_count(store: &DriveStore) -> i64 {
     store
         .with_locked_conn(|conn| {
             conn.query_row(
-                "SELECT count(*) FROM routes WHERE cloud_uploaded_at IS NULL",
+                "SELECT count(*) FROM routes \
+                 WHERE cloud_uploaded_at IS NULL \
+                   AND (source IS NULL OR source != 'tessie')",
                 [],
                 |row| row.get::<_, i64>(0),
             )
@@ -123,6 +130,7 @@ pub fn pending_queue(store: &DriveStore, limit: i64) -> Result<Vec<QueueEntry>> 
                     updated_at \
              FROM routes \
              WHERE cloud_uploaded_at IS NULL \
+               AND (source IS NULL OR source != 'tessie') \
              ORDER BY start_ts ASC, file ASC LIMIT ?1",
         )?;
         let iter = stmt.query_map(params![limit], |row| {
