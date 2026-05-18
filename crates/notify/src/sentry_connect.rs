@@ -32,9 +32,37 @@ pub struct SendContext<'a> {
     pub device_name: Option<&'a str>,
 }
 
+/// Notification relay base URL. Resolved in this order:
+///
+/// 1. `SENTRY_NOTIFICATION_URL` env var — covers dev overrides and any
+///    systemd `EnvironmentFile=` setup.
+/// 2. `SENTRY_NOTIFICATION_URL` in `/root/sentryusb.conf` — systemd starts
+///    the binary without sourcing the config (no shell wrapper), so the
+///    env var is NOT set on a default install. Without this fallback the
+///    user's `SENTRY_NOTIFICATION_URL` is silently ignored on the send
+///    path and every push hits `notifications.sentry-six.com` regardless
+///    of what the conf says — which silently breaks third-party relays
+///    (e.g. the Android SentryConnect app's Firebase Cloud Functions).
+///    Mirrors `notification_base_url()` in `api/src/notifications.rs`
+///    and Go's `configOrDefault` (`server/api/apiconfig.go`).
+/// 3. Hardcoded default `https://notifications.sentry-six.com`.
 fn default_push_server() -> String {
-    std::env::var("SENTRY_NOTIFICATION_URL")
-        .unwrap_or_else(|_| "https://notifications.sentry-six.com".to_string())
+    if let Ok(v) = std::env::var("SENTRY_NOTIFICATION_URL") {
+        let trimmed = v.trim().trim_end_matches('/');
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    let config_path = sentryusb_config::find_config_path();
+    if let Ok((active, _)) = sentryusb_config::parse_file(config_path) {
+        if let Some(v) = active.get("SENTRY_NOTIFICATION_URL") {
+            let trimmed = v.trim().trim_end_matches('/');
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+    "https://notifications.sentry-six.com".to_string()
 }
 
 pub async fn send(
@@ -144,11 +172,15 @@ mod tests {
     fn push_server_default_is_production_url() {
         // Cross-test env mutation is unsafe on the 2024 edition + risks
         // flakiness when other tests also touch the env; just verify the
-        // fallback branch when the variable is whatever it is in test
-        // context. The assertion holds whenever the env isn't explicitly
-        // set to a non-empty override, which is the only state CI cares
-        // about anyway.
-        if std::env::var("SENTRY_NOTIFICATION_URL").is_err() {
+        // fallback branch when neither the env var nor the on-disk config
+        // overrides it. This is the only state CI cares about anyway —
+        // a host with /root/sentryusb.conf carrying SENTRY_NOTIFICATION_URL
+        // is a deployed Pi, not a build runner.
+        let env_unset = std::env::var("SENTRY_NOTIFICATION_URL").is_err();
+        let conf_unset = sentryusb_config::parse_file(sentryusb_config::find_config_path())
+            .map(|(active, _)| !active.contains_key("SENTRY_NOTIFICATION_URL"))
+            .unwrap_or(true);
+        if env_unset && conf_unset {
             assert_eq!(default_push_server(), "https://notifications.sentry-six.com");
         }
     }
