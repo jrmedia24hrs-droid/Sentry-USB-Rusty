@@ -175,9 +175,22 @@ pub fn find_drive_files(
     let groups = group_summary_clips(summaries);
 
     let pick = |idx: usize| -> Vec<String> {
+        // Dedupe parent files: when a clip's mid-clip park gap splits it
+        // across two drives, each drive's sub-clip list references the
+        // parent once; within a single drive a parent appears at most
+        // once, but the dedupe is cheap insurance against future logic
+        // changes that allow multiple sub-clips of the same parent in
+        // one drive.
+        let mut seen = std::collections::HashSet::new();
         groups[idx]
             .iter()
-            .map(|c| c.summary.file.clone())
+            .filter_map(|c| {
+                if seen.insert(c.summary.file.as_str()) {
+                    Some(c.summary.file.clone())
+                } else {
+                    None
+                }
+            })
             .collect()
     };
 
@@ -2105,11 +2118,70 @@ struct TimedSummary<'a> {
     timestamp: NaiveDateTime,
 }
 
+/// Sub-segment of a clip, produced when a clip contains internal park
+/// gaps that should split it across two or more drives. Mirrors the
+/// cloud's `{row, startFrame, endFrame, totalFrames, fraction}` shape
+/// (web/src/lib/drives/grouper.js `makeSubClip`).
+///
+/// A "whole-clip" sub-clip has `start_frame=0, end_frame=total_frames,
+/// fraction=1.0`. Aggregator multiplies per-clip aggregates by `fraction`
+/// so a clip split mid-way contributes proportionally to each drive
+/// instead of dumping the full aggregate into whichever drive it
+/// started in.
+#[derive(Clone)]
+struct SubClipSummary<'a> {
+    summary: &'a RouteSummary,
+    /// Timestamp of the START of this sub-segment. For whole-clip wraps
+    /// this is the parent clip's parsed file timestamp; for mid-clip
+    /// sub-segments it is offset by `start_frame * (60_000 ms / total_frames)`
+    /// so two sub-drives derived from the same clip get distinct, ordered
+    /// start times.
+    timestamp: NaiveDateTime,
+    /// Inclusive start frame index within the parent clip. 0 for whole clips.
+    start_frame: u32,
+    /// Exclusive end frame index within the parent clip. Equal to
+    /// `total_frames` for whole clips.
+    end_frame: u32,
+    /// Total frame count of the parent clip. 1 for clips without gear data
+    /// (so fraction stays 1.0 in the degenerate case).
+    total_frames: u32,
+    /// `(end_frame - start_frame) / total_frames`. Aggregator multiplies
+    /// time-attributable per-clip fields by this.
+    fraction: f64,
+}
+
+impl<'a> SubClipSummary<'a> {
+    /// Wrap a whole TimedSummary as a single sub-clip covering its full
+    /// length. Used when the input has no gear_runs and we fall back to
+    /// per-clip semantics.
+    fn whole(ts: TimedSummary<'a>) -> Self {
+        let total_frames = if ts.summary.gear_runs.is_empty() {
+            1
+        } else {
+            ts.summary.gear_runs.iter().map(|r| r.frames).sum::<u32>().max(1)
+        };
+        SubClipSummary {
+            summary: ts.summary,
+            timestamp: ts.timestamp,
+            start_frame: 0,
+            end_frame: total_frames,
+            total_frames,
+            fraction: 1.0,
+        }
+    }
+}
+
 /// Dedup by normalised path, parse timestamps, sort, split on 5-minute
 /// gaps, and split within clips at long Park periods. Mirrors
 /// `group_clips` but operates on summary rows that don't carry point
-/// arrays. See module-level comment for the accuracy contract.
-fn group_summary_clips<'a>(summaries: &'a [RouteSummary]) -> Vec<Vec<TimedSummary<'a>>> {
+/// arrays.
+///
+/// Returns `Vec<Vec<SubClipSummary>>` (not `Vec<Vec<TimedSummary>>`) —
+/// `split_summary_by_gear_state` slices clips with internal park gaps
+/// into sub-segments so the drive boundaries and per-drive aggregates
+/// match the cloud's `splitByGearStateSummary` exactly, instead of the
+/// pre-2026-05-18 atomic-clip approximation.
+fn group_summary_clips<'a>(summaries: &'a [RouteSummary]) -> Vec<Vec<SubClipSummary<'a>>> {
     if summaries.is_empty() {
         return Vec::new();
     }
@@ -2149,7 +2221,8 @@ fn group_summary_clips<'a>(summaries: &'a [RouteSummary]) -> Vec<Vec<TimedSummar
         time_groups.push(current);
     }
 
-    // Gear-state split, then external-signature split.
+    // Gear-state split (produces sub-clips), then external-signature
+    // split (operates on sub-clips).
     let mut groups = Vec::new();
     for tg in time_groups {
         for gear_group in split_summary_by_gear_state(tg) {
@@ -2161,10 +2234,12 @@ fn group_summary_clips<'a>(summaries: &'a [RouteSummary]) -> Vec<Vec<TimedSummar
     groups
 }
 
-/// Summary-side equivalent of `split_by_external_signature`.
+/// Summary-side equivalent of `split_by_external_signature`. Operates
+/// on sub-clips (post gear-state split) so signature buckets preserve
+/// the mid-clip park-gap slicing.
 fn split_summary_by_external_signature<'a>(
-    group: Vec<TimedSummary<'a>>,
-) -> Vec<Vec<TimedSummary<'a>>> {
+    group: Vec<SubClipSummary<'a>>,
+) -> Vec<Vec<SubClipSummary<'a>>> {
     if group.len() <= 1 {
         return vec![group];
     }
@@ -2173,9 +2248,9 @@ fn split_summary_by_external_signature<'a>(
         return vec![group];
     }
 
-    let mut buckets: std::collections::HashMap<&str, Vec<TimedSummary<'a>>> =
+    let mut buckets: std::collections::HashMap<&str, Vec<SubClipSummary<'a>>> =
         std::collections::HashMap::new();
-    let mut no_sig: Vec<TimedSummary<'a>> = Vec::new();
+    let mut no_sig: Vec<SubClipSummary<'a>> = Vec::new();
 
     for clip in group {
         match &clip.summary.external_signature {
@@ -2194,14 +2269,18 @@ fn split_summary_by_external_signature<'a>(
     result
 }
 
-/// Summary-side equivalent of `split_by_gear_state`. Since we can't chop
-/// point arrays, any clip that contains an internal long-Park run ends
-/// the current drive after its aggregates are added — the entire clip's
-/// per-clip aggregates stay with whichever drive it started in. This is
-/// the fractions-of-a-percent divergence flagged in the module header.
+/// Summary-side equivalent of `split_by_gear_state`. Slices clips with
+/// internal Park gaps into sub-segments so the resulting drives match
+/// the cloud's `splitByGearStateSummary` (web/src/lib/drives/grouper.js)
+/// — including the multi-park-gap case where one clip contributes to
+/// 3+ drives.
+///
+/// Each produced sub-clip carries `(start_frame, end_frame, fraction)`
+/// so `build_summary_from_aggregates` can fraction-scale per-clip
+/// aggregates instead of dumping the whole clip's totals into one drive.
 fn split_summary_by_gear_state<'a>(
     group: Vec<TimedSummary<'a>>,
-) -> Vec<Vec<TimedSummary<'a>>> {
+) -> Vec<Vec<SubClipSummary<'a>>> {
     if group.is_empty() {
         return Vec::new();
     }
@@ -2211,45 +2290,94 @@ fn split_summary_by_gear_state<'a>(
         return split_summary_by_gear_state_legacy(group);
     }
 
-    let mut result: Vec<Vec<TimedSummary<'a>>> = Vec::new();
-    let mut current: Vec<TimedSummary<'a>> = Vec::new();
+    let mut result: Vec<Vec<SubClipSummary<'a>>> = Vec::new();
+    let mut current: Vec<SubClipSummary<'a>> = Vec::new();
 
     for clip in group {
         let total_frames: u32 = clip.summary.gear_runs.iter().map(|r| r.frames).sum();
-        let has_park_gap = if total_frames > 0 {
-            let spf = 60.0 / total_frames as f64;
-            clip.summary.gear_runs.iter().any(|r| {
-                r.gear == GEAR_PARK
-                    && (r.frames as f64 * spf) >= PARK_GAP_SECONDS
-                    && r.frames < total_frames // park-gap must be *internal* to split
-            })
-        } else {
-            false
-        };
 
-        // Whole-clip park (all frames parked) → clip is itself a boundary;
-        // attach it to nothing and close out the current drive.
-        let all_parked = total_frames > 0
-            && clip
-                .summary
-                .gear_runs
-                .iter()
-                .filter(|r| r.gear == GEAR_PARK)
-                .map(|r| r.frames)
-                .sum::<u32>()
-                == total_frames;
+        // No gear data: treat whole clip as one non-park sub-segment
+        // (matches cloud's `if (!gr || gr.length < 2)` short-circuit).
+        if total_frames == 0 {
+            current.push(SubClipSummary::whole(clip));
+            continue;
+        }
 
-        if all_parked {
+        let spf = 60.0 / total_frames as f64;
+
+        // Raw per-gear-run segments, marked parked iff GEAR_PARK and the
+        // run lasts at least PARK_GAP_SECONDS. Mirrors cloud's `rawSegs`.
+        #[derive(Clone)]
+        struct Seg {
+            start: u32,
+            end: u32,
+            parked: bool,
+        }
+        let mut raw_segs: Vec<Seg> = Vec::with_capacity(clip.summary.gear_runs.len());
+        let mut offset: u32 = 0;
+        for run in &clip.summary.gear_runs {
+            let parked = run.gear == GEAR_PARK
+                && (run.frames as f64 * spf) >= PARK_GAP_SECONDS;
+            raw_segs.push(Seg {
+                start: offset,
+                end: offset + run.frames,
+                parked,
+            });
+            offset += run.frames;
+        }
+
+        // Merge consecutive non-parked segments (a non-park run that
+        // changes gear shouldn't split the drive).
+        let mut merged: Vec<Seg> = Vec::new();
+        for seg in raw_segs {
+            match merged.last_mut() {
+                Some(last) if !last.parked && !seg.parked => last.end = seg.end,
+                _ => merged.push(seg),
+            }
+        }
+
+        // Whole clip parked → boundary, no sub-clip emitted on either side.
+        if merged.iter().all(|s| s.parked) {
             if !current.is_empty() {
                 result.push(std::mem::take(&mut current));
             }
             continue;
         }
 
-        current.push(clip);
+        // No internal park gap → whole clip stays in current sub-drive.
+        if !merged.iter().any(|s| s.parked) {
+            current.push(SubClipSummary {
+                summary: clip.summary,
+                timestamp: clip.timestamp,
+                start_frame: 0,
+                end_frame: total_frames,
+                total_frames,
+                fraction: 1.0,
+            });
+            continue;
+        }
 
-        if has_park_gap && !current.is_empty() {
-            result.push(std::mem::take(&mut current));
+        // Mixed: emit sub-clip per non-park segment, close current
+        // drive at each park boundary. The sub-clip's timestamp is
+        // offset to the segment's start frame so two sub-drives derived
+        // from one clip get distinct, ordered start times.
+        for seg in merged {
+            if seg.parked {
+                if !current.is_empty() {
+                    result.push(std::mem::take(&mut current));
+                }
+            } else {
+                let seg_offset_ms = (seg.start as f64 * spf * 1000.0).round() as i64;
+                current.push(SubClipSummary {
+                    summary: clip.summary,
+                    timestamp: clip.timestamp
+                        + chrono::Duration::milliseconds(seg_offset_ms),
+                    start_frame: seg.start,
+                    end_frame: seg.end,
+                    total_frames,
+                    fraction: (seg.end - seg.start) as f64 / total_frames as f64,
+                });
+            }
         }
     }
     if !current.is_empty() {
@@ -2262,14 +2390,17 @@ fn split_summary_by_gear_state<'a>(
     result
 }
 
+/// Legacy fallback for clip groups without `gear_runs` data (v1
+/// summaries, or full routes pre-Phase-1). Each surviving clip becomes
+/// a whole-clip sub-clip with fraction=1.0.
 fn split_summary_by_gear_state_legacy<'a>(
     group: Vec<TimedSummary<'a>>,
-) -> Vec<Vec<TimedSummary<'a>>> {
+) -> Vec<Vec<SubClipSummary<'a>>> {
     if group.len() <= 1 {
-        return vec![group];
+        return vec![group.into_iter().map(SubClipSummary::whole).collect()];
     }
-    let mut result: Vec<Vec<TimedSummary<'a>>> = Vec::new();
-    let mut current: Vec<TimedSummary<'a>> = Vec::new();
+    let mut result: Vec<Vec<SubClipSummary<'a>>> = Vec::new();
+    let mut current: Vec<SubClipSummary<'a>> = Vec::new();
     for clip in group {
         let mostly_park = if clip.summary.raw_frame_count > 0 {
             (clip.summary.raw_park_count as f64 / clip.summary.raw_frame_count as f64) > 0.5
@@ -2281,7 +2412,7 @@ fn split_summary_by_gear_state_legacy<'a>(
                 result.push(std::mem::take(&mut current));
             }
         } else {
-            current.push(clip);
+            current.push(SubClipSummary::whole(clip));
         }
     }
     if !current.is_empty() {
@@ -2291,12 +2422,14 @@ fn split_summary_by_gear_state_legacy<'a>(
 }
 
 /// Compute drive distance from summary clips using:
-/// 1) per-clip aggregate distance, plus
+/// 1) per-clip aggregate distance scaled by sub-clip fraction, plus
 /// 2) boundary gaps between consecutive clips (prev end -> next start).
 ///
-/// The gap term matches Sentry-Drive's merged-point walk behavior and is
-/// especially important for sparse Tessie clips.
-fn distance_from_summary_clips(clips: &[TimedSummary]) -> f64 {
+/// Fraction-scaling lets a clip split mid-way (internal park gap)
+/// contribute proportionally to two drives instead of dumping the full
+/// distance into one. The gap term matches Sentry-Drive's merged-point
+/// walk behavior and is especially important for sparse Tessie clips.
+fn distance_from_summary_clips(clips: &[SubClipSummary]) -> f64 {
     fn is_null_island_pair(lat: f64, lng: f64) -> bool {
         lat.abs() < 1.0 && lng.abs() < 1.0
     }
@@ -2306,7 +2439,7 @@ fn distance_from_summary_clips(clips: &[TimedSummary]) -> f64 {
 
     for clip in clips {
         let a = &clip.summary.aggregates;
-        total_dist_m += a.distance_m;
+        total_dist_m += a.distance_m * clip.fraction;
 
         if let (Some((prev_lat, prev_lng)), Some(cur_lat), Some(cur_lng)) =
             (prev_end, a.start_lat, a.start_lng)
@@ -2329,27 +2462,45 @@ fn distance_from_summary_clips(clips: &[TimedSummary]) -> f64 {
     total_dist_m
 }
 
-/// Build a single `DriveSummary` by summing the per-clip
-/// `RouteAggregates` columns. No point arrays touched.
+/// Build a single `DriveSummary` from sub-clips. Per-clip time-
+/// attributable aggregates (distance, durations, engaged-ms, sample
+/// counts) are multiplied by each sub-clip's `fraction` so a parent
+/// clip split mid-way by an internal park gap contributes
+/// proportionally to two drives. `max_speed_mps` is not scaled — peak
+/// is peak. `fsd_disengagements` and `fsd_accel_pushes` are counted
+/// once per parent file (attributed to the first sub-clip of that
+/// file in this drive) to avoid double-counting in the rare case a
+/// parent contributes multiple sub-clips here.
 fn build_summary_from_aggregates(
-    clips: &[TimedSummary],
+    clips: &[SubClipSummary],
     idx: usize,
     tags: &HashMap<String, Vec<String>>,
 ) -> DriveSummary {
     let first_clip = &clips[0];
     let last_clip = &clips[clips.len() - 1];
+    // Sub-clip-aware start/end times: a mid-clip sub-segment carries an
+    // offset timestamp; the drive's end_time also respects the last
+    // sub-segment's end_frame rather than always adding a full minute.
     let start_time = first_clip.timestamp;
-    let end_time = last_clip.timestamp + chrono::Duration::minutes(1);
+    let last_spf_ms = if last_clip.total_frames > 0 {
+        60_000.0 / last_clip.total_frames as f64
+    } else {
+        0.0
+    };
+    let last_segment_len_ms = ((last_clip.end_frame - last_clip.start_frame) as f64
+        * last_spf_ms)
+        .round() as i64;
+    let end_time = last_clip.timestamp + chrono::Duration::milliseconds(last_segment_len_ms);
     let duration_ms = (end_time - start_time).num_milliseconds();
 
     let total_dist_m: f64 = distance_from_summary_clips(clips);
     let mut max_speed_mps: f64 = 0.0;
     let mut speed_sum: f64 = 0.0;
-    let mut speed_count: i64 = 0;
-    let mut point_count: i64 = 0;
-    let mut fsd_engaged_ms: i64 = 0;
-    let mut autosteer_engaged_ms: i64 = 0;
-    let mut tacc_engaged_ms: i64 = 0;
+    let mut speed_count: f64 = 0.0;
+    let mut point_count: f64 = 0.0;
+    let mut fsd_engaged_ms: f64 = 0.0;
+    let mut autosteer_engaged_ms: f64 = 0.0;
+    let mut tacc_engaged_ms: f64 = 0.0;
     let mut fsd_dist_m: f64 = 0.0;
     let mut autosteer_dist_m: f64 = 0.0;
     let mut tacc_dist_m: f64 = 0.0;
@@ -2360,23 +2511,37 @@ fn build_summary_from_aggregates(
     let mut start_point: Option<GpsPoint> = None;
     let mut end_point: Option<GpsPoint> = None;
 
+    // Dedupe parent files so non-time-attributable counts (disengagements,
+    // accel pushes, max-speed) are taken from each parent at most once.
+    let mut seen_files: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut unique_clip_count: usize = 0;
+
     for clip in clips {
         let a = &clip.summary.aggregates;
-        if a.max_speed_mps > max_speed_mps {
-            max_speed_mps = a.max_speed_mps;
+        let f = clip.fraction;
+
+        // Time-attributable aggregates scale by sub-clip fraction.
+        speed_sum += a.avg_speed_mps * a.speed_sample_count as f64 * f;
+        speed_count += a.speed_sample_count as f64 * f;
+        point_count += a.valid_point_count as f64 * f;
+        fsd_engaged_ms += a.fsd_engaged_ms as f64 * f;
+        autosteer_engaged_ms += a.autosteer_engaged_ms as f64 * f;
+        tacc_engaged_ms += a.tacc_engaged_ms as f64 * f;
+        fsd_dist_m += a.fsd_distance_m * f;
+        autosteer_dist_m += a.autosteer_distance_m * f;
+        tacc_dist_m += a.tacc_distance_m * f;
+        assisted_dist_m += a.assisted_distance_m * f;
+
+        // Per-file (not per-sub-clip) aggregates.
+        let is_first_subclip_of_file = seen_files.insert(clip.summary.file.as_str());
+        if is_first_subclip_of_file {
+            unique_clip_count += 1;
+            if a.max_speed_mps > max_speed_mps {
+                max_speed_mps = a.max_speed_mps;
+            }
+            fsd_disengagements += a.fsd_disengagements;
+            fsd_accel_pushes += a.fsd_accel_pushes;
         }
-        speed_sum += a.avg_speed_mps * a.speed_sample_count as f64;
-        speed_count += a.speed_sample_count;
-        point_count += a.valid_point_count;
-        fsd_engaged_ms += a.fsd_engaged_ms;
-        autosteer_engaged_ms += a.autosteer_engaged_ms;
-        tacc_engaged_ms += a.tacc_engaged_ms;
-        fsd_dist_m += a.fsd_distance_m;
-        autosteer_dist_m += a.autosteer_distance_m;
-        tacc_dist_m += a.tacc_distance_m;
-        assisted_dist_m += a.assisted_distance_m;
-        fsd_disengagements += a.fsd_disengagements;
-        fsd_accel_pushes += a.fsd_accel_pushes;
 
         if start_point.is_none() {
             if let (Some(lat), Some(lng)) = (a.start_lat, a.start_lng) {
@@ -2388,8 +2553,8 @@ fn build_summary_from_aggregates(
         }
     }
 
-    let avg_speed_mps = if speed_count > 0 {
-        speed_sum / speed_count as f64
+    let avg_speed_mps = if speed_count > 0.0 {
+        speed_sum / speed_count
     } else {
         0.0
     };
@@ -2419,22 +2584,22 @@ fn build_summary_from_aggregates(
         max_speed_mph: round2(max_speed_mps * 2.23694),
         avg_speed_kmh: round2(avg_speed_mps * 3.6),
         max_speed_kmh: round2(max_speed_mps * 3.6),
-        clip_count: clips.len(),
-        point_count: point_count as usize,
+        clip_count: unique_clip_count,
+        point_count: point_count.round() as usize,
         start_point,
         end_point,
         tags: drive_tags,
-        fsd_engaged_ms,
+        fsd_engaged_ms: fsd_engaged_ms.round() as i64,
         fsd_disengagements,
         fsd_accel_pushes,
         fsd_percent,
         fsd_distance_km: round2(fsd_dist_m / 1000.0),
         fsd_distance_mi: round2(fsd_dist_m / 1609.344),
-        autosteer_engaged_ms,
+        autosteer_engaged_ms: autosteer_engaged_ms.round() as i64,
         autosteer_percent,
         autosteer_distance_km: round2(autosteer_dist_m / 1000.0),
         autosteer_distance_mi: round2(autosteer_dist_m / 1609.344),
-        tacc_engaged_ms,
+        tacc_engaged_ms: tacc_engaged_ms.round() as i64,
         tacc_percent,
         tacc_distance_km: round2(tacc_dist_m / 1000.0),
         tacc_distance_mi: round2(tacc_dist_m / 1609.344),
@@ -2469,8 +2634,19 @@ fn compute_aggregate_stats_summary_impl(summaries: &[RouteSummary]) -> Aggregate
         if grp.is_empty() {
             continue;
         }
+        // Sub-clip-aware end: the last sub-clip's segment length, not
+        // always a full minute. Matches build_summary_from_aggregates.
         let start = grp[0].timestamp;
-        let end = grp[grp.len() - 1].timestamp + chrono::Duration::minutes(1);
+        let last = &grp[grp.len() - 1];
+        let last_spf_ms = if last.total_frames > 0 {
+            60_000.0 / last.total_frames as f64
+        } else {
+            0.0
+        };
+        let last_segment_len_ms = ((last.end_frame - last.start_frame) as f64
+            * last_spf_ms)
+            .round() as i64;
+        let end = last.timestamp + chrono::Duration::milliseconds(last_segment_len_ms);
         total_duration_ms += (end - start).num_milliseconds();
     }
     s.total_duration_ms = total_duration_ms;
@@ -2680,8 +2856,8 @@ mod tests {
         let ts = chrono::NaiveDateTime::parse_from_str("2025-01-15T12:00:00", "%Y-%m-%dT%H:%M:%S")
             .unwrap();
         let clips = vec![
-            TimedSummary { summary: &s1, timestamp: ts },
-            TimedSummary { summary: &s2, timestamp: ts + chrono::Duration::minutes(1) },
+            SubClipSummary::whole(TimedSummary { summary: &s1, timestamp: ts }),
+            SubClipSummary::whole(TimedSummary { summary: &s2, timestamp: ts + chrono::Duration::minutes(1) }),
         ];
 
         let d = distance_from_summary_clips(&clips);
@@ -2690,6 +2866,124 @@ mod tests {
             (d - (300.0 + gap)).abs() < 0.1,
             "distance should include inter-clip gap"
         );
+    }
+
+    /// Build a RouteSummary with a single non-park gear run covering the
+    /// whole clip. Useful for grouping tests that don't care about
+    /// aggregates.
+    fn drive_summary(file: &str) -> RouteSummary {
+        RouteSummary {
+            file: file.to_string(),
+            date: "2025-01-15".to_string(),
+            raw_park_count: 0,
+            raw_frame_count: 60,
+            gear_runs: vec![GearRun { gear: 1, frames: 60 }],
+            aggregates: RouteAggregates::default(),
+            source: None,
+            external_signature: None,
+        }
+    }
+
+    /// Build a RouteSummary that has internal park gaps at the supplied
+    /// frame ranges. `runs` is a sequence of `(gear, frames)` pairs that
+    /// must sum to 60. Aggregate distance is split across the segments
+    /// so the fraction-aware aggregator has something to compare.
+    fn clip_with_gear_runs(file: &str, runs: &[(u8, u32)], total_distance_m: f64) -> RouteSummary {
+        let mut a = RouteAggregates::default();
+        a.distance_m = total_distance_m;
+        RouteSummary {
+            file: file.to_string(),
+            date: "2025-01-15".to_string(),
+            raw_park_count: runs.iter().filter(|(g, _)| *g == GEAR_PARK).map(|(_, f)| f).sum(),
+            raw_frame_count: runs.iter().map(|(_, f)| *f).sum(),
+            gear_runs: runs.iter().map(|(g, f)| GearRun { gear: *g, frames: *f }).collect(),
+            aggregates: a,
+            source: None,
+            external_signature: None,
+        }
+    }
+
+    /// Regression for the "fractions of a percent" divergence noted in
+    /// the 2026-05-18 CLAUDE.md entry. A single clip with TWO internal
+    /// park gaps (drive/park/drive/park/drive) used to undercount by
+    /// producing one drive boundary and dumping the full clip's
+    /// aggregates into the first drive. Post-port it should produce
+    /// THREE drives, each receiving roughly a third of the clip's
+    /// distance.
+    #[test]
+    fn test_split_summary_multi_park_gap_produces_three_drives() {
+        // 60 frames total: drive 20, park 5, drive 15, park 5, drive 15.
+        // Park runs (5 frames * 1s/frame = 5s) are > PARK_GAP_SECONDS (2s).
+        let clip = clip_with_gear_runs(
+            "/cam/2025-01-15_12-00-00-front.mp4",
+            &[(1, 20), (GEAR_PARK, 5), (1, 15), (GEAR_PARK, 5), (1, 15)],
+            600.0, // 600m total clip distance
+        );
+        let summaries = vec![clip];
+        let groups = group_summary_clips(&summaries);
+        assert_eq!(groups.len(), 3, "multi-park-gap clip should split into 3 drives");
+
+        // Each drive should get its slice of the clip's distance.
+        // drive 1: 20/60 = 0.333 → 200m
+        // drive 2: 15/60 = 0.25  → 150m
+        // drive 3: 15/60 = 0.25  → 150m
+        // (Sub-clip totals = 50/60 of clip's distance = 500m, by design
+        // — the 10/60 parked portion is dropped on the cutting-room floor.)
+        let d1 = distance_from_summary_clips(&groups[0]);
+        let d2 = distance_from_summary_clips(&groups[1]);
+        let d3 = distance_from_summary_clips(&groups[2]);
+        assert!((d1 - 200.0).abs() < 0.5, "drive 1 distance: {}", d1);
+        assert!((d2 - 150.0).abs() < 0.5, "drive 2 distance: {}", d2);
+        assert!((d3 - 150.0).abs() < 0.5, "drive 3 distance: {}", d3);
+    }
+
+    /// Sanity: a clip with NO internal park gap stays in one drive and
+    /// keeps its full aggregates (fraction = 1.0 path).
+    #[test]
+    fn test_split_summary_no_park_gap_keeps_one_drive() {
+        let clip = clip_with_gear_runs(
+            "/cam/2025-01-15_12-00-00-front.mp4",
+            &[(1, 60)],
+            1000.0,
+        );
+        let summaries = vec![clip];
+        let groups = group_summary_clips(&summaries);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 1);
+        assert!((distance_from_summary_clips(&groups[0]) - 1000.0).abs() < 0.5);
+    }
+
+    /// Sanity: a fully-parked clip closes the current drive and does not
+    /// produce a sub-clip for itself. Drives count is 0 when ALL clips
+    /// are parked.
+    #[test]
+    fn test_split_summary_all_parked_zero_drives() {
+        let clip = clip_with_gear_runs(
+            "/cam/2025-01-15_12-00-00-front.mp4",
+            &[(GEAR_PARK, 60)],
+            0.0,
+        );
+        let summaries = vec![clip];
+        let groups = group_summary_clips(&summaries);
+        assert_eq!(groups.len(), 0);
+    }
+
+    /// Drive-bounded scenario: two real drive clips bracketing a fully
+    /// parked clip should split into two drives.
+    #[test]
+    fn test_split_summary_park_clip_between_drives() {
+        let s1 = drive_summary("/cam/2025-01-15_12-00-00-front.mp4");
+        let park = clip_with_gear_runs(
+            "/cam/2025-01-15_12-01-00-front.mp4",
+            &[(GEAR_PARK, 60)],
+            0.0,
+        );
+        let s3 = drive_summary("/cam/2025-01-15_12-02-00-front.mp4");
+        let summaries = vec![s1, park, s3];
+        let groups = group_summary_clips(&summaries);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].len(), 1);
+        assert_eq!(groups[1].len(), 1);
     }
 
     #[test]
