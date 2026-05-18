@@ -149,9 +149,10 @@ pub async fn get_status(
         }
     }
 
-    // WiFi info
+    // WiFi info — skip shell queries when interface is down (saves 5-10s
+    // on ethernet-only systems where wlan0 exists but is unconfigured)
     let wifi_dev = find_net_device("wl*");
-    if !wifi_dev.is_empty() {
+    if !wifi_dev.is_empty() && iface_is_up(&wifi_dev) {
         if let Ok(out) = sentryusb_shell::run("iwgetid", &["-r", &wifi_dev]).await {
             s.wifi_ssid = out.trim().to_string();
         }
@@ -182,12 +183,12 @@ pub async fn get_status(
         s.wifi_tx_bps = tx;
     }
 
-    // Ethernet info
+    // Ethernet info — same operstate guard
     let mut eth_dev = find_net_device("eth*");
     if eth_dev.is_empty() {
         eth_dev = find_net_device("en*");
     }
-    if !eth_dev.is_empty() {
+    if !eth_dev.is_empty() && iface_is_up(&eth_dev) {
         if let Ok(out) = sentryusb_shell::run("ip", &["-4", "addr", "show", &eth_dev]).await {
             for line in out.lines() {
                 let trimmed = line.trim();
@@ -398,37 +399,46 @@ pub async fn get_wifi_config(
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// List snapshot backing files at the top of `/backingfiles/snapshots/`.
+///
+/// The previous implementation called a generic recursive `walkdir` and
+/// filtered for paths ending in `snap.bin`. That descended through every
+/// snapshot's `mnt -> /tmp/snapshots/snap-NNN` symlink, which is backed by
+/// an autofs mount (timeout=300s) that re-mounts the per-snapshot vfat loop
+/// device on first access. Each fresh /api/status call after the autofs
+/// timeout therefore triggered up to 130 vfat mounts *and* walked the
+/// entire dashcam tree inside each one — observed 15,000+ openat syscalls
+/// per request and 5-15s TTFB.
+///
+/// Snapshots always have `snap.bin` directly at the top level
+/// (`/backingfiles/snapshots/snap-NNNNNN/snap.bin`). We only need to scan
+/// that one directory level — no recursion, no symlink follow.
 fn find_snapshots() -> Vec<String> {
     let mut snaps = Vec::new();
     let base = std::path::Path::new("/backingfiles/snapshots/");
-    if base.exists() {
-        if let Ok(entries) = walkdir(base) {
-            for path in entries {
-                if path.ends_with("snap.bin") {
-                    snaps.push(path);
-                }
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return snaps;
+    };
+    for entry in entries.flatten() {
+        // Only consider entries that are themselves directories on the
+        // host filesystem. `file_type()` uses the dirent's d_type and
+        // does NOT follow symlinks, so the `mnt` autofs symlink inside
+        // each snapshot is never resolved here.
+        let Ok(ft) = entry.file_type() else { continue };
+        if !ft.is_dir() {
+            continue;
+        }
+        let snap_bin = entry.path().join("snap.bin");
+        // Use symlink_metadata to avoid traversing into anything weird;
+        // snap.bin is always a regular file on the parent XFS.
+        if std::fs::symlink_metadata(&snap_bin).is_ok() {
+            if let Some(s) = snap_bin.to_str() {
+                snaps.push(s.to_string());
             }
         }
     }
     snaps.sort();
     snaps
-}
-
-fn walkdir(dir: &std::path::Path) -> std::io::Result<Vec<String>> {
-    let mut result = Vec::new();
-    if !dir.is_dir() {
-        return Ok(result);
-    }
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            result.extend(walkdir(&path)?);
-        } else if let Some(s) = path.to_str() {
-            result.push(s.to_string());
-        }
-    }
-    Ok(result)
 }
 
 fn read_fan_speed() -> String {
@@ -483,6 +493,21 @@ fn find_net_device(pattern: &str) -> String {
         }
     }
     String::new()
+}
+
+/// Returns true when the kernel reports the interface in `operstate == "up"`.
+///
+/// We use this to gate the shell queries below: `iwgetid`/`iwconfig`/`ip` can
+/// each block for several seconds when an interface is present-but-DOWN
+/// (e.g. `wlan0` exists but no NetworkManager / no Skip-WiFi configured),
+/// adding up to 5-15s on `GET /api/status`. Companion apps that probe this
+/// endpoint with a short HTTP timeout then fall back to BLE-only mode even
+/// though the Pi is reachable over ethernet.
+fn iface_is_up(dev: &str) -> bool {
+    let path = format!("/sys/class/net/{}/operstate", dev);
+    std::fs::read_to_string(&path)
+        .map(|s| s.trim() == "up")
+        .unwrap_or(false)
 }
 
 fn disk_usage(path: &str) -> i64 {
