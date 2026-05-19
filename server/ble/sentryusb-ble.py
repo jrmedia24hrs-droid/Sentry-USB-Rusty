@@ -927,7 +927,7 @@ class APIRequestCharacteristic(Characteristic):
 
             # Send response, chunking if it exceeds the negotiated BLE MTU.
             # ATT notification overhead is 3 bytes.
-            max_msg = self._client_mtu - 3
+            max_msg = self._client_mtu - 8
             if len(response_json) <= max_msg:
                 def send_single():
                     self.response_chrc.send_notification(
@@ -967,7 +967,7 @@ class APIRequestCharacteristic(Characteristic):
                             dbus.Array([dbus.Byte(b) for b in msg], signature='y'))
                         return False
                     # Stagger chunk notifications by 50ms to prevent BlueZ drops
-                    GLib.timeout_add(50 * idx, send_chunk)
+                    GLib.timeout_add(200 * idx, send_chunk)
 
         # Run the blocking HTTP proxy call in a background thread
         # so the GLib main loop stays responsive for BLE operations
