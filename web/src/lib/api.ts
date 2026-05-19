@@ -35,6 +35,10 @@ export interface PiStatus {
   ether_ip: string
   ether_speed: string
   fan_speed: string
+  sbc_model?: string
+  device_suffix?: string
+  /** Negative integer parsed from iwconfig "Signal level=-48 dBm". Present only on backends ≥ v2.7.4. */
+  wifi_signal_dbm?: number
   wifi_rx_bps?: number
   wifi_tx_bps?: number
   ether_rx_bps?: number

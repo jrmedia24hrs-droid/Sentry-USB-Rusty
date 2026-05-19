@@ -152,8 +152,16 @@ export default function CloudPairingSection({ compact = false }: Props) {
   const pairingState = status?.pairingState ?? "idle"
   const inFlight =
     pairingState === "handshaking" || pairingState === "polling"
+  // Compact "Mon DD, HH:MM" — the previous toLocaleString() ran ~23 chars
+  // (full date + seconds + AM/PM) which truncated to "…" in the 1/4-width
+  // stat box. Same precision a user needs (date + minute), no overflow.
   const lastUploadDisplay = status?.lastUploadAt
-    ? new Date(status.lastUploadAt).toLocaleString()
+    ? new Date(status.lastUploadAt).toLocaleString(undefined, {
+        month: "short",
+        day: "numeric",
+        hour: "2-digit",
+        minute: "2-digit",
+      })
     : null
 
   const uploadProgress = useMemo(() => {

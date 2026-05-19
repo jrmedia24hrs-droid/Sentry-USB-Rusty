@@ -41,6 +41,8 @@ struct PiStatus {
     wifi_ssid: String,
     wifi_freq: String,
     wifi_strength: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wifi_signal_dbm: Option<i32>,
     wifi_ip: String,
     ether_ip: String,
     ether_speed: String,
@@ -68,6 +70,7 @@ pub async fn get_status(
         wifi_ssid: String::new(),
         wifi_freq: String::new(),
         wifi_strength: String::new(),
+        wifi_signal_dbm: None,
         wifi_ip: String::new(),
         ether_ip: String::new(),
         ether_speed: String::new(),
@@ -164,6 +167,16 @@ pub async fn get_status(
                 if let Some(after) = line.split("Link Quality=").nth(1) {
                     if let Some(qual) = after.split_whitespace().next() {
                         s.wifi_strength = qual.to_string();
+                    }
+                }
+                // Same line typically contains "Signal level=-48 dBm". Parse
+                // only the integer portion so we don't smuggle units through
+                // the JSON and the frontend can format consistently.
+                if let Some(after) = line.split("Signal level=").nth(1) {
+                    if let Some(tok) = after.split_whitespace().next() {
+                        if let Ok(dbm) = tok.parse::<i32>() {
+                            s.wifi_signal_dbm = Some(dbm);
+                        }
                     }
                 }
             }

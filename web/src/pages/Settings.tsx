@@ -43,13 +43,15 @@ export default function Settings() {
   const activeTab: TabName = isTab(params.get("tab")) ? (params.get("tab") as TabName) : "Device"
 
   const [status, setStatus] = useState<PiStatus | null>(null)
-  const [piConfig, setPiConfig] = useState<{ uses_ble?: string; HOSTNAME?: string } | null>(
-    null
-  )
-  const [sbc, setSbc] = useState<string | null>(null)
-  const [hostname, setHostname] = useState<string | null>(null)
+  const [piConfig, setPiConfig] = useState<{
+    uses_ble?: string
+    SENTRYUSB_HOSTNAME?: string
+  } | null>(null)
   const [confirmReboot, setConfirmReboot] = useState(false)
   const [drivesConnected, setDrivesConnected] = useState<boolean | null>(null)
+  // Local 1s tick so the header strip uptime advances between status polls
+  // (status itself only refreshes every 4s — too jumpy for a wall clock).
+  const [tickOffset, setTickOffset] = useState(0)
 
   // Modal state
   const [wizardOpen, setWizardOpen] = useState(false)
@@ -70,6 +72,7 @@ export default function Settings() {
         if (mounted) {
           setStatus(data)
           setDrivesConnected(data.drives_active === "yes")
+          setTickOffset(0) // reset local tick when we get a fresh server value
         }
       } catch {
         /* ignore */
@@ -77,28 +80,38 @@ export default function Settings() {
     }
     poll()
     const id = setInterval(poll, 4000)
+    const tickId = setInterval(() => setTickOffset((t) => t + 1), 1000)
     return () => {
       mounted = false
       clearInterval(id)
+      clearInterval(tickId)
     }
   }, [])
 
-  // Pi config (uses_ble, hostname) + RTC status (for SBC label)
+  // Pi config (uses_ble, SENTRYUSB_HOSTNAME). SBC model now comes from the
+  // status payload (which already detects Pi 5 reliably) — the previous
+  // rtc-status flag only flipped to is_pi5=true when a battery was present,
+  // so a Pi 5 without an RTC battery was mis-labelled as "Pi 4 / earlier".
   useEffect(() => {
     fetch("/api/config")
       .then((r) => r.json())
-      .then((data) => {
-        setPiConfig(data)
-        if (data?.HOSTNAME) setHostname(data.HOSTNAME)
-      })
-      .catch(() => {})
-    fetch("/api/system/rtc-status")
-      .then((r) => r.json())
-      .then((data) => {
-        setSbc(data.is_pi5 ? "Raspberry Pi 5" : "Raspberry Pi 4 / earlier")
-      })
+      .then((data) => setPiConfig(data))
       .catch(() => {})
   }, [])
+
+  const sbc = status?.sbc_model || null
+  // /api/config returns each key as { value, active } OR as a raw string,
+  // depending on shape — handle both.
+  const hostnameEntry = piConfig?.SENTRYUSB_HOSTNAME as
+    | { value?: string; active?: boolean }
+    | string
+    | undefined
+  const hostname =
+    typeof hostnameEntry === "string"
+      ? hostnameEntry
+      : hostnameEntry?.active
+      ? hostnameEntry.value || null
+      : null
 
   function setTab(next: TabName) {
     const p = new URLSearchParams(params)
@@ -212,7 +225,7 @@ export default function Settings() {
     },
   ]
 
-  const uptimeSec = status ? parseFloat(status.uptime) : null
+  const uptimeSec = status ? parseFloat(status.uptime) + tickOffset : null
 
   // ⚠️ Mobile / tab-bar — switch to scrollable variant under 640px.
   const [isMobile, setIsMobile] = useState(
@@ -249,6 +262,7 @@ export default function Settings() {
           status={status}
           sbc={sbc}
           hostname={hostname}
+          uptimeSec={uptimeSec}
           onOpenWizard={handleOpenWizard}
         />
       )}

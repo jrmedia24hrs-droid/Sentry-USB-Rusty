@@ -298,8 +298,11 @@ code, pre, .font-mono {
    ▌ Redesign utilities — shared primitives for Dashboard/Settings
    ──────────────────────────────────────────────────────────────── */
 
-/* StatusTile primitive */
-.tile { padding: 14px; display: flex; flex-direction: column; gap: 10px; }
+/* StatusTile primitive — min-height gives short tiles a visual floor so
+   they don't look stunted next to fuller ones in the same row. Grid's
+   default align-items: stretch already makes neighbouring tiles match the
+   tallest in their row, so this only matters when the entire row is short. */
+.tile { padding: 14px; display: flex; flex-direction: column; gap: 10px; min-height: 140px; }
 .tile-header { display: flex; align-items: center; gap: 10px; }
 .tile-icon { flex: 0 0 auto; width: 32px; height: 32px; border-radius: 10px; display: inline-flex; align-items: center; justify-content: center; }
 .tile-title { font-size: 11px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: #7a8294; flex: 1 1 auto; min-width: 0; }

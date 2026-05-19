@@ -55,6 +55,33 @@ function formatThroughput(bps: number): string {
   return bps > 0 ? "< 1 Kbps" : "—"
 }
 
+function getWifiStrengthBars(strength: string): number {
+  if (!strength) return 0
+  const parts = strength.split("/")
+  if (parts.length !== 2) return 0
+  const ratio = parseInt(parts[0]) / parseInt(parts[1])
+  if (ratio > 0.75) return 4
+  if (ratio > 0.5) return 3
+  if (ratio > 0.25) return 2
+  return 1
+}
+
+// Mini 4-bar signal indicator. Filled bars get the tile's accent colour;
+// the rest are a muted slate so the gauge reads at a glance.
+function WifiBars({ bars }: { bars: number }) {
+  return (
+    <span className="inline-flex items-end gap-[2px] align-middle" aria-label={`${bars}/4 bars`}>
+      {[1, 2, 3, 4].map((n) => (
+        <span
+          key={n}
+          className={n <= bars ? "bg-emerald-400" : "bg-slate-700"}
+          style={{ width: 3, height: 3 + n * 2, borderRadius: 1 }}
+        />
+      ))}
+    </span>
+  )
+}
+
 interface ProcessProgress {
   current: number
   total: number
@@ -430,21 +457,27 @@ function NetworkTile({ status }: { status: PiStatus }) {
             <span className="text-xs font-medium text-slate-200">
               {status.wifi_ssid}
             </span>
-            <span className="ml-auto text-[10px] text-slate-500">
-              {status.wifi_ip || "No IP"}
+            <span className="ml-auto inline-flex items-center gap-1.5 text-[10px] text-slate-500">
+              {status.wifi_signal_dbm != null && (
+                <span className="text-slate-400">{status.wifi_signal_dbm} dBm</span>
+              )}
+              <WifiBars bars={getWifiStrengthBars(status.wifi_strength)} />
             </span>
           </div>
-          {(status.wifi_rx_bps !== undefined || status.wifi_tx_bps !== undefined) && (
-            <div className="tile-row pl-5" style={{ minHeight: 18 }}>
-              <span className="text-[10px] text-emerald-400">
-                ↓ {formatThroughput(status.wifi_rx_bps ?? 0)}
-              </span>
-              <span className="text-[10px] text-slate-500">·</span>
-              <span className="text-[10px] text-sky-400">
-                ↑ {formatThroughput(status.wifi_tx_bps ?? 0)}
-              </span>
-            </div>
-          )}
+          <div className="tile-row pl-5" style={{ minHeight: 18 }}>
+            <span className="text-[10px] text-slate-500">{status.wifi_ip || "No IP"}</span>
+            {(status.wifi_rx_bps !== undefined || status.wifi_tx_bps !== undefined) && (
+              <>
+                <span className="ml-auto text-[10px] text-emerald-400">
+                  ↓ {formatThroughput(status.wifi_rx_bps ?? 0)}
+                </span>
+                <span className="text-[10px] text-slate-500">·</span>
+                <span className="text-[10px] text-sky-400">
+                  ↑ {formatThroughput(status.wifi_tx_bps ?? 0)}
+                </span>
+              </>
+            )}
+          </div>
         </>
       ) : (
         <Row
@@ -481,13 +514,18 @@ function NetworkTile({ status }: { status: PiStatus }) {
             </div>
           )}
         </>
-      ) : !haveWifi ? (
-        <Row
-          icon={<Cable className="h-3.5 w-3.5" />}
-          label="Ethernet"
-          sub="not connected"
-        />
-      ) : null}
+      ) : (
+        // Always render an Ethernet row — keeps tile balanced when WiFi is
+        // present but ethernet isn't (or vice versa). Muted styling signals
+        // disconnected state without taking the tile's halo over.
+        <div className="tile-row">
+          <span className="inline-flex text-slate-600">
+            <Cable className="h-3.5 w-3.5" />
+          </span>
+          <span className="text-xs text-slate-600">Ethernet</span>
+          <span className="ml-auto text-[10px] text-slate-600">not connected</span>
+        </div>
+      )}
     </StatusTile>
   )
 }

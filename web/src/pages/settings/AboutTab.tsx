@@ -10,12 +10,14 @@ interface Props {
   status: PiStatus | null
   sbc?: string | null
   hostname?: string | null
+  /** Pre-computed uptime in seconds, including the parent's 1s local tick. */
+  uptimeSec?: number | null
   onOpenWizard: () => void
 }
 
-export function AboutTab({ status, sbc, hostname, onOpenWizard }: Props) {
+export function AboutTab({ status, sbc, hostname, uptimeSec, onOpenWizard }: Props) {
   const version = useVersion()
-  const uptime = status ? parseFloat(status.uptime) : null
+  const uptime = uptimeSec ?? (status ? parseFloat(status.uptime) : null)
 
   return (
     <PrefGrid min={300}>

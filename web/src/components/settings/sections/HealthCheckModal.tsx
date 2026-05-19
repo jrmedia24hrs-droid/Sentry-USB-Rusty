@@ -1,4 +1,4 @@
-import { useState } from "react"
+import { useState, useEffect } from "react"
 import {
   Stethoscope,
   Loader2,
@@ -6,6 +6,7 @@ import {
   ChevronRight,
   CheckCircle,
   AlertTriangle,
+  AlertCircle,
   XCircle,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
@@ -18,31 +19,37 @@ type HealthReport = { summary: string; categories: HealthCategory[] }
 export function HealthCheckModal({ onClose }: { onClose: () => void }) {
   const [loading, setLoading] = useState(true)
   const [report, setReport] = useState<HealthReport | null>(null)
+  const [error, setError] = useState<string | null>(null)
   const [expanded, setExpanded] = useState<Record<string, boolean>>({})
 
   async function runCheck() {
     setLoading(true)
+    setError(null)
     setReport(null)
     try {
       const res = await fetch("/api/system/health-check")
-      if (!res.ok) throw new Error("Health check failed")
-      const data = await res.json()
+      if (!res.ok) throw new Error(`Server responded with ${res.status}`)
+      const data: HealthReport = await res.json()
       setReport(data)
+      // Auto-expand categories that have at least one warn/fail
       const exp: Record<string, boolean> = {}
       for (const cat of data.categories) {
-        if (cat.items.some((i: HealthItem) => i.status !== "pass")) exp[cat.name] = true
+        if (cat.items.some((i) => i.status !== "pass")) exp[cat.name] = true
       }
       setExpanded(exp)
-    } catch {
-      setReport(null)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Health check failed")
+    } finally {
+      setLoading(false)
     }
-    setLoading(false)
   }
 
-  // Kick off the first check on mount
-  if (loading && report === null) {
+  // Kick off the first check on mount. Using useEffect so we don't trigger
+  // side-effects during render (previous version called runCheck() inline,
+  // which silently looped and produced a blank modal when the fetch failed).
+  useEffect(() => {
     void runCheck()
-  }
+  }, [])
 
   const statusIcon = (s: string) => {
     if (s === "pass") return <CheckCircle className="h-3.5 w-3.5 text-emerald-400" />
@@ -63,12 +70,13 @@ export function HealthCheckModal({ onClose }: { onClose: () => void }) {
       )
     : 0
 
-  const headerIconClass =
-    failCount > 0
-      ? "text-red-400"
-      : warnCount > 0
-      ? "text-amber-400"
-      : "text-emerald-400"
+  const headerIconClass = error
+    ? "text-red-400"
+    : failCount > 0
+    ? "text-red-400"
+    : warnCount > 0
+    ? "text-amber-400"
+    : "text-emerald-400"
 
   return (
     <Modal
@@ -76,7 +84,7 @@ export function HealthCheckModal({ onClose }: { onClose: () => void }) {
         <span className="flex items-center gap-2">
           <Stethoscope className={cn("h-4 w-4", headerIconClass)} />
           <span>Health Check</span>
-          {report && (
+          {report && !loading && (
             <span
               className={cn(
                 "rounded-full px-2 py-0.5 text-xs font-medium",
@@ -106,13 +114,26 @@ export function HealthCheckModal({ onClose }: { onClose: () => void }) {
         </div>
       }
     >
-      {loading && !report && (
+      {loading && (
         <div className="flex items-center justify-center py-8 text-slate-500">
           <Loader2 className="mr-2 h-5 w-5 animate-spin" />
           Running health check...
         </div>
       )}
+
+      {error && !loading && (
+        <div className="flex items-start gap-3 rounded-xl border border-red-500/20 bg-red-500/5 p-4 text-sm">
+          <AlertCircle className="mt-0.5 h-5 w-5 shrink-0 text-red-400" />
+          <div>
+            <p className="font-medium text-red-300">Health check failed</p>
+            <p className="mt-1 text-xs text-slate-400">{error}</p>
+          </div>
+        </div>
+      )}
+
       {report &&
+        !loading &&
+        !error &&
         report.categories.map((cat) => {
           const isOpen = expanded[cat.name] ?? false
           const catFails = cat.items.filter((i) => i.status === "fail").length
