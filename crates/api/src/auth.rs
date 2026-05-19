@@ -247,8 +247,9 @@ pub async fn auth_middleware(
 
     // Allow localhost
     if let Some(addr) = req.extensions().get::<axum::extract::ConnectInfo<std::net::SocketAddr>>() {
-        let ip = addr.ip();
-        if ip.is_loopback() {
+        // Fold IPv4-mapped IPv6 (::ffff:127.0.0.1) back to v4 so loopback
+        // matches on a dual-stack listener.
+        if addr.ip().to_canonical().is_loopback() {
             return next.run(req).await;
         }
     }

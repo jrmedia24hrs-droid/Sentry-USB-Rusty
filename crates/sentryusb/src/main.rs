@@ -266,7 +266,7 @@ async fn main() {
     ));
     phase!("router_built");
 
-    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], args.port));
+    let addr = std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, args.port));
     info!("SentryUSB server listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr)

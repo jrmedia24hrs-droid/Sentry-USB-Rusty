@@ -473,7 +473,7 @@ const DIAGNOSTICS_SCRIPT: &str = r#"{
   echo ""
 
   echo "====== drive-import history (persisted, last 20) ======"
-  curl -fsS --max-time 5 http://127.0.0.1/api/drives/data/import-history 2>/dev/null \
+  curl -fsS --max-time 5 http://[::1]/api/drives/data/import-history 2>/dev/null \
     || echo "could not reach /api/drives/data/import-history"
   echo ""
 

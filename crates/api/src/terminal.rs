@@ -96,7 +96,7 @@ fn send_msg_text(ty: &str, data: &str) -> Message {
 async fn handle_terminal_ws(socket: WebSocket, addr: SocketAddr) {
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
-    let ip = addr.ip().to_string();
+    let ip = addr.ip().to_canonical().to_string();
     let (mut sender, mut receiver) = socket.split();
 
     if rate_limited(&ip) {
