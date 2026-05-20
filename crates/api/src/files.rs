@@ -35,25 +35,44 @@ const ALLOWED_BASES: &[&str] = &[
     "/var/www/html/fs",
 ];
 
-/// Validate and clean a path, resolving symlinks and checking against allowed bases.
-fn is_path_allowed(req_path: &str) -> (PathBuf, bool) {
-    let clean = PathBuf::from(req_path);
-    let clean = clean.canonicalize().unwrap_or_else(|_| {
-        // canonicalize fails if path doesn't exist — use cleaned version
-        let mut p = PathBuf::from("/");
-        for component in Path::new(req_path).components() {
-            match component {
-                std::path::Component::Normal(c) => p.push(c),
-                std::path::Component::RootDir => p = PathBuf::from("/"),
-                _ => {}
+/// Lexically normalize a request path: anchor at `/` and resolve `.`/`..`
+/// textually, WITHOUT touching the filesystem. `..` pops the previous segment and
+/// is clamped at the root, so the result can never climb above `/`.
+fn lexical_normalize(req_path: &str) -> PathBuf {
+    let mut parts: Vec<std::ffi::OsString> = Vec::new();
+    for component in Path::new(req_path).components() {
+        match component {
+            std::path::Component::Normal(c) => parts.push(c.to_os_string()),
+            std::path::Component::ParentDir => {
+                parts.pop();
             }
+            // RootDir / Prefix / CurDir add nothing once re-anchored at "/".
+            _ => {}
         }
-        p
-    });
+    }
+    let mut p = PathBuf::from("/");
+    for part in parts {
+        p.push(part);
+    }
+    p
+}
 
+/// Validate and clean a path against the allowed bases.
+///
+/// We check the *logical* path (lexically normalized), not the symlink-resolved
+/// path. Dashcam clips under `/mutable/TeslaCam/...` are symlinks into the snapshot
+/// autofs mount (`/tmp/snapshots/snap-*/...`), which is deliberately outside the
+/// allowed bases — canonicalizing them would deny every clip download (and make
+/// delete operate on the read-only snapshot file instead of the symlink). Lexical
+/// normalization still blocks `..` traversal, and the API never creates symlinks,
+/// so there is no user-reachable symlink escape to resolve away.
+fn is_path_allowed(req_path: &str) -> (PathBuf, bool) {
+    let clean = lexical_normalize(req_path);
     let clean_str = clean.to_str().unwrap_or("");
     for base in ALLOWED_BASES {
-        if clean_str.starts_with(base) || clean_str == *base {
+        // Exact base, or a path strictly under it — the trailing slash prevents
+        // `/mutable` from matching e.g. `/mutable-secret`.
+        if clean_str == *base || clean_str.starts_with(&format!("{}/", base)) {
             return (clean, true);
         }
     }
@@ -894,6 +913,44 @@ mod tests {
     use std::io::Read;
     use std::path::Path;
     use tempfile::TempDir;
+
+    #[test]
+    fn allows_clip_paths_and_blocks_traversal() {
+        // The dashcam clip path that was being denied: it lives logically under
+        // /mutable even though the real file is a symlink into the snapshot mount.
+        assert!(
+            is_path_allowed(
+                "/mutable/TeslaCam/SavedClips/2026-05-02_08-50-13/2026-05-02_08-46-34-back.mp4"
+            )
+            .1
+        );
+        // Exact base and other allowed roots.
+        assert!(is_path_allowed("/mutable").1);
+        assert!(is_path_allowed("/mnt/cam/TeslaCam/SentryClips/x/y.mp4").1);
+
+        // `..` traversal is normalized away and then rejected.
+        assert!(!is_path_allowed("/mutable/../etc/passwd").1);
+        assert!(!is_path_allowed("/mutable/TeslaCam/../../../../etc/shadow").1);
+        assert!(!is_path_allowed("/etc/passwd").1);
+        // Prefix-boundary: a sibling that merely starts with a base name is denied.
+        assert!(!is_path_allowed("/mutable-secret/data").1);
+    }
+
+    #[test]
+    fn lexical_normalize_does_not_follow_symlinks() {
+        // A symlink that escapes to /etc must be returned as its *textual* path,
+        // unresolved — proving validation never follows links off to a real target.
+        let dir = TempDir::new().unwrap();
+        let link = dir.path().join("escape");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("/etc", &link).unwrap();
+        let through = link.join("passwd");
+        assert_eq!(lexical_normalize(through.to_str().unwrap()), through);
+
+        // `..` pops and is clamped at root.
+        assert_eq!(lexical_normalize("/a/b/../c"), PathBuf::from("/a/c"));
+        assert_eq!(lexical_normalize("/../../x"), PathBuf::from("/x"));
+    }
 
     /// Run the streaming build exactly as the handlers do and collect the bytes.
     async fn build_archive(root: &Path, limits: Zip64Thresholds) -> Vec<u8> {
