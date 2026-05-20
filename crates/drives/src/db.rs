@@ -52,7 +52,12 @@ pub const ARCHIVE_DATA_PATH: &str = "/mnt/archive/drive-data.json";
 // (was the raw date_dir column). Aligns the list endpoint with what
 // the single-drive endpoint already does, so clicking a drive in the
 // list returns the matching points.
-const DRIVE_LIST_CACHE_ALGO_VERSION: &str = "3";
+//
+// v4 (2026-05-19): drive grouping output changed since v3 without a bump —
+// SavedClips/SentryClips event folders are now skipped, and the grouper was
+// reworked to match Sentry-Drive/Sentry-Cloud distance/AP math. Same routes
+// now yield a different drive list, so stale v3 caches must rebuild.
+const DRIVE_LIST_CACHE_ALGO_VERSION: &str = "4";
 
 /// Ordered list of paths the one-shot importer checks on first boot.
 /// The first that exists wins. `/mutable/drive-data.json` is kept as a
