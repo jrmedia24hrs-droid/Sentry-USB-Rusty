@@ -8,7 +8,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use clap::{Parser, Subcommand};
-use tower_http::compression::CompressionLayer;
+use tower_http::compression::{
+    CompressionLayer,
+    predicate::{NotForContentType, Predicate, SizeAbove},
+};
 use tracing::info;
 
 mod embed;
@@ -233,9 +236,6 @@ async fn main() {
     // Build the API router
     let mut app = sentryusb_api::build_router(app_state.clone());
 
-    // Add compression
-    app = app.layer(CompressionLayer::new());
-
     // Serve TeslaCam video files through the cttseraser FUSE mount, which
     // strips the `ctts` atom from Tesla MP4s so Chromium-based browsers can
     // play them. The setup crate (`sentryusb_setup::cttseraser_mount`) mounts
@@ -258,6 +258,37 @@ async fn main() {
     } else {
         info!("Running in development mode (no static file serving)");
     }
+
+    // Compression wraps everything *after* all routes are added. axum's
+    // `Router::layer` only wraps routes registered before the call, so we
+    // apply compression AFTER the api router + ServeDir nests + SPA fallback
+    // are in place. The predicate keeps already-compressed media bodies
+    // (MP4, MP3, JPEG, ZIP) and binary streams out of the gzip path:
+    //   - video/*  — Tesla MP4s under /TeslaCam/*; gzipping wastes CPU and
+    //                produces no size win on already-compressed H.264.
+    //   - audio/*  — /fs/* music/lock_chimes (MP3/AAC/OGG are pre-compressed).
+    //   - image/*  — already-compressed JPEG/PNG/WebP.
+    //   - application/octet-stream — /api/files/download streams arbitrary
+    //                binary; without Content-Length the default predicate
+    //                would gzip-stream the whole download. Skip.
+    //   - application/zip — /api/files/download-zip; entries inside the zip
+    //                are already DEFLATE'd, re-gzipping gains nothing.
+    //   - application/grpc, text/event-stream — never compress these.
+    // Size floor raised from the tower-http default of 32 bytes to 1024 to
+    // match nginx/Cloudflare defaults — sub-1 KB JSON responses don't benefit
+    // from gzip and incur per-request compression CPU. JSON above 1 KB and
+    // the SPA JS/CSS bundle still compress normally (1.2 MB → ~280 KB).
+    let compression = CompressionLayer::new().compress_when(
+        SizeAbove::new(1024)
+            .and(NotForContentType::new("video/"))
+            .and(NotForContentType::new("audio/"))
+            .and(NotForContentType::new("image/"))
+            .and(NotForContentType::new("application/octet-stream"))
+            .and(NotForContentType::new("application/zip"))
+            .and(NotForContentType::new("application/grpc"))
+            .and(NotForContentType::new("text/event-stream")),
+    );
+    app = app.layer(compression);
 
     // Auth middleware
     app = app.layer(axum::middleware::from_fn_with_state(
