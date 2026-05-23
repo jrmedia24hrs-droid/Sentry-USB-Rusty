@@ -279,6 +279,148 @@ function TelemetryStrip({ d, metric }: {
   )
 }
 
+/**
+ * Expanded telemetry panel for the selected-drive detail view.
+ * Mirrors the compact `TelemetryStrip` from the list rows but shows
+ * the full start→end values (battery, odometer) and individual tires.
+ * Whole section hides when no telemetry is present (pre-v6 drives,
+ * drives that never crossed a BLE sample, etc.); each subsection
+ * hides independently when its specific data is missing.
+ */
+function DriveTelemetryDetail({
+  d,
+  metric,
+}: {
+  d: DriveDetail
+  metric: boolean
+}) {
+  const hasBattery = d.batteryPctStart != null || d.batteryPctEnd != null || d.batteryPctUsed != null
+  const hasOdo = d.odometerMiStart != null || d.odometerMiEnd != null || d.odometerMiDriven != null
+  const hasInteriorTemp = d.interiorTempMinC != null || d.interiorTempMaxC != null
+  const hasExteriorTemp = d.exteriorTempAvgC != null
+  const hasHvac = d.hvacRuntimeS != null && d.hvacRuntimeS > 0
+  const hasTpms =
+    d.tireFlPsi != null ||
+    d.tireFrPsi != null ||
+    d.tireRlPsi != null ||
+    d.tireRrPsi != null
+  const hasSoftware = d.softwareVersion != null
+  const hasFsd = d.fsdVersion != null
+
+  const hasAny =
+    hasBattery || hasOdo || hasInteriorTemp || hasExteriorTemp ||
+    hasHvac || hasTpms || hasSoftware || hasFsd
+  if (!hasAny) return null
+
+  const tempStr = (c: number) =>
+    metric ? `${Math.round(c)}°C` : `${Math.round(c * 9 / 5 + 32)}°F`
+  const distStr = (mi: number) =>
+    metric ? `${(mi * 1.609344).toFixed(1)} km` : `${mi.toFixed(1)} mi`
+
+  return (
+    <div className="mb-2 rounded-lg border border-white/5 bg-white/[0.02] px-3 py-2">
+      <div className="mb-1.5 flex items-center gap-2 text-[10px] font-semibold uppercase tracking-wider text-slate-500">
+        <Zap className="h-3 w-3 text-emerald-400/80" />
+        Vehicle telemetry
+      </div>
+      <div className="flex flex-wrap gap-x-5 gap-y-1.5">
+        {hasOdo && (
+          <Stat
+            icon={<Gauge className="h-3 w-3" />}
+            label="Odometer"
+            value={
+              d.odometerMiStart != null && d.odometerMiEnd != null
+                ? `${distStr(d.odometerMiStart)} → ${distStr(d.odometerMiEnd)}`
+                : "—"
+            }
+            highlight
+          />
+        )}
+        {d.odometerMiDriven != null && d.odometerMiDriven > 0 && (
+          <Stat
+            label="Driven"
+            value={distStr(d.odometerMiDriven)}
+          />
+        )}
+        {hasBattery && (
+          <Stat
+            icon={<BatteryLow className="h-3 w-3" />}
+            label="Battery"
+            value={
+              d.batteryPctStart != null && d.batteryPctEnd != null
+                ? `${Math.round(d.batteryPctStart)}% → ${Math.round(d.batteryPctEnd)}%`
+                : "—"
+            }
+          />
+        )}
+        {d.batteryPctUsed != null && d.batteryPctUsed > 0 && (
+          <Stat label="Used" value={`${d.batteryPctUsed}%`} />
+        )}
+        {hasInteriorTemp && (
+          <Stat
+            icon={<Thermometer className="h-3 w-3" />}
+            label="Cabin temp"
+            value={
+              d.interiorTempMinC != null && d.interiorTempMaxC != null
+                ? `${tempStr(d.interiorTempMinC)} – ${tempStr(d.interiorTempMaxC)}`
+                : "—"
+            }
+          />
+        )}
+        {hasExteriorTemp && d.exteriorTempAvgC != null && (
+          <Stat
+            label="Ext temp"
+            value={tempStr(d.exteriorTempAvgC)}
+          />
+        )}
+        {hasHvac && d.hvacRuntimeS != null && (
+          <Stat
+            icon={<Wind className="h-3 w-3" />}
+            label="HVAC"
+            value={formatHvacRuntime(d.hvacRuntimeS)}
+          />
+        )}
+        {hasFsd && (
+          <Stat
+            icon={<Zap className="h-3 w-3" />}
+            label="FSD version"
+            value={d.fsdVersion!}
+            highlight
+          />
+        )}
+        {hasSoftware && (
+          <Stat label="Tesla OS" value={d.softwareVersion!} />
+        )}
+      </div>
+      {hasTpms && (
+        <div className="mt-1.5 border-t border-white/5 pt-1.5">
+          <div className="mb-1 flex items-center gap-1.5 text-[10px] uppercase tracking-wider text-slate-600">
+            <Disc className="h-3 w-3" />
+            Tire pressure (psi)
+          </div>
+          <div className="flex flex-wrap gap-x-5 gap-y-1">
+            <Stat label="Front L" value={d.tireFlPsi != null ? `${Math.round(d.tireFlPsi)}` : "—"} />
+            <Stat label="Front R" value={d.tireFrPsi != null ? `${Math.round(d.tireFrPsi)}` : "—"} />
+            <Stat label="Rear L" value={d.tireRlPsi != null ? `${Math.round(d.tireRlPsi)}` : "—"} />
+            <Stat label="Rear R" value={d.tireRrPsi != null ? `${Math.round(d.tireRrPsi)}` : "—"} />
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+/** Compact HVAC seconds → "8m" / "1h 5m" — same shape as
+ *  formatRuntime above, copied here so the detail panel doesn't
+ *  reach into list-row helpers. */
+function formatHvacRuntime(s: number): string {
+  if (s < 60) return `${s}s`
+  const m = Math.round(s / 60)
+  if (m < 60) return `${m}m`
+  const h = Math.floor(m / 60)
+  return `${h}h ${m - h * 60}m`
+}
+
 function assistedBadge(d: { fsdPercent: number; autosteerPercent: number; taccPercent: number; assistedPercent: number }): { label: string; pct: number } | null {
   const fsd = d.fsdPercent ?? 0
   const ap = d.autosteerPercent ?? 0
@@ -1561,6 +1703,12 @@ export default function Drives() {
                   </div>
                 </div>
               )}
+
+              {/* Vehicle telemetry — BLE samples rolled up into this
+                  drive's window. Section renders only when at least
+                  one field has a value; each row hides itself when
+                  its specific data is missing. */}
+              <DriveTelemetryDetail d={selectedDrive} metric={metric} />
 
               {/* Slider */}
               <div className="flex items-center gap-3">
