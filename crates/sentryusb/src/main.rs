@@ -151,8 +151,10 @@ async fn main() {
         tick.tick().await; // skip the first immediate tick
         loop {
             tick.tick().await;
-            // SAFETY: malloc_trim is async-signal-safe and thread-safe
-            // per glibc docs. Returns 1 if memory was released, 0 if not.
+            // SAFETY: malloc_trim is thread-safe (takes the arena mutex
+            // internally per glibc docs) and we call it from a tokio task,
+            // never a signal handler. Returns 1 if memory was released, 0
+            // if not.
             unsafe { libc::malloc_trim(0); }
         }
     });

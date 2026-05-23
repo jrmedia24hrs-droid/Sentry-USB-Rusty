@@ -216,10 +216,6 @@ pub async fn send_to_all(
     .await
 }
 
-/// Context-aware dispatch — preferred entry point for runtime
-/// notifications. Passes the extra context through to providers that
-/// can use it (currently just Sentry Connect); others ignore the extras
-/// and use title + message.
 /// Process-wide shared client for outbound notification dispatches.
 /// Built once on first send; reused for the lifetime of the process so
 /// we don't repeatedly stand up a fresh TLS pool + DNS cache + idle
@@ -242,6 +238,10 @@ fn notify_client() -> &'static reqwest::Client {
     })
 }
 
+/// Context-aware dispatch — preferred entry point for runtime
+/// notifications. Passes the extra context through to providers that
+/// can use it (currently just Sentry Connect); others ignore the extras
+/// and use title + message.
 pub async fn send_to_all_with_context(
     config: &NotifyConfig,
     req: &NotifyRequest<'_>,
