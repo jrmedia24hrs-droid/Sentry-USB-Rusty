@@ -7,9 +7,13 @@ Requires=bluetooth.target
 # migrate() run — the sampler relies on the v6 schema being in place
 # before it starts inserting into telemetry_samples.
 After=sentryusb.service
-# Won't start if the BLE binaries haven't been installed yet. Pairing
-# the Pi via the settings page lazily installs them; the unit picks up
-# on the next start after that completes.
+# Won't start if the BLE binaries haven't been installed yet. The
+# sampler binary itself, tesla-control (used to talk to the car), and
+# the BLE keypair (set during pairing) all need to be on disk before
+# we even attempt to run. Listing each separately means
+# `systemctl status` says exactly which one is missing rather than
+# spawning and crashing at ExecStart.
+ConditionPathExists=/root/bin/sentryusb-tesla-telemetry
 ConditionPathExists=/root/bin/tesla-control
 ConditionPathExists=/root/.ble/key_private.pem
 # Match sentryusb-ble.service's burst limits so a flaky boot doesn't

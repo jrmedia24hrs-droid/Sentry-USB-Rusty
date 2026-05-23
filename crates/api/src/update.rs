@@ -247,6 +247,68 @@ async fn self_update(target_version: Option<String>) -> anyhow::Result<String> {
     sentryusb_shell::run("chmod", &["+x", tmp]).await?;
     sentryusb_shell::run("mv", &[tmp, "/opt/sentryusb/sentryusb"]).await?;
 
+    // ── Tesla BLE telemetry sampler binary ──
+    //
+    // Pulled from the same release as the main binary so the schema
+    // version the sampler writes is locked to the schema the main
+    // binary expects. Best-effort: if the release doesn't include
+    // the telemetry binary (older release, unfinished CI) the update
+    // succeeds anyway and the sampler service stays inactive via its
+    // ConditionPathExists guard. Same arch-suffix, same repo, parallel
+    // URL shape — kept here rather than in migrate.rs so a single
+    // update pulls both binaries in lockstep.
+    let telemetry_url = if let Some(v) = &target_version {
+        format!(
+            "https://github.com/{}/releases/download/{}/sentryusb-tesla-telemetry-{}",
+            repo, v, suffix
+        )
+    } else {
+        format!(
+            "https://github.com/{}/releases/latest/download/sentryusb-tesla-telemetry-{}",
+            repo, suffix
+        )
+    };
+    let head_ok = sentryusb_shell::run_with_timeout(
+        std::time::Duration::from_secs(15),
+        "curl",
+        &["-sfI", "--max-time", "10", &telemetry_url],
+    )
+    .await
+    .is_ok();
+    if head_ok {
+        let telemetry_tmp = "/tmp/sentryusb-tesla-telemetry-update";
+        if sentryusb_shell::run_with_timeout(
+            std::time::Duration::from_secs(120),
+            "curl",
+            &["-fsSL", &telemetry_url, "-o", telemetry_tmp],
+        )
+        .await
+        .is_ok()
+        {
+            let _ = sentryusb_shell::run("mkdir", &["-p", "/root/bin"]).await;
+            let _ = sentryusb_shell::run("chmod", &["+x", telemetry_tmp]).await;
+            let _ = sentryusb_shell::run(
+                "mv",
+                &[telemetry_tmp, "/root/bin/sentryusb-tesla-telemetry"],
+            )
+            .await;
+            // Service file is installed by migrate.rs (sentryusb's
+            // startup script). Restart here so the freshly-installed
+            // binary picks up immediately rather than waiting for the
+            // post-reboot start.
+            let _ = sentryusb_shell::run(
+                "systemctl",
+                &["daemon-reload"],
+            )
+            .await;
+            let _ = sentryusb_shell::run(
+                "systemctl",
+                &["restart", "sentryusb-telemetry"],
+            )
+            .await;
+        }
+    }
+
     // Determine the tag to record. Use the requested target if any (it
     // matches the binary we just installed); otherwise resolve /latest.
     let tag = match target_version {

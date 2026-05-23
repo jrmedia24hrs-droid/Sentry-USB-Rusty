@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from "react"
-import { Bluetooth, CheckCircle, AlertCircle, Loader2, Wifi, WifiOff, ChevronDown, ChevronUp } from "lucide-react"
+import { Bluetooth, CheckCircle, AlertCircle, Loader2, Wifi, WifiOff, ChevronDown, ChevronUp, Eye, EyeOff } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { wsClient } from "@/lib/ws"
 import { PrefCard } from "@/components/settings/PrefCard"
@@ -72,6 +72,7 @@ export function BlePairButton() {
   const [outputOpen, setOutputOpen] = useState(false)
   const [latestSample, setLatestSample] = useState<BleLatestSample | null>(null)
   const [sampleLoading, setSampleLoading] = useState(false)
+  const [vinRevealed, setVinRevealed] = useState(false)
 
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -501,27 +502,52 @@ export function BlePairButton() {
 
   return (
     <PrefCard icon={icon} halo={halo} title="BLE Pairing" badge={badge}>
-      {/* VIN input — always visible so users can update it any time. */}
+      {/* VIN input — always visible so users can update it any time.
+          Masked by default once a full 17-char VIN is set, since
+          screenshots of the settings page (like the ones users share
+          for troubleshooting) shouldn't leak the VIN. The eye toggle
+          reveals it; partial values (mid-edit) always show in full so
+          typing isn't surprising. */}
       <label className="flex flex-col gap-1">
         <span className="t-xs text-slate-500">Tesla VIN (17 chars)</span>
-        <input
-          type="text"
-          value={vin}
-          maxLength={17}
-          autoCapitalize="characters"
-          spellCheck={false}
-          disabled={bleState === "disabled" || isActive || bleState === "loading"}
-          onChange={(e) => setVin(e.target.value.toUpperCase())}
-          placeholder="5YJ3E1EA..."
-          className={cn(
-            "rounded-lg border bg-white/5 px-3 py-1.5 font-mono text-xs uppercase tracking-wider text-slate-100",
-            "placeholder-slate-600 outline-none transition focus:ring-1",
-            vin && !validVin(vin)
-              ? "border-red-500/50 focus:border-red-500/50 focus:ring-red-500/25"
-              : "border-white/10 focus:border-blue-500/50 focus:ring-blue-500/25",
-            "disabled:opacity-50",
+        <div className="relative">
+          <input
+            type="text"
+            value={
+              !vinRevealed && vin.length === 17
+                ? `${vin.slice(0, 3)}${"•".repeat(11)}${vin.slice(-3)}`
+                : vin
+            }
+            maxLength={17}
+            autoCapitalize="characters"
+            spellCheck={false}
+            readOnly={!vinRevealed && vin.length === 17}
+            disabled={bleState === "disabled" || isActive || bleState === "loading"}
+            onChange={(e) => setVin(e.target.value.toUpperCase())}
+            placeholder="5YJ3E1EA..."
+            className={cn(
+              "w-full rounded-lg border bg-white/5 px-3 py-1.5 pr-9 font-mono text-xs uppercase tracking-wider text-slate-100",
+              "placeholder-slate-600 outline-none transition focus:ring-1",
+              vin && !validVin(vin)
+                ? "border-red-500/50 focus:border-red-500/50 focus:ring-red-500/25"
+                : "border-white/10 focus:border-blue-500/50 focus:ring-blue-500/25",
+              "disabled:opacity-50",
+              !vinRevealed && vin.length === 17 && "cursor-default",
+            )}
+          />
+          {vin.length === 17 && (
+            <button
+              type="button"
+              onClick={() => setVinRevealed((v) => !v)}
+              disabled={bleState === "disabled" || isActive || bleState === "loading"}
+              title={vinRevealed ? "Hide VIN" : "Reveal VIN"}
+              aria-label={vinRevealed ? "Hide VIN" : "Reveal VIN"}
+              className="absolute right-1.5 top-1/2 -translate-y-1/2 rounded p-1 text-slate-500 transition-colors hover:bg-white/5 hover:text-slate-300 disabled:opacity-50"
+            >
+              {vinRevealed ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+            </button>
           )}
-        />
+        </div>
       </label>
 
       <p

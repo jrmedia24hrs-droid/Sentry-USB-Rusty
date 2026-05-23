@@ -247,15 +247,54 @@ APEOF
   chmod 755 /etc/NetworkManager/dispatcher.d/10-sentryusb-ap
 fi
 
-# ── Install Tesla BLE telemetry sampler service ──
-# The sampler binary itself is shipped by the main sentryusb upgrade
-# path (it's a workspace member built by build.sh into the upgrade
-# tarball). Here we just lay down its systemd unit and enable it so
-# existing installs pick it up on next boot. Idempotent.
+# ── Install Tesla BLE telemetry sampler service + binary ──
+# Two concerns here:
+#   1. The systemd unit ships in the source tarball — copy it into place
+#      and enable it. Idempotent on every upgrade.
+#   2. The binary itself needs to be on disk for the service's
+#      ConditionPathExists to pass. Future updates pull both binaries
+#      together via update.rs::self_update, but THIS run (the first
+#      upgrade onto telemetry-aware code) won't have it — bootstrap by
+#      downloading it from the same GitHub release that just shipped the
+#      main sentryusb binary. Idempotent: skipped if already present.
 if [ -f "$TMPDIR/server/ble/sentryusb-telemetry.service" ]; then
   cp "$TMPDIR/server/ble/sentryusb-telemetry.service" "/etc/systemd/system/sentryusb-telemetry.service"
   systemctl daemon-reload
   systemctl enable sentryusb-telemetry 2>/dev/null || true
+
+  if [ ! -x /root/bin/sentryusb-tesla-telemetry ]; then
+    # Match the suffix scheme update.rs uses. Mirror its userspace-arch
+    # detection (dpkg first, falling back to uname -m) so a 64-bit kernel
+    # with 32-bit userspace doesn't fetch an unloadable binary.
+    _arch=$(dpkg --print-architecture 2>/dev/null || true)
+    case "$_arch" in
+      arm64)  _suffix=linux-arm64 ;;
+      armhf)  _suffix=linux-armv7 ;;
+      armel)  _suffix=linux-armv6 ;;
+      amd64)  _suffix=linux-amd64 ;;
+      *)
+        _arch=$(uname -m 2>/dev/null || echo "")
+        case "$_arch" in
+          aarch64) _suffix=linux-arm64 ;;
+          armv7l)  _suffix=linux-armv7 ;;
+          armv6l)  _suffix=linux-armv6 ;;
+          x86_64)  _suffix=linux-amd64 ;;
+          *)       _suffix="" ;;
+        esac
+        ;;
+    esac
+    if [ -n "$_suffix" ]; then
+      _tele_url="https://github.com/{repo}/releases/latest/download/sentryusb-tesla-telemetry-${{_suffix}}"
+      if curl -sfI --max-time 10 "$_tele_url" >/dev/null 2>&1; then
+        mkdir -p /root/bin
+        if curl -fsSL --max-time 120 "$_tele_url" -o /tmp/sentryusb-tesla-telemetry-update 2>/dev/null; then
+          chmod +x /tmp/sentryusb-tesla-telemetry-update
+          mv /tmp/sentryusb-tesla-telemetry-update /root/bin/sentryusb-tesla-telemetry
+        fi
+      fi
+    fi
+  fi
+
   # Only attempt restart if the binary is actually present — the
   # ConditionPathExists in the unit would otherwise log a confusing
   # "skipped" line on every upgrade where BLE isn't set up yet.
