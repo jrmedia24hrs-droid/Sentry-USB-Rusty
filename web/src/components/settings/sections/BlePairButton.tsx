@@ -47,10 +47,13 @@ interface BleLatestSample {
   ts: number | null
   seconds_ago?: number
   battery_pct?: number | null
-  battery_temp_c?: number | null
   interior_temp_c?: number | null
   exterior_temp_c?: number | null
   hvac_on?: boolean | null
+  tire_fl_psi?: number | null
+  tire_fr_psi?: number | null
+  tire_rl_psi?: number | null
+  tire_rr_psi?: number | null
   source?: string
 }
 
@@ -748,10 +751,29 @@ function TelemetryOutputPanel({
             </span>
           </div>
           <Row label="Battery" value={fmtPct(sample.battery_pct)} />
-          <Row label="Battery temp" value={fmtTemp(sample.battery_temp_c, metric)} />
           <Row label="Interior temp" value={fmtTemp(sample.interior_temp_c, metric)} />
           <Row label="Exterior temp" value={fmtTemp(sample.exterior_temp_c, metric)} />
           <Row label="HVAC" value={fmtBool(sample.hvac_on)} />
+          {/* Battery cell temperature intentionally omitted: Tesla
+              doesn't expose it via state-query APIs (BLE or REST).
+              Only battery_heater_on (a boolean) is available. */}
+          {/* TPMS — show the whole block only when at least one tire
+              reading is present. Cars without TPMS, or runs where the
+              `state tire-pressure` call failed, naturally hide it. */}
+          {(sample.tire_fl_psi != null ||
+            sample.tire_fr_psi != null ||
+            sample.tire_rl_psi != null ||
+            sample.tire_rr_psi != null) && (
+            <>
+              <div className="mt-1 border-t border-white/5 pt-1.5 text-[10px] uppercase tracking-wider text-slate-600">
+                Tire pressure (psi)
+              </div>
+              <Row label="Front left" value={fmtPsi(sample.tire_fl_psi)} />
+              <Row label="Front right" value={fmtPsi(sample.tire_fr_psi)} />
+              <Row label="Rear left" value={fmtPsi(sample.tire_rl_psi)} />
+              <Row label="Rear right" value={fmtPsi(sample.tire_rr_psi)} />
+            </>
+          )}
           {isStale && radioOwner === "keep_awake" && (
             <p className="pt-1 text-[10px] text-amber-400/80">
               {archiving
@@ -806,6 +828,12 @@ function fmtTemp(v: number | null | undefined, metric: boolean): string {
 function fmtBool(v: boolean | null | undefined): string {
   if (v == null) return "—"
   return v ? "on" : "off"
+}
+
+/** Tesla reports TPMS in PSI. We follow that — most users (US + EU)
+ *  read tire pressure in PSI even when other units are metric. */
+function fmtPsi(v: number | null | undefined): string {
+  return v == null ? "—" : `${Math.round(v)} psi`
 }
 
 /** Compact relative-time formatter for the live indicator. */

@@ -57,7 +57,6 @@ pub fn compute_telemetry_for_window(
                 count(battery_pct),
                 count(hvac_on),
                 sum(CASE WHEN hvac_on = 1 THEN 1 ELSE 0 END),
-                avg(battery_temp_c),
                 min(interior_temp_c),
                 max(interior_temp_c),
                 avg(exterior_temp_c)
@@ -70,22 +69,20 @@ pub fn compute_telemetry_for_window(
                     r.get::<_, i64>(1)?,              // battery_pct count
                     r.get::<_, i64>(2)?,              // hvac_on count
                     r.get::<_, Option<i64>>(3)?,      // hvac_on=1 count
-                    r.get::<_, Option<f64>>(4)?,      // battery_temp_avg
-                    r.get::<_, Option<f64>>(5)?,      // interior min
-                    r.get::<_, Option<f64>>(6)?,      // interior max
-                    r.get::<_, Option<f64>>(7)?,      // exterior avg
+                    r.get::<_, Option<f64>>(4)?,      // interior min
+                    r.get::<_, Option<f64>>(5)?,      // interior max
+                    r.get::<_, Option<f64>>(6)?,      // exterior avg
                 ))
             },
         )
         .optional()?
-        .unwrap_or((0, 0, 0, None, None, None, None, None));
+        .unwrap_or((0, 0, 0, None, None, None, None));
 
     let (
         total_samples,
         _bat_count,
         hvac_total,
         hvac_on_count,
-        battery_temp_avg,
         interior_temp_min,
         interior_temp_max,
         exterior_temp_avg,
@@ -117,6 +114,27 @@ pub fn compute_telemetry_for_window(
         )
         .optional()?;
 
+    // TPMS — latest non-null reading per tire within the window.
+    // Pressures change slowly so the most recent sample is the
+    // canonical "what was it during this clip" value.
+    let latest_tire = |col: &str| -> Result<Option<f64>> {
+        Ok(conn
+            .query_row(
+                &format!(
+                    "SELECT {col} FROM telemetry_samples \
+                     WHERE ts BETWEEN ?1 AND ?2 AND {col} IS NOT NULL \
+                     ORDER BY ts DESC LIMIT 1"
+                ),
+                params![start_ts, end_ts],
+                |r| r.get(0),
+            )
+            .optional()?)
+    };
+    let tire_fl_psi = latest_tire("tire_fl_psi")?;
+    let tire_fr_psi = latest_tire("tire_fr_psi")?;
+    let tire_rl_psi = latest_tire("tire_rl_psi")?;
+    let tire_rr_psi = latest_tire("tire_rr_psi")?;
+
     // hvac_runtime only meaningful when at least one sample populated
     // the hvac_on column. If every sample's hvac_on is NULL (the
     // body-controller-state sampler path doesn't fill it), leave the
@@ -137,11 +155,14 @@ pub fn compute_telemetry_for_window(
     Ok(RouteTelemetryAggregates {
         battery_pct_start,
         battery_pct_end,
-        battery_temp_avg,
         interior_temp_min,
         interior_temp_max,
         exterior_temp_avg,
         hvac_runtime_s,
+        tire_fl_psi,
+        tire_fr_psi,
+        tire_rl_psi,
+        tire_rr_psi,
     })
 }
 
@@ -167,24 +188,34 @@ pub fn write_route_telemetry(
     file: &str,
     agg: &RouteTelemetryAggregates,
 ) -> Result<()> {
+    // `battery_temp_avg` is left out of the UPDATE entirely — we don't
+    // populate it any more. The column stays in the schema as nullable
+    // forward-compat; old rows that happened to have a value (none in
+    // practice, since the sampler never wrote one) are preserved.
     conn.execute(
         "UPDATE routes SET
             battery_pct_start = ?1,
             battery_pct_end   = ?2,
-            battery_temp_avg  = ?3,
-            interior_temp_min = ?4,
-            interior_temp_max = ?5,
-            exterior_temp_avg = ?6,
-            hvac_runtime_s    = ?7
-         WHERE file = ?8",
+            interior_temp_min = ?3,
+            interior_temp_max = ?4,
+            exterior_temp_avg = ?5,
+            hvac_runtime_s    = ?6,
+            tire_fl_psi       = ?7,
+            tire_fr_psi       = ?8,
+            tire_rl_psi       = ?9,
+            tire_rr_psi       = ?10
+         WHERE file = ?11",
         params![
             agg.battery_pct_start,
             agg.battery_pct_end,
-            agg.battery_temp_avg,
             agg.interior_temp_min,
             agg.interior_temp_max,
             agg.exterior_temp_avg,
             agg.hvac_runtime_s,
+            agg.tire_fl_psi,
+            agg.tire_fr_psi,
+            agg.tire_rl_psi,
+            agg.tire_rr_psi,
             file,
         ],
     )?;
@@ -238,7 +269,6 @@ mod tests {
         assert_eq!(a.interior_temp_min, Some(20.0));
         assert_eq!(a.interior_temp_max, Some(24.0));
         assert_eq!(a.exterior_temp_avg, Some(10.0));
-        assert_eq!(a.battery_temp_avg, Some(16.0));
     }
 
     #[test]
@@ -290,11 +320,11 @@ mod tests {
         let agg = RouteTelemetryAggregates {
             battery_pct_start: Some(73.0),
             battery_pct_end: Some(72.0),
-            battery_temp_avg: Some(18.5),
             interior_temp_min: Some(20.0),
             interior_temp_max: Some(24.0),
             exterior_temp_avg: Some(10.5),
             hvac_runtime_s: Some(45),
+            ..Default::default()
         };
         write_route_telemetry(
             &conn,
@@ -302,18 +332,17 @@ mod tests {
             &agg,
         )
         .unwrap();
-        let (bs, be, bt, imin, imax, ea, hvac): (
-            Option<f64>, Option<f64>, Option<f64>, Option<f64>, Option<f64>, Option<f64>, Option<i64>,
+        let (bs, be, imin, imax, ea, hvac): (
+            Option<f64>, Option<f64>, Option<f64>, Option<f64>, Option<f64>, Option<i64>,
         ) = conn.query_row(
-            "SELECT battery_pct_start, battery_pct_end, battery_temp_avg, \
+            "SELECT battery_pct_start, battery_pct_end, \
                     interior_temp_min, interior_temp_max, exterior_temp_avg, hvac_runtime_s \
              FROM routes WHERE file = ?1",
             params!["RecentClips/2026-05-17/2026-05-17_18-47-34-front.mp4"],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
         ).unwrap();
         assert_eq!(bs, Some(73.0));
         assert_eq!(be, Some(72.0));
-        assert_eq!(bt, Some(18.5));
         assert_eq!(imin, Some(20.0));
         assert_eq!(imax, Some(24.0));
         assert_eq!(ea, Some(10.5));

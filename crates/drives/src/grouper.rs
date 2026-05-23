@@ -917,11 +917,14 @@ fn build_summary(
         battery_pct_start: None,
         battery_pct_end: None,
         battery_pct_used: None,
-        battery_temp_avg_c: None,
         interior_temp_min_c: None,
         interior_temp_max_c: None,
         exterior_temp_avg_c: None,
         hvac_runtime_s: None,
+        tire_fl_psi: None,
+        tire_fr_psi: None,
+        tire_rl_psi: None,
+        tire_rr_psi: None,
         // Default null source to "sei" so the JSON contract matches Go
         // (`hide_tessie_overlapping_sei` and the FSD analytics filter
         // both compare to the literal "sei" string).
@@ -2617,11 +2620,14 @@ fn build_summary_from_aggregates(
         battery_pct_start: telemetry.battery_pct_start,
         battery_pct_end: telemetry.battery_pct_end,
         battery_pct_used: telemetry.battery_pct_used,
-        battery_temp_avg_c: telemetry.battery_temp_avg_c,
         interior_temp_min_c: telemetry.interior_temp_min_c,
         interior_temp_max_c: telemetry.interior_temp_max_c,
         exterior_temp_avg_c: telemetry.exterior_temp_avg_c,
         hvac_runtime_s: telemetry.hvac_runtime_s,
+        tire_fl_psi: telemetry.tire_fl_psi,
+        tire_fr_psi: telemetry.tire_fr_psi,
+        tire_rl_psi: telemetry.tire_rl_psi,
+        tire_rr_psi: telemetry.tire_rr_psi,
         // Match Go: null/empty source becomes "sei".
         source: Some(
             first_clip
@@ -2653,11 +2659,17 @@ struct DriveTelemetryRollup {
     battery_pct_start: Option<f64>,
     battery_pct_end: Option<f64>,
     battery_pct_used: Option<f64>,
-    battery_temp_avg_c: Option<f64>,
     interior_temp_min_c: Option<f64>,
     interior_temp_max_c: Option<f64>,
     exterior_temp_avg_c: Option<f64>,
     hvac_runtime_s: Option<i64>,
+    /// v7 TPMS — latest non-null reading per tire across the drive's
+    /// clips (clips are time-ordered, so "latest" = last clip that
+    /// had a value for that wheel).
+    tire_fl_psi: Option<f64>,
+    tire_fr_psi: Option<f64>,
+    tire_rl_psi: Option<f64>,
+    tire_rr_psi: Option<f64>,
 }
 
 fn roll_up_telemetry(clips: &[SubClipSummary]) -> DriveTelemetryRollup {
@@ -2669,12 +2681,15 @@ fn roll_up_telemetry(clips: &[SubClipSummary]) -> DriveTelemetryRollup {
     let mut battery_pct_end: Option<f64> = None;
     let mut interior_min: Option<f64> = None;
     let mut interior_max: Option<f64> = None;
-    let mut bat_temp_sum = 0.0_f64;
-    let mut bat_temp_n = 0_i64;
     let mut ext_temp_sum = 0.0_f64;
     let mut ext_temp_n = 0_i64;
     let mut hvac_sum = 0_i64;
     let mut hvac_any = false;
+    // TPMS — last non-null wins (clips iterate time-ordered).
+    let mut tire_fl: Option<f64> = None;
+    let mut tire_fr: Option<f64> = None;
+    let mut tire_rl: Option<f64> = None;
+    let mut tire_rr: Option<f64> = None;
 
     for clip in clips {
         if !seen.insert(clip.summary.file.as_str()) {
@@ -2693,10 +2708,6 @@ fn roll_up_telemetry(clips: &[SubClipSummary]) -> DriveTelemetryRollup {
         if let Some(v) = t.interior_temp_max {
             interior_max = Some(interior_max.map_or(v, |m| m.max(v)));
         }
-        if let Some(v) = t.battery_temp_avg {
-            bat_temp_sum += v;
-            bat_temp_n += 1;
-        }
         if let Some(v) = t.exterior_temp_avg {
             ext_temp_sum += v;
             ext_temp_n += 1;
@@ -2705,6 +2716,10 @@ fn roll_up_telemetry(clips: &[SubClipSummary]) -> DriveTelemetryRollup {
             hvac_sum += v;
             hvac_any = true;
         }
+        if t.tire_fl_psi.is_some() { tire_fl = t.tire_fl_psi; }
+        if t.tire_fr_psi.is_some() { tire_fr = t.tire_fr_psi; }
+        if t.tire_rl_psi.is_some() { tire_rl = t.tire_rl_psi; }
+        if t.tire_rr_psi.is_some() { tire_rr = t.tire_rr_psi; }
     }
 
     let battery_pct_used = match (battery_pct_start, battery_pct_end) {
@@ -2716,11 +2731,6 @@ fn roll_up_telemetry(clips: &[SubClipSummary]) -> DriveTelemetryRollup {
         battery_pct_start: battery_pct_start.map(round2),
         battery_pct_end: battery_pct_end.map(round2),
         battery_pct_used,
-        battery_temp_avg_c: if bat_temp_n > 0 {
-            Some(round2(bat_temp_sum / bat_temp_n as f64))
-        } else {
-            None
-        },
         interior_temp_min_c: interior_min.map(round2),
         interior_temp_max_c: interior_max.map(round2),
         exterior_temp_avg_c: if ext_temp_n > 0 {
@@ -2729,6 +2739,10 @@ fn roll_up_telemetry(clips: &[SubClipSummary]) -> DriveTelemetryRollup {
             None
         },
         hvac_runtime_s: if hvac_any { Some(hvac_sum) } else { None },
+        tire_fl_psi: tire_fl.map(round2),
+        tire_fr_psi: tire_fr.map(round2),
+        tire_rl_psi: tire_rl.map(round2),
+        tire_rr_psi: tire_rr.map(round2),
     }
 }
 
@@ -3260,7 +3274,6 @@ mod tests {
         battery_end: Option<f64>,
         interior_min: Option<f64>,
         interior_max: Option<f64>,
-        battery_temp_avg: Option<f64>,
         exterior_temp_avg: Option<f64>,
         hvac_runtime_s: Option<i64>,
     ) -> RouteSummary {
@@ -3276,11 +3289,11 @@ mod tests {
             telemetry: crate::types::RouteTelemetryAggregates {
                 battery_pct_start: battery_start,
                 battery_pct_end: battery_end,
-                battery_temp_avg,
                 interior_temp_min: interior_min,
                 interior_temp_max: interior_max,
                 exterior_temp_avg,
                 hvac_runtime_s,
+                ..Default::default()
             },
         }
     }
@@ -3302,7 +3315,6 @@ mod tests {
         assert!(r.battery_pct_used.is_none());
         assert!(r.interior_temp_min_c.is_none());
         assert!(r.interior_temp_max_c.is_none());
-        assert!(r.battery_temp_avg_c.is_none());
         assert!(r.exterior_temp_avg_c.is_none());
         assert!(r.hvac_runtime_s.is_none());
     }
@@ -3311,15 +3323,15 @@ mod tests {
     fn rollup_battery_start_end_derived_from_first_and_last_clips() {
         let s1 = clip_with_telemetry(
             "/cam/2025-01-15_12-00-00-front.mp4",
-            Some(80.0), Some(79.5), None, None, None, None, None,
+            Some(80.0), Some(79.5), None, None, None, None,
         );
         let s2 = clip_with_telemetry(
             "/cam/2025-01-15_12-01-00-front.mp4",
-            Some(79.5), Some(78.8), None, None, None, None, None,
+            Some(79.5), Some(78.8), None, None, None, None,
         );
         let s3 = clip_with_telemetry(
             "/cam/2025-01-15_12-02-00-front.mp4",
-            Some(78.8), Some(78.0), None, None, None, None, None,
+            Some(78.8), Some(78.0), None, None, None, None,
         );
         let clips = vec![
             SubClipSummary::whole(TimedSummary { summary: &s1, timestamp: ts(0) }),
@@ -3336,15 +3348,15 @@ mod tests {
     fn rollup_interior_temp_uses_extremes_across_clips() {
         let s1 = clip_with_telemetry(
             "/cam/2025-01-15_12-00-00-front.mp4",
-            None, None, Some(18.0), Some(22.0), None, None, None,
+            None, None, Some(18.0), Some(22.0), None, None,
         );
         let s2 = clip_with_telemetry(
             "/cam/2025-01-15_12-01-00-front.mp4",
-            None, None, Some(20.0), Some(28.0), None, None, None,
+            None, None, Some(20.0), Some(28.0), None, None,
         );
         let s3 = clip_with_telemetry(
             "/cam/2025-01-15_12-02-00-front.mp4",
-            None, None, Some(17.0), Some(25.0), None, None, None,
+            None, None, Some(17.0), Some(25.0), None, None,
         );
         let clips = vec![
             SubClipSummary::whole(TimedSummary { summary: &s1, timestamp: ts(0) }),
@@ -3360,15 +3372,15 @@ mod tests {
     fn rollup_hvac_runtime_sums_per_clip_estimates() {
         let s1 = clip_with_telemetry(
             "/cam/2025-01-15_12-00-00-front.mp4",
-            None, None, None, None, None, None, Some(30),
+            None, None, None, None, None, Some(30),
         );
         let s2 = clip_with_telemetry(
             "/cam/2025-01-15_12-01-00-front.mp4",
-            None, None, None, None, None, None, Some(60),
+            None, None, None, None, None, Some(60),
         );
         let s3 = clip_with_telemetry(
             "/cam/2025-01-15_12-02-00-front.mp4",
-            None, None, None, None, None, None, Some(45),
+            None, None, None, None, None, Some(45),
         );
         let clips = vec![
             SubClipSummary::whole(TimedSummary { summary: &s1, timestamp: ts(0) }),
@@ -3386,15 +3398,15 @@ mod tests {
         // values across the gap rather than the bare clip's None.
         let s1 = clip_with_telemetry(
             "/cam/2025-01-15_12-00-00-front.mp4",
-            Some(60.0), None, None, None, None, None, None,
+            Some(60.0), None, None, None, None, None,
         );
         let s2 = clip_with_telemetry(
             "/cam/2025-01-15_12-01-00-front.mp4",
-            None, None, None, None, None, None, None,
+            None, None, None, None, None, None,
         );
         let s3 = clip_with_telemetry(
             "/cam/2025-01-15_12-02-00-front.mp4",
-            None, Some(55.0), None, None, None, None, None,
+            None, Some(55.0), None, None, None, None,
         );
         let clips = vec![
             SubClipSummary::whole(TimedSummary { summary: &s1, timestamp: ts(0) }),
@@ -3414,7 +3426,7 @@ mod tests {
         // clip with an internal park gap.)
         let s = clip_with_telemetry(
             "/cam/2025-01-15_12-00-00-front.mp4",
-            Some(70.0), Some(69.0), None, None, None, None, Some(30),
+            Some(70.0), Some(69.0), None, None, None, Some(30),
         );
         let clips = vec![
             SubClipSummary::whole(TimedSummary { summary: &s, timestamp: ts(0) }),

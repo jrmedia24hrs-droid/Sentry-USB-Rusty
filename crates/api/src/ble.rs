@@ -297,25 +297,55 @@ pub async fn ble_latest_sample(
     let store = s.drives.store.clone();
     let row = tokio::task::spawn_blocking(move || {
         store.with_locked_conn(|conn| {
-            conn.query_row(
-                "SELECT ts, battery_pct, battery_temp_c, interior_temp_c, \
-                        exterior_temp_c, hvac_on, source \
-                 FROM telemetry_samples \
-                 ORDER BY ts DESC LIMIT 1",
-                [],
-                |r| {
-                    Ok((
-                        r.get::<_, i64>(0)?,
-                        r.get::<_, Option<f64>>(1)?,
-                        r.get::<_, Option<f64>>(2)?,
-                        r.get::<_, Option<f64>>(3)?,
-                        r.get::<_, Option<f64>>(4)?,
-                        r.get::<_, Option<i64>>(5)?,
-                        r.get::<_, String>(6)?,
-                    ))
-                },
-            )
-            .ok()
+            // battery_temp_c intentionally not selected — Tesla doesn't
+            // expose battery cell temp via the state API, so the column
+            // is always NULL. Including it in the response would just
+            // advertise a field that's never populated.
+            // Pull the most recent sample row plus the latest non-null
+            // TPMS reading per tire (which may live in an older sample
+            // than the most-recent one — tires update slowly).
+            let latest = conn
+                .query_row(
+                    "SELECT ts, battery_pct, interior_temp_c, \
+                            exterior_temp_c, hvac_on, source \
+                     FROM telemetry_samples \
+                     ORDER BY ts DESC LIMIT 1",
+                    [],
+                    |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, Option<f64>>(1)?,
+                            r.get::<_, Option<f64>>(2)?,
+                            r.get::<_, Option<f64>>(3)?,
+                            r.get::<_, Option<i64>>(4)?,
+                            r.get::<_, String>(5)?,
+                        ))
+                    },
+                )
+                .ok();
+            let latest_tire = |col: &str| -> Option<f64> {
+                conn.query_row(
+                    &format!(
+                        "SELECT {col} FROM telemetry_samples \
+                         WHERE {col} IS NOT NULL \
+                         ORDER BY ts DESC LIMIT 1"
+                    ),
+                    [],
+                    |r| r.get(0),
+                )
+                .ok()
+            };
+            latest.map(|row| {
+                (
+                    row,
+                    (
+                        latest_tire("tire_fl_psi"),
+                        latest_tire("tire_fr_psi"),
+                        latest_tire("tire_rl_psi"),
+                        latest_tire("tire_rr_psi"),
+                    ),
+                )
+            })
         })
     })
     .await
@@ -328,17 +358,23 @@ pub async fn ble_latest_sample(
         .unwrap_or(0);
 
     match row {
-        Some((ts, battery_pct, battery_temp_c, interior_temp_c, exterior_temp_c, hvac_on, source)) => {
+        Some((
+            (ts, battery_pct, interior_temp_c, exterior_temp_c, hvac_on, source),
+            (tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi),
+        )) => {
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
                     "ts": ts,
                     "seconds_ago": (now - ts).max(0),
                     "battery_pct": battery_pct,
-                    "battery_temp_c": battery_temp_c,
                     "interior_temp_c": interior_temp_c,
                     "exterior_temp_c": exterior_temp_c,
                     "hvac_on": hvac_on.map(|v| v != 0),
+                    "tire_fl_psi": tire_fl_psi,
+                    "tire_fr_psi": tire_fr_psi,
+                    "tire_rl_psi": tire_rl_psi,
+                    "tire_rr_psi": tire_rr_psi,
                     "source": source,
                 })),
             )

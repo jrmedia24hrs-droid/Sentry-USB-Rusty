@@ -35,6 +35,13 @@ pub struct Sample {
     pub interior_temp_c: Option<f64>,
     pub exterior_temp_c: Option<f64>,
     pub hvac_on: Option<bool>,
+    // TPMS pressures in PSI. All four optional — cars without TPMS
+    // (or runs where the `state tire-pressure` call fails / times
+    // out) just leave these as None and the UI hides the row.
+    pub tire_fl_psi: Option<f64>,
+    pub tire_fr_psi: Option<f64>,
+    pub tire_rl_psi: Option<f64>,
+    pub tire_rr_psi: Option<f64>,
     pub source: String,
 }
 
@@ -44,23 +51,24 @@ pub struct Sample {
 pub async fn sample_state(vin: &str) -> Result<Sample> {
     let climate = run_state(vin, "climate").await?;
     let charge = run_state(vin, "charge").await?;
+    // tire-pressure is best-effort: cars without TPMS, or the rare
+    // model that doesn't expose this category, return an error
+    // instead of populating fields. Don't let it fail the whole
+    // sample — just record None for the four tires.
+    let tires = run_state(vin, "tire-pressure").await.ok();
     let now = now_secs();
-    // Battery temp may live in either state-payload depending on SDK
-    // version — try `charge` first (where it semantically belongs) then
-    // fall back to `climate` (where the battery heater fields cluster).
-    let battery_temp_candidates: &[&str] = &[
-        "batteryHeaterCurrentTemp",
-        "batteryTemp",
-        "battery_temp",
-        "batteryTempCelsius",
-        "packTempCelsius",
-        "batteryHeaterTemp",
-    ];
+    // NOTE on battery_temp_c: Tesla's BLE state API does NOT expose
+    // battery cell temperature. Both charge_state and climate_state
+    // only return `battery_heater_on` / `battery_heater_no_power`
+    // (booleans — is the heater running, not how hot the pack is).
+    // The BMS knows the temperature internally but it isn't part of
+    // the public state query surface. We leave the column nullable
+    // in the schema for forward compatibility (in case Tesla adds it
+    // later) but we don't waste a probe trying to find it.
     Ok(Sample {
         ts: now,
         battery_pct: pick_f64(&charge, &["batteryLevel", "battery_level", "batteryPct"]),
-        battery_temp_c: pick_f64(&charge, battery_temp_candidates)
-            .or_else(|| pick_f64(&climate, battery_temp_candidates)),
+        battery_temp_c: None,
         interior_temp_c: pick_f64(
             &climate,
             &["insideTempCelsius", "insideTemp", "inside_temp", "insideTempC"],
@@ -73,6 +81,20 @@ pub async fn sample_state(vin: &str) -> Result<Sample> {
             &climate,
             &["isClimateOn", "is_climate_on", "hvacAuto", "climateKeeperMode"],
         ),
+        // TPMS — Tesla emits these as `tpms_pressure_fl|fr|rl|rr` in
+        // PSI on cars that have TPMS. tires=None when the call failed.
+        tire_fl_psi: tires
+            .as_ref()
+            .and_then(|t| pick_f64(t, &["tpmsPressureFl", "tpms_pressure_fl"])),
+        tire_fr_psi: tires
+            .as_ref()
+            .and_then(|t| pick_f64(t, &["tpmsPressureFr", "tpms_pressure_fr"])),
+        tire_rl_psi: tires
+            .as_ref()
+            .and_then(|t| pick_f64(t, &["tpmsPressureRl", "tpms_pressure_rl"])),
+        tire_rr_psi: tires
+            .as_ref()
+            .and_then(|t| pick_f64(t, &["tpmsPressureRr", "tpms_pressure_rr"])),
         source: "state".into(),
     })
 }

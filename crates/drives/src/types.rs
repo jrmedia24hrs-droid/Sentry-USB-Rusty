@@ -244,8 +244,6 @@ pub struct DriveSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub battery_pct_used: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub battery_temp_avg_c: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interior_temp_min_c: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interior_temp_max_c: Option<f64>,
@@ -253,6 +251,17 @@ pub struct DriveSummary {
     pub exterior_temp_avg_c: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hvac_runtime_s: Option<i64>,
+    // v7 TPMS rollup — latest non-null PSI per tire across the
+    // drive's clips. Omitted when null so the UI naturally hides
+    // the TPMS section for cars without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tire_fl_psi: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tire_fr_psi: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tire_rl_psi: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tire_rr_psi: Option<f64>,
     // Provenance
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
@@ -414,15 +423,24 @@ pub struct RouteAggregates {
 /// whose `ts` falls inside the clip's 60s window. Defined here (rather
 /// than in `aggregate_telemetry.rs`) so `RouteSummary` can embed it
 /// without a circular module dependency.
+///
+/// Note: the `battery_temp_avg` column on the routes table is left
+/// nullable in the schema for forward compatibility but is no longer
+/// populated — Tesla's state API doesn't expose battery cell temp.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RouteTelemetryAggregates {
     pub battery_pct_start: Option<f64>,
     pub battery_pct_end: Option<f64>,
-    pub battery_temp_avg: Option<f64>,
     pub interior_temp_min: Option<f64>,
     pub interior_temp_max: Option<f64>,
     pub exterior_temp_avg: Option<f64>,
     pub hvac_runtime_s: Option<i64>,
+    /// v7 TPMS — latest non-null pressure per tire (PSI) within the
+    /// clip's 60s window. All four None on cars without TPMS.
+    pub tire_fl_psi: Option<f64>,
+    pub tire_fr_psi: Option<f64>,
+    pub tire_rl_psi: Option<f64>,
+    pub tire_rr_psi: Option<f64>,
 }
 
 /// BLOB-free row shape used by the summary endpoints. Carries the

@@ -32,8 +32,9 @@ pub fn open() -> Result<Connection> {
 pub fn insert(conn: &Connection, s: &Sample) -> Result<()> {
     conn.execute(
         "INSERT OR IGNORE INTO telemetry_samples \
-         (ts, battery_pct, battery_temp_c, interior_temp_c, exterior_temp_c, hvac_on, source) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+         (ts, battery_pct, battery_temp_c, interior_temp_c, exterior_temp_c, hvac_on, \
+          tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi, source) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             s.ts,
             s.battery_pct,
@@ -41,6 +42,10 @@ pub fn insert(conn: &Connection, s: &Sample) -> Result<()> {
             s.interior_temp_c,
             s.exterior_temp_c,
             s.hvac_on.map(|b| if b { 1_i64 } else { 0_i64 }),
+            s.tire_fl_psi,
+            s.tire_fr_psi,
+            s.tire_rl_psi,
+            s.tire_rr_psi,
             s.source,
         ],
     )?;
@@ -68,6 +73,10 @@ mod tests {
             interior_temp_c: Some(22.0),
             exterior_temp_c: Some(12.0),
             hvac_on: Some(true),
+            tire_fl_psi: Some(40.0),
+            tire_fr_psi: Some(40.5),
+            tire_rl_psi: Some(38.5),
+            tire_rr_psi: Some(39.0),
             source: "state".into(),
         };
         insert(&conn, &s).unwrap();

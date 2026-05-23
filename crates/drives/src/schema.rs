@@ -28,7 +28,15 @@ use rusqlite::{params, Connection, OptionalExtension};
 /// end_ts window. Samples are written by the tesla_telemetry daemon
 /// independently of drive discovery; the aggregator joins them in
 /// during `compute_route_aggregates`. Unmatched samples are kept.
-pub const CURRENT_SCHEMA_VERSION: i32 = 6;
+///
+/// v6 -> v7: add TPMS (tire pressure) columns to both
+/// `telemetry_samples` and `routes`. Tesla exposes 4 tire pressures
+/// via `state tire-pressure` in PSI. Per-route columns store the
+/// latest non-null reading per tire within each clip's 60s window;
+/// per-drive rollup takes the latest across the drive's clips.
+/// All nullable — cars without TPMS or pre-TPMS-sampler drives
+/// simply stay NULL and the UI hides the row.
+pub const CURRENT_SCHEMA_VERSION: i32 = 7;
 
 /// v1 DDL. Each statement is idempotent (`IF NOT EXISTS`) so `migrate()`
 /// is safe on every startup. Column shapes and names match Go exactly —
@@ -163,6 +171,33 @@ const V6_NEW_TABLES: &[&str] = &[
     ) WITHOUT ROWID",
 ];
 
+/// v7 TPMS columns on `telemetry_samples`. Added via ALTER on
+/// existing v6 tables and inline for fresh installs via the CREATE
+/// in V6_NEW_TABLES (older databases that miss them get caught by
+/// the `list_telemetry_columns` check below).
+///
+/// Values are in PSI (Tesla's native unit). NULL on cars without
+/// TPMS or when the sampler skipped the call (sleep mode uses
+/// `body-controller-state` which doesn't include tire data).
+pub const V7_TELEMETRY_TPMS_COLUMNS: &[(&str, &str)] = &[
+    ("tire_fl_psi", "REAL"),
+    ("tire_fr_psi", "REAL"),
+    ("tire_rl_psi", "REAL"),
+    ("tire_rr_psi", "REAL"),
+];
+
+/// v7 TPMS rollup columns on `routes`. Latest non-null reading per
+/// tire within the clip's 60s window. Tire pressure changes slowly
+/// (minutes-to-hours) so "latest" is a sensible single-value
+/// representative — drive-level rollup takes the latest across all
+/// the drive's clips.
+pub const V7_ROUTE_TPMS_COLUMNS: &[(&str, &str)] = &[
+    ("tire_fl_psi", "REAL"),
+    ("tire_fr_psi", "REAL"),
+    ("tire_rl_psi", "REAL"),
+    ("tire_rr_psi", "REAL"),
+];
+
 /// Bring the DB up to `CURRENT_SCHEMA_VERSION`. Safe on every open —
 /// idempotent by construction.
 pub fn migrate(conn: &Connection) -> Result<()> {
@@ -178,15 +213,16 @@ pub fn migrate(conn: &Connection) -> Result<()> {
             .with_context(|| format!("migrate: applying v6 DDL {:?}", truncate(stmt, 60)))?;
     }
 
-    // v2/v3/v4/v6 upgrade: add columns to existing routes tables. Check
-    // column presence rather than parsing schema_version to stay robust
-    // against DBs restored from future-version backups.
+    // v2/v3/v4/v6/v7 upgrade: add columns to existing routes tables.
+    // Check column presence rather than parsing schema_version to stay
+    // robust against DBs restored from future-version backups.
     let existing = list_route_columns(conn)?;
     for (name, typ) in V2_ROUTE_AGGREGATE_COLUMNS
         .iter()
         .chain(V3_ROUTE_CLOUD_COLUMNS.iter())
         .chain(V4_ROUTE_TESSIE_COLUMNS.iter())
         .chain(V6_ROUTE_TELEMETRY_COLUMNS.iter())
+        .chain(V7_ROUTE_TPMS_COLUMNS.iter())
     {
         if existing.contains(*name) {
             continue;
@@ -194,6 +230,19 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         let sql = format!("ALTER TABLE routes ADD COLUMN {} {}", name, typ);
         conn.execute(&sql, [])
             .with_context(|| format!("migrate: adding routes.{}", name))?;
+    }
+
+    // v7 upgrade: add TPMS columns to existing telemetry_samples
+    // tables. Fresh DBs land via V6_NEW_TABLES which doesn't include
+    // them — caught here on the first migrate after the v7 bump.
+    let existing_tele = list_telemetry_columns(conn)?;
+    for (name, typ) in V7_TELEMETRY_TPMS_COLUMNS.iter() {
+        if existing_tele.contains(*name) {
+            continue;
+        }
+        let sql = format!("ALTER TABLE telemetry_samples ADD COLUMN {} {}", name, typ);
+        conn.execute(&sql, [])
+            .with_context(|| format!("migrate: adding telemetry_samples.{}", name))?;
     }
 
     // v3 partial index. Idempotent.
@@ -265,6 +314,18 @@ fn list_route_columns(conn: &Connection) -> Result<std::collections::HashSet<Str
     Ok(cols)
 }
 
+/// Return the set of column names present on the `telemetry_samples`
+/// table. Returns empty when the table doesn't exist yet (older DB
+/// caught mid-migration); the v7 ALTER loop then no-ops harmlessly.
+fn list_telemetry_columns(conn: &Connection) -> Result<std::collections::HashSet<String>> {
+    let mut stmt =
+        conn.prepare("SELECT name FROM pragma_table_info('telemetry_samples')")?;
+    let cols = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<std::collections::HashSet<String>, _>>()?;
+    Ok(cols)
+}
+
 /// Read a value from `meta`. Returns `None` when the key doesn't exist.
 pub fn meta_get(conn: &Connection, key: &str) -> Result<Option<String>> {
     let v = conn
@@ -325,7 +386,7 @@ mod tests {
         migrate(&conn).unwrap();
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("6"),
+            Some("7"),
         );
         assert!(meta_get(&conn, "created_at").unwrap().is_some());
     }
@@ -355,12 +416,13 @@ mod tests {
             .chain(V3_ROUTE_CLOUD_COLUMNS.iter())
             .chain(V4_ROUTE_TESSIE_COLUMNS.iter())
             .chain(V6_ROUTE_TELEMETRY_COLUMNS.iter())
+            .chain(V7_ROUTE_TPMS_COLUMNS.iter())
         {
             assert!(existing.contains(*name), "column {} missing after migrate", name);
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("6")
+            Some("7")
         );
     }
 
@@ -384,12 +446,13 @@ mod tests {
             .iter()
             .chain(V4_ROUTE_TESSIE_COLUMNS.iter())
             .chain(V6_ROUTE_TELEMETRY_COLUMNS.iter())
+            .chain(V7_ROUTE_TPMS_COLUMNS.iter())
         {
             assert!(existing.contains(*name), "column {} missing", name);
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("6")
+            Some("7")
         );
     }
 
@@ -415,12 +478,13 @@ mod tests {
         for (name, _) in V4_ROUTE_TESSIE_COLUMNS
             .iter()
             .chain(V6_ROUTE_TELEMETRY_COLUMNS.iter())
+            .chain(V7_ROUTE_TPMS_COLUMNS.iter())
         {
             assert!(existing.contains(*name), "column {} missing", name);
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("6")
+            Some("7")
         );
     }
 
@@ -527,7 +591,7 @@ mod tests {
         assert!(surviving_processed.starts_with("RecentClips/"));
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("6")
+            Some("7")
         );
     }
 
@@ -578,7 +642,7 @@ mod tests {
         assert_eq!(count_routes(&conn), 1, "fresh-DB seed must not run v5 cleanup");
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("6")
+            Some("7")
         );
     }
 
@@ -631,7 +695,50 @@ mod tests {
         assert_eq!(table_exists, 1, "v6 must create telemetry_samples");
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("6")
+            Some("7")
+        );
+    }
+
+    #[test]
+    fn migrate_from_v6_adds_v7_tpms_columns() {
+        // Stand up a v6 DB (everything but v7's tpms cols) and
+        // confirm migrate adds them to BOTH routes and
+        // telemetry_samples.
+        let conn = open();
+        for stmt in V1_SCHEMA {
+            conn.execute(stmt, []).unwrap();
+        }
+        for stmt in V6_NEW_TABLES {
+            conn.execute(stmt, []).unwrap();
+        }
+        for (name, typ) in V2_ROUTE_AGGREGATE_COLUMNS
+            .iter()
+            .chain(V3_ROUTE_CLOUD_COLUMNS.iter())
+            .chain(V4_ROUTE_TESSIE_COLUMNS.iter())
+            .chain(V6_ROUTE_TELEMETRY_COLUMNS.iter())
+        {
+            conn.execute(&format!("ALTER TABLE routes ADD COLUMN {} {}", name, typ), [])
+                .unwrap();
+        }
+        meta_set(&conn, "schema_version", "6").unwrap();
+
+        migrate(&conn).unwrap();
+
+        let route_cols = list_route_columns(&conn).unwrap();
+        for (name, _) in V7_ROUTE_TPMS_COLUMNS {
+            assert!(route_cols.contains(*name), "routes.{} missing after v7", name);
+        }
+        let tele_cols = list_telemetry_columns(&conn).unwrap();
+        for (name, _) in V7_TELEMETRY_TPMS_COLUMNS {
+            assert!(
+                tele_cols.contains(*name),
+                "telemetry_samples.{} missing after v7",
+                name,
+            );
+        }
+        assert_eq!(
+            meta_get(&conn, "schema_version").unwrap().as_deref(),
+            Some("7")
         );
     }
 

@@ -1379,9 +1379,10 @@ fn select_all_route_summaries(conn: &Connection) -> Result<Vec<RouteSummary>> {
                 fsd_disengagements, fsd_accel_pushes,
                 start_lat, start_lon, end_lat, end_lon,
                 source, external_signature,
-                battery_pct_start, battery_pct_end, battery_temp_avg,
+                battery_pct_start, battery_pct_end,
                 interior_temp_min, interior_temp_max, exterior_temp_avg,
-                hvac_runtime_s
+                hvac_runtime_s,
+                tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi
          FROM routes
          ORDER BY file",
     )?;
@@ -1413,14 +1414,21 @@ fn select_all_route_summaries(conn: &Connection) -> Result<Vec<RouteSummary>> {
             row.get::<_, Option<f64>>(22)?,
             row.get::<_, Option<String>>(23)?,
             row.get::<_, Option<String>>(24)?,
-            // v6 telemetry columns
+            // v6 telemetry columns (battery_temp_avg intentionally
+            // not fetched — Tesla doesn't expose battery cell temp)
             row.get::<_, Option<f64>>(25)?,
             row.get::<_, Option<f64>>(26)?,
             row.get::<_, Option<f64>>(27)?,
             row.get::<_, Option<f64>>(28)?,
             row.get::<_, Option<f64>>(29)?,
-            row.get::<_, Option<f64>>(30)?,
-            row.get::<_, Option<i64>>(31)?,
+            row.get::<_, Option<i64>>(30)?,
+            // v7 TPMS columns
+            (
+                row.get::<_, Option<f64>>(31)?,
+                row.get::<_, Option<f64>>(32)?,
+                row.get::<_, Option<f64>>(33)?,
+                row.get::<_, Option<f64>>(34)?,
+            ),
         ))
     })?;
 
@@ -1454,11 +1462,11 @@ fn select_all_route_summaries(conn: &Connection) -> Result<Vec<RouteSummary>> {
             external_signature,
             battery_pct_start,
             battery_pct_end,
-            battery_temp_avg,
             interior_temp_min,
             interior_temp_max,
             exterior_temp_avg,
             hvac_runtime_s,
+            (tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi),
         ) = r?;
 
         let gear_runs = decode_gear_runs(rb.as_deref())
@@ -1496,11 +1504,14 @@ fn select_all_route_summaries(conn: &Connection) -> Result<Vec<RouteSummary>> {
             telemetry: crate::types::RouteTelemetryAggregates {
                 battery_pct_start,
                 battery_pct_end,
-                battery_temp_avg,
                 interior_temp_min,
                 interior_temp_max,
                 exterior_temp_avg,
                 hvac_runtime_s,
+                tire_fl_psi,
+                tire_fr_psi,
+                tire_rl_psi,
+                tire_rr_psi,
             },
         });
     }

@@ -7,7 +7,7 @@ import {
   Download, Upload, Loader2, ChevronLeft, Search, List, X,
   Tag, Plus, Layers, RefreshCw, AlertTriangle, Trash2,
   Eye, EyeOff, Zap, ChevronRight,
-  BatteryLow, Thermometer, Wind,
+  BatteryLow, Thermometer, Wind, Disc,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { wsClient } from "@/lib/ws"
@@ -51,11 +51,15 @@ interface DriveSummary {
   batteryPctStart?: number
   batteryPctEnd?: number
   batteryPctUsed?: number
-  batteryTempAvgC?: number
   interiorTempMinC?: number
   interiorTempMaxC?: number
   exteriorTempAvgC?: number
   hvacRuntimeS?: number
+  // v7 TPMS — omitted on cars without tire pressure sensors.
+  tireFlPsi?: number
+  tireFrPsi?: number
+  tireRlPsi?: number
+  tireRrPsi?: number
   source?: string
   externalSignature?: string
   tessieAutopilotPercent?: number
@@ -149,16 +153,26 @@ function TelemetryStrip({ d, metric }: {
     interiorTempMaxC?: number
     exteriorTempAvgC?: number
     hvacRuntimeS?: number
+    tireFlPsi?: number
+    tireFrPsi?: number
+    tireRlPsi?: number
+    tireRrPsi?: number
   }
   metric: boolean
 }) {
+  const hasTpms =
+    d.tireFlPsi != null ||
+    d.tireFrPsi != null ||
+    d.tireRlPsi != null ||
+    d.tireRrPsi != null
   const hasAny =
     d.batteryPctUsed != null ||
     d.batteryPctStart != null ||
     d.interiorTempMinC != null ||
     d.interiorTempMaxC != null ||
     d.exteriorTempAvgC != null ||
-    d.hvacRuntimeS != null
+    d.hvacRuntimeS != null ||
+    hasTpms
   if (!hasAny) return null
 
   return (
@@ -201,6 +215,23 @@ function TelemetryStrip({ d, metric }: {
         >
           <Wind className="h-3 w-3 text-blue-400/80" />
           HVAC {formatRuntime(d.hvacRuntimeS)}
+        </span>
+      )}
+      {hasTpms && (
+        <span
+          className="inline-flex items-center gap-1"
+          title={[
+            d.tireFlPsi != null ? `FL ${Math.round(d.tireFlPsi)}` : "FL —",
+            d.tireFrPsi != null ? `FR ${Math.round(d.tireFrPsi)}` : "FR —",
+            d.tireRlPsi != null ? `RL ${Math.round(d.tireRlPsi)}` : "RL —",
+            d.tireRrPsi != null ? `RR ${Math.round(d.tireRrPsi)}` : "RR —",
+          ].join("  ·  ") + " psi"}
+        >
+          <Disc className="h-3 w-3 text-emerald-400/80" />
+          {[d.tireFlPsi, d.tireFrPsi, d.tireRlPsi, d.tireRrPsi]
+            .filter((p): p is number => p != null)
+            .map((p) => Math.round(p))
+            .join("/")} psi
         </span>
       )}
     </div>
