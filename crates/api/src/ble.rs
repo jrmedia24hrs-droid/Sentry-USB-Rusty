@@ -249,14 +249,37 @@ pub async fn ble_connected(
     } else {
         Some((now - last).max(0))
     };
+
+    // Surface "why the gap" context so the UI can explain a stale
+    // connection instead of just saying "Disconnected". The keep-awake
+    // nudge claims the BLE radio (writes "keep_awake" into
+    // /tmp/ble_radio_owner) — typically because archiveloop is in the
+    // middle of an archive cycle and is poking the car to prevent USB
+    // power-off. While that owner is set, the sampler can't take new
+    // samples, so the freshness pill should say "paused" not "broken".
+    let radio_owner = read_radio_owner();
+    let archiving = crate::drives_handler::is_archiving();
+
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "last_success_ts": last,
             "seconds_ago": seconds_ago,
             "sample_count_10min": sample_count_10min,
+            "radio_owner": radio_owner,
+            "archiving": archiving,
         })),
     )
+}
+
+/// Read the first line of `/tmp/ble_radio_owner` — the owner-name
+/// string written by `awake_start` ("keep_awake") or the telemetry
+/// sampler ("telemetry"). Returns None when the file is missing
+/// (no one holds the radio).
+fn read_radio_owner() -> Option<String> {
+    let contents = std::fs::read_to_string("/tmp/ble_radio_owner").ok()?;
+    let first = contents.lines().next()?.trim();
+    if first.is_empty() { None } else { Some(first.to_string()) }
 }
 
 /// GET /api/system/ble-latest-sample

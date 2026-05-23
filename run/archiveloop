@@ -61,6 +61,17 @@ export MUSIC_MOUNT=/mnt/music
 # read the setup variables and define other environment variables and functions
 source /root/bin/envsetup.sh
 
+# Make sure awake_stop runs no matter how this script exits — set -e
+# is on (bash -eu above), so any unhandled error in archive_clips or
+# its helpers would otherwise kill the script before reaching the
+# explicit `awake_stop` call after archive_clips. Without this trap
+# the BLE radio lock stays held by "keep_awake" until the lock-stale
+# check eventually kicks in 24h later (or the Pi reboots), blocking
+# the telemetry sampler for the duration.
+# Idempotent: awake_stop is safe to call even when keep-awake was
+# never started (no lock to remove, services already up).
+trap '/root/bin/awake_stop || true' EXIT
+
 # Reason passed to awake_start so nudge log lines show what is keeping the car awake.
 export KEEP_AWAKE_REASON=Archive
 # Single global PID file shared with web UI keep-awake. awake_start kills

@@ -40,9 +40,26 @@ const OWNER: &str = "telemetry";
 /// per the user's design call.
 const AWAKE_INTERVAL: Duration = Duration::from_secs(15);
 
-/// Sample cadence while the car is asleep. Uses
-/// `body-controller-state` which doesn't wake the car.
+/// Sample cadence while the car is asleep, after the warm-up ramp.
+/// Uses `body-controller-state` which doesn't wake the car.
 const ASLEEP_INTERVAL: Duration = Duration::from_secs(15 * 60);
+
+/// Asleep-mode backoff for the first few attempts after the daemon
+/// starts (or after the state flips Awake → Asleep). Goal: give the
+/// user feedback within a minute of pairing without spamming the
+/// radio long-term.
+///
+/// Attempt n → interval:
+///   1 → 30 s,  2 → 60 s,  3 → 2 min,  4 → 5 min,  5+ → ASLEEP_INTERVAL
+fn asleep_backoff(attempt: usize) -> Duration {
+    match attempt {
+        0 | 1 => Duration::from_secs(30),
+        2 => Duration::from_secs(60),
+        3 => Duration::from_secs(120),
+        4 => Duration::from_secs(300),
+        _ => ASLEEP_INTERVAL,
+    }
+}
 
 /// How long to sleep when we can't take the BLE radio (some other
 /// owner holds the lock). Short so we resume quickly when the
@@ -67,6 +84,11 @@ async fn main() -> Result<()> {
 
     let conn = db::open()?;
     let mut held_radio = false;
+    // Counts consecutive Asleep ticks since the last Awake/Idle
+    // observation. Drives `asleep_backoff` so the first few attempts
+    // after pairing or after the car goes to sleep are fast (30s, 60s,
+    // 2m, 5m) before settling at the 15-min steady-state cadence.
+    let mut asleep_attempts: usize = 0;
 
     // SIGTERM handler — release the radio on shutdown so the iOS
     // GATT daemon can come back up cleanly.
@@ -89,7 +111,7 @@ async fn main() -> Result<()> {
                 if held_radio { release_radio().await; }
                 return Ok(());
             }
-            sleep = tick(&conn, &mut held_radio) => {
+            sleep = tick(&conn, &mut held_radio, &mut asleep_attempts) => {
                 tokio::time::sleep(sleep).await;
             }
         }
@@ -97,8 +119,14 @@ async fn main() -> Result<()> {
 }
 
 /// One iteration of the main loop. Returns the duration to sleep
-/// before the next iteration.
-async fn tick(conn: &Connection, held_radio: &mut bool) -> Duration {
+/// before the next iteration. `asleep_attempts` tracks consecutive
+/// Asleep ticks for the warm-up backoff and gets reset whenever the
+/// car is observed Awake or Idle.
+async fn tick(
+    conn: &Connection,
+    held_radio: &mut bool,
+    asleep_attempts: &mut usize,
+) -> Duration {
     let cfg = match BleConfig::load() {
         Ok(c) => c,
         Err(e) => {
@@ -113,6 +141,7 @@ async fn tick(conn: &Connection, held_radio: &mut bool) -> Duration {
             release_radio().await;
             *held_radio = false;
         }
+        *asleep_attempts = 0;
         return DISABLED_POLL;
     }
     if cfg.vin.is_empty() {
@@ -121,6 +150,7 @@ async fn tick(conn: &Connection, held_radio: &mut bool) -> Duration {
             release_radio().await;
             *held_radio = false;
         }
+        *asleep_attempts = 0;
         return DISABLED_POLL;
     }
 
@@ -128,6 +158,10 @@ async fn tick(conn: &Connection, held_radio: &mut bool) -> Duration {
 
     match state {
         CarState::Awake | CarState::Idle => {
+            // Car is producing clip writes → reset the warm-up
+            // counter so the next Asleep transition starts fast
+            // again rather than jumping straight to 15-min.
+            *asleep_attempts = 0;
             // Need the radio. Try to acquire.
             if !*held_radio {
                 match lock::try_acquire(OWNER) {
@@ -191,7 +225,8 @@ async fn tick(conn: &Connection, held_radio: &mut bool) -> Duration {
                 release_radio().await;
                 *held_radio = false;
             }
-            ASLEEP_INTERVAL
+            *asleep_attempts = asleep_attempts.saturating_add(1);
+            asleep_backoff(*asleep_attempts)
         }
     }
 }

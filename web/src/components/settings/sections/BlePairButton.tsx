@@ -33,6 +33,14 @@ interface BleConnectedResp {
   last_success_ts: number
   seconds_ago: number | null
   sample_count_10min: number
+  /** "keep_awake" while archiveloop's nudge holds the radio,
+   *  "telemetry" while our own sampler is mid-call, null when the
+   *  radio is free. Lets the UI explain a stale pill as "paused"
+   *  rather than "disconnected". */
+  radio_owner: string | null
+  /** True when archiveloop reports phase=="archiving" — the most
+   *  common reason `radio_owner === "keep_awake"`. */
+  archiving: boolean
 }
 
 interface BleLatestSample {
@@ -68,11 +76,18 @@ export function BlePairButton() {
   const [binariesInstalled, setBinariesInstalled] = useState<boolean>(false)
   const [lastSuccessTs, setLastSuccessTs] = useState<number>(0)
   const [sampleCount10min, setSampleCount10min] = useState<number>(0)
+  const [radioOwner, setRadioOwner] = useState<string | null>(null)
+  const [archiving, setArchiving] = useState<boolean>(false)
   const [nowTs, setNowTs] = useState<number>(Math.floor(Date.now() / 1000))
   const [outputOpen, setOutputOpen] = useState(false)
   const [latestSample, setLatestSample] = useState<BleLatestSample | null>(null)
   const [sampleLoading, setSampleLoading] = useState(false)
+  const [sampleFetchedAt, setSampleFetchedAt] = useState<number>(0)
   const [vinRevealed, setVinRevealed] = useState(false)
+  // Unit pref: mirrors Drives.tsx — DRIVE_MAP_UNIT=="km" → metric
+  // (km + °C), else imperial (mi + °F). Default to imperial since
+  // that's the wizard default and most North-American Pi owners.
+  const [metric, setMetric] = useState<boolean>(false)
 
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -204,6 +219,8 @@ export function BlePairButton() {
         if (!cancelled) {
           setLastSuccessTs(d?.last_success_ts || 0)
           setSampleCount10min(d?.sample_count_10min ?? 0)
+          setRadioOwner(d?.radio_owner ?? null)
+          setArchiving(Boolean(d?.archiving))
         }
       } catch {
         /* ignore */
@@ -230,11 +247,27 @@ export function BlePairButton() {
       const res = await fetch("/api/system/ble-latest-sample")
       const d = (await res.json()) as BleLatestSample
       setLatestSample(d)
+      setSampleFetchedAt(Math.floor(Date.now() / 1000))
     } catch {
       /* leave previous value */
     } finally {
       setSampleLoading(false)
     }
+  }, [])
+
+  // Unit preference — mirror Drives.tsx's DRIVE_MAP_UNIT lookup.
+  useEffect(() => {
+    fetch("/api/setup/config")
+      .then((r) => r.json())
+      .then((cfg) => {
+        const entry = cfg?.DRIVE_MAP_UNIT
+        if (!entry) return
+        const val = typeof entry === "object"
+          ? (entry.active ? entry.value : null)
+          : entry
+        if (val !== null) setMetric(val === "km")
+      })
+      .catch(() => { /* default imperial */ })
   }, [])
 
   useEffect(() => {
@@ -434,28 +467,42 @@ export function BlePairButton() {
   //   else    → "Disconnected" (slate)
   const secondsAgo = lastSuccessTs > 0 ? Math.max(0, nowTs - lastSuccessTs) : null
   const showLive = bleState === "paired"
-  const liveLabel =
-    secondsAgo === null
+  // "Paused" reason: the keep-awake nudge owns the radio (typically
+  // because archiveloop is mid-archive). Show that as the pill state
+  // when fresh data has stopped landing — avoids the user thinking
+  // pairing broke when really the sampler is just waiting its turn.
+  const radioBusyForOther = radioOwner === "keep_awake"
+  const showPaused =
+    showLive &&
+    radioBusyForOther &&
+    (secondsAgo === null || secondsAgo >= 60)
+  const pauseLabel = archiving ? "Paused — archiving" : "Paused — keep-awake"
+
+  const liveLabel = showPaused
+    ? pauseLabel
+    : secondsAgo === null
       ? "Idle"
       : secondsAgo < 60
         ? "Connected"
         : secondsAgo < 600
           ? `Last seen ${formatAgo(secondsAgo)} ago`
           : "Disconnected"
-  const liveKind: "accent" | "sky" | "slate" =
-    secondsAgo !== null && secondsAgo < 60
+  const liveKind: "accent" | "sky" | "slate" | "amber" = showPaused
+    ? "amber"
+    : secondsAgo !== null && secondsAgo < 60
       ? "accent"
       : secondsAgo !== null && secondsAgo < 600
         ? "sky"
         : "slate"
-  const liveIcon =
-    secondsAgo !== null && secondsAgo < 60 ? (
-      <LiveDot />
-    ) : secondsAgo !== null && secondsAgo < 600 ? (
-      <Wifi className="h-3 w-3" />
-    ) : (
-      <WifiOff className="h-3 w-3" />
-    )
+  const liveIcon = showPaused ? (
+    <Loader2 className="h-3 w-3 animate-spin" />
+  ) : secondsAgo !== null && secondsAgo < 60 ? (
+    <LiveDot />
+  ) : secondsAgo !== null && secondsAgo < 600 ? (
+    <Wifi className="h-3 w-3" />
+  ) : (
+    <WifiOff className="h-3 w-3" />
+  )
 
   // ── Top-right badge: shows pair status + live connection ───────────────────
   const badge = (() => {
@@ -604,7 +651,26 @@ export function BlePairButton() {
         <TelemetryOutputPanel
           sample={latestSample}
           loading={sampleLoading}
-          onRefresh={fetchLatestSample}
+          metric={metric}
+          fetchedSecondsAgo={
+            sampleFetchedAt > 0 ? Math.max(0, nowTs - sampleFetchedAt) : null
+          }
+          onRefresh={async () => {
+            // Also refetch the connection pill so the user sees
+            // immediate visible feedback (Last seen Xm ago updates)
+            // even when the sample row itself hasn't changed.
+            await fetchLatestSample()
+            try {
+              const res = await fetch("/api/system/ble-connected")
+              const d = (await res.json()) as BleConnectedResp
+              setLastSuccessTs(d?.last_success_ts || 0)
+              setSampleCount10min(d?.sample_count_10min ?? 0)
+              setRadioOwner(d?.radio_owner ?? null)
+              setArchiving(Boolean(d?.archiving))
+            } catch { /* ignore */ }
+          }}
+          radioOwner={radioOwner}
+          archiving={archiving}
         />
       )}
     </PrefCard>
@@ -616,25 +682,44 @@ export function BlePairButton() {
 function TelemetryOutputPanel({
   sample,
   loading,
+  metric,
+  fetchedSecondsAgo,
   onRefresh,
+  radioOwner,
+  archiving,
 }: {
   sample: BleLatestSample | null
   loading: boolean
+  metric: boolean
+  fetchedSecondsAgo: number | null
   onRefresh: () => void
+  radioOwner: string | null
+  archiving: boolean
 }) {
   const hasSample = sample !== null && sample.ts !== null
+  // Sample is considered "stale" once it's older than 60s — visually
+  // de-emphasize so the user understands they're looking at past
+  // values, not a real-time read like the Tesla app shows.
+  const isStale = hasSample && (sample?.seconds_ago ?? 0) > 60
   return (
     <div className="rounded-lg border border-white/5 bg-black/20 p-3 text-xs">
       <div className="mb-2 flex items-center justify-between">
         <span className="font-semibold text-slate-300">Live telemetry from car</span>
-        <button
-          onClick={onRefresh}
-          disabled={loading}
-          className="inline-flex items-center gap-1 rounded bg-white/5 px-2 py-0.5 text-[10px] text-slate-400 hover:bg-white/10 disabled:opacity-50"
-        >
-          {loading ? <Loader2 className="h-3 w-3 animate-spin" /> : null}
-          Refresh
-        </button>
+        <div className="flex items-center gap-2">
+          {fetchedSecondsAgo !== null && (
+            <span className="text-[10px] text-slate-600">
+              polled {fetchedSecondsAgo}s ago
+            </span>
+          )}
+          <button
+            onClick={onRefresh}
+            disabled={loading}
+            className="inline-flex items-center gap-1 rounded bg-white/5 px-2 py-0.5 text-[10px] text-slate-400 hover:bg-white/10 disabled:opacity-50"
+          >
+            {loading ? <Loader2 className="h-3 w-3 animate-spin" /> : null}
+            Refresh
+          </button>
+        </div>
       </div>
 
       {!hasSample && (
@@ -648,7 +733,12 @@ function TelemetryOutputPanel({
         <div className="space-y-1.5">
           <div className="flex items-baseline justify-between">
             <span className="text-slate-500">Sample taken</span>
-            <span className="font-mono text-slate-300">
+            <span
+              className={cn(
+                "font-mono",
+                isStale ? "text-amber-400" : "text-slate-300",
+              )}
+            >
               {sample.seconds_ago !== undefined
                 ? `${sample.seconds_ago}s ago`
                 : "-"}
@@ -658,15 +748,29 @@ function TelemetryOutputPanel({
             </span>
           </div>
           <Row label="Battery" value={fmtPct(sample.battery_pct)} />
-          <Row label="Battery temp" value={fmtTempC(sample.battery_temp_c)} />
-          <Row label="Interior temp" value={fmtTempC(sample.interior_temp_c)} />
-          <Row label="Exterior temp" value={fmtTempC(sample.exterior_temp_c)} />
+          <Row label="Battery temp" value={fmtTemp(sample.battery_temp_c, metric)} />
+          <Row label="Interior temp" value={fmtTemp(sample.interior_temp_c, metric)} />
+          <Row label="Exterior temp" value={fmtTemp(sample.exterior_temp_c, metric)} />
           <Row label="HVAC" value={fmtBool(sample.hvac_on)} />
+          {isStale && radioOwner === "keep_awake" && (
+            <p className="pt-1 text-[10px] text-amber-400/80">
+              {archiving
+                ? "Sampler paused while the Pi is archiving — keep-awake is holding the BLE radio. New samples will resume once archive completes."
+                : "Sampler paused — the keep-awake nudge is holding the BLE radio. New samples will resume once it finishes."}
+            </p>
+          )}
+          {isStale && radioOwner !== "keep_awake" && (
+            <p className="pt-1 text-[10px] text-amber-400/70">
+              These values are {sample.seconds_ago}s old. The Tesla app reads
+              live data over LTE — small differences from what's shown here
+              are expected when the car has been driving or charging.
+            </p>
+          )}
           {sample.source === "body_controller" && (
             <p className="pt-1 text-[10px] text-slate-600">
-              `body_controller` samples are taken while the car is asleep —
-              temperatures and HVAC stay blank because reading them would wake
-              the car.
+              <code>body_controller</code> samples are taken while the car is
+              asleep — temperatures and HVAC stay blank because reading them
+              would wake the car.
             </p>
           )}
         </div>
@@ -684,12 +788,19 @@ function Row({ label, value }: { label: string; value: string }) {
   )
 }
 
+/** Tesla's app shows battery as a whole-number percentage; matching
+ *  that avoids the "Pi says 70%, app says 69%" confusion which is
+ *  really just `.toFixed(1)` faking precision on a coarse integer
+ *  value. */
 function fmtPct(v: number | null | undefined): string {
-  return v == null ? "—" : `${v.toFixed(1)}%`
+  return v == null ? "—" : `${Math.round(v)}%`
 }
 
-function fmtTempC(v: number | null | undefined): string {
-  return v == null ? "—" : `${v.toFixed(1)}°C`
+/** Backend always stores Celsius (single source of truth). Convert
+ *  for display when the user prefers Fahrenheit. */
+function fmtTemp(v: number | null | undefined, metric: boolean): string {
+  if (v == null) return "—"
+  return metric ? `${v.toFixed(1)}°C` : `${(v * 9 / 5 + 32).toFixed(1)}°F`
 }
 
 function fmtBool(v: boolean | null | undefined): string {

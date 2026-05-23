@@ -45,13 +45,22 @@ pub async fn sample_state(vin: &str) -> Result<Sample> {
     let climate = run_state(vin, "climate").await?;
     let charge = run_state(vin, "charge").await?;
     let now = now_secs();
+    // Battery temp may live in either state-payload depending on SDK
+    // version — try `charge` first (where it semantically belongs) then
+    // fall back to `climate` (where the battery heater fields cluster).
+    let battery_temp_candidates: &[&str] = &[
+        "batteryHeaterCurrentTemp",
+        "batteryTemp",
+        "battery_temp",
+        "batteryTempCelsius",
+        "packTempCelsius",
+        "batteryHeaterTemp",
+    ];
     Ok(Sample {
         ts: now,
         battery_pct: pick_f64(&charge, &["batteryLevel", "battery_level", "batteryPct"]),
-        battery_temp_c: pick_f64(
-            &charge,
-            &["batteryHeaterCurrentTemp", "batteryTemp", "battery_temp", "batteryTempCelsius"],
-        ),
+        battery_temp_c: pick_f64(&charge, battery_temp_candidates)
+            .or_else(|| pick_f64(&climate, battery_temp_candidates)),
         interior_temp_c: pick_f64(
             &climate,
             &["insideTempCelsius", "insideTemp", "inside_temp", "insideTempC"],

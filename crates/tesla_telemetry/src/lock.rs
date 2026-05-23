@@ -28,7 +28,24 @@ use tracing::{info, warn};
 pub const LOCK_PATH: &str = "/tmp/ble_radio_owner";
 
 /// Stale-lock threshold. Matches `BLE_LOCK_MAX_AGE` in `awake_start`.
+/// Acts as a worst-case safety net — the orphan check below catches
+/// most real failure cases within a minute.
 const STALE_AFTER_SECS: i64 = 86_400;
+
+/// Minimum age before a `keep_awake`-owned lock is eligible to be
+/// treated as orphaned. Gives `archiveloop` a window to start
+/// writing `/tmp/archive_status.json` after `awake_start` returns,
+/// so we don't race-steal a legitimately-fresh archive cycle.
+const KEEP_AWAKE_ORPHAN_GRACE_SECS: i64 = 60;
+
+/// archiveloop status file. Mtime-fresh within 120s means archive is
+/// actively running. Matches the staleness logic in
+/// `crates/api/src/drives_handler.rs::read_archive_status`.
+const ARCHIVE_STATUS_PATH: &str = "/tmp/archive_status.json";
+const ARCHIVE_STATUS_FRESH_SECS: u64 = 120;
+
+/// PID file written by the Case-3 keep-awake nudge loop in awake_start.
+const NUDGE_PID_FILE: &str = "/tmp/keep_awake_nudge_pid";
 
 /// Acquire the radio lock for `owner`. Returns `true` if we now hold
 /// it. Returns `false` if another fresh owner holds it — callers
@@ -51,11 +68,29 @@ pub fn try_acquire(owner: &str) -> Result<bool> {
                     write_lock(owner, now)?;
                     return Ok(true);
                 }
-                if now - ts > STALE_AFTER_SECS {
+                let age = now - ts;
+                if age > STALE_AFTER_SECS {
                     warn!(
                         "BLE radio lock held by '{}' for {}s — assuming crashed, taking over",
-                        existing_owner,
-                        now - ts
+                        existing_owner, age
+                    );
+                    write_lock(owner, now)?;
+                    return Ok(true);
+                }
+                // Orphan check for keep_awake: archiveloop bails on
+                // set -e errors and (without the EXIT trap) leaves
+                // the lock dangling. After a 60s grace, if there's
+                // no fresh archive_status.json AND no live nudge
+                // process, the lock is dead — take over rather than
+                // wait the full 24h.
+                if existing_owner == "keep_awake"
+                    && age >= KEEP_AWAKE_ORPHAN_GRACE_SECS
+                    && !is_archive_active()
+                    && !is_nudge_alive()
+                {
+                    warn!(
+                        "BLE radio lock owned by keep_awake but no active archive/nudge ({}s old) — orphan, taking over",
+                        age
                     );
                     write_lock(owner, now)?;
                     return Ok(true);
@@ -146,6 +181,37 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
+/// True when archiveloop is currently running (status file fresh
+/// within 120s). Used by the orphan-lock check to distinguish a
+/// stuck "keep_awake" lock from a real archive cycle.
+fn is_archive_active() -> bool {
+    let Ok(meta) = std::fs::metadata(ARCHIVE_STATUS_PATH) else {
+        return false;
+    };
+    let Ok(modified) = meta.modified() else {
+        return false;
+    };
+    SystemTime::now()
+        .duration_since(modified)
+        .map(|d| d.as_secs() < ARCHIVE_STATUS_FRESH_SECS)
+        .unwrap_or(false)
+}
+
+/// True when `/tmp/keep_awake_nudge_pid` exists and the PID is
+/// still alive. Detected via `/proc/<pid>` existence — no libc
+/// dependency. False positives only possible on PID reuse, which
+/// is rare on a Pi with a sparse process table; in that case we
+/// just don't steal the lock and fall through to the 24h safety net.
+fn is_nudge_alive() -> bool {
+    let Ok(pid_str) = std::fs::read_to_string(NUDGE_PID_FILE) else {
+        return false;
+    };
+    let Ok(pid) = pid_str.trim().parse::<u32>() else {
+        return false;
+    };
+    Path::new(&format!("/proc/{pid}")).exists()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,6 +260,41 @@ mod tests {
             write_lock("keep_awake", now_secs() - STALE_AFTER_SECS - 1).unwrap();
             assert!(try_acquire("telemetry").unwrap(), "stale lock should be stealable");
             assert_eq!(current_owner().as_deref(), Some("telemetry"));
+        });
+    }
+
+    #[test]
+    fn acquire_steals_orphaned_keep_awake_lock() {
+        with_tmp_lock(|| {
+            // Simulate: archive crashed mid-cycle (or set -e killed it
+            // pre-trap). Lock is keep_awake, well past the grace
+            // window, but no fresh archive status and no nudge PID
+            // (default for an in-memory test harness).
+            write_lock(
+                "keep_awake",
+                now_secs() - KEEP_AWAKE_ORPHAN_GRACE_SECS - 5,
+            )
+            .unwrap();
+            assert!(
+                try_acquire("telemetry").unwrap(),
+                "orphaned keep_awake lock should be stealable after grace",
+            );
+            assert_eq!(current_owner().as_deref(), Some("telemetry"));
+        });
+    }
+
+    #[test]
+    fn acquire_respects_grace_window_on_keep_awake_lock() {
+        with_tmp_lock(|| {
+            // Within the grace window — even with no archive/nudge,
+            // don't steal. Avoids a race where archiveloop just ran
+            // awake_start and hasn't written archive_status.json yet.
+            write_lock("keep_awake", now_secs()).unwrap();
+            assert!(
+                !try_acquire("telemetry").unwrap(),
+                "fresh keep_awake lock should NOT be stolen during grace",
+            );
+            assert_eq!(current_owner().as_deref(), Some("keep_awake"));
         });
     }
 
