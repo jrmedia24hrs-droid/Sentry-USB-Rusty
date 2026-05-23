@@ -228,6 +228,31 @@ pub struct DriveSummary {
     pub tacc_distance_mi: f64,
     // Assisted aggregate
     pub assisted_percent: f64,
+    // ── v6 BLE telemetry rollup ────────────────────────────────────────
+    // Aggregated across the drive's clips from `telemetry_samples`.
+    // All optional — pre-telemetry drives, drives that never crossed a
+    // sample, and routes whose clip window had no samples in it all
+    // render as omitted (`skip_serializing_if`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub battery_pct_start: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub battery_pct_end: Option<f64>,
+    /// Convenience scalar: `battery_pct_start - battery_pct_end`,
+    /// rounded to one decimal. Computed in `build_summary_*` so the
+    /// UI doesn't have to derive it (and to avoid floating-point
+    /// surprises across language boundaries).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub battery_pct_used: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub battery_temp_avg_c: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interior_temp_min_c: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interior_temp_max_c: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exterior_temp_avg_c: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hvac_runtime_s: Option<i64>,
     // Provenance
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
@@ -385,6 +410,21 @@ pub struct RouteAggregates {
     pub end_lng: Option<f64>,
 }
 
+/// Per-clip telemetry rollup populated from `telemetry_samples` rows
+/// whose `ts` falls inside the clip's 60s window. Defined here (rather
+/// than in `aggregate_telemetry.rs`) so `RouteSummary` can embed it
+/// without a circular module dependency.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RouteTelemetryAggregates {
+    pub battery_pct_start: Option<f64>,
+    pub battery_pct_end: Option<f64>,
+    pub battery_temp_avg: Option<f64>,
+    pub interior_temp_min: Option<f64>,
+    pub interior_temp_max: Option<f64>,
+    pub exterior_temp_avg: Option<f64>,
+    pub hvac_runtime_s: Option<i64>,
+}
+
 /// BLOB-free row shape used by the summary endpoints. Carries the
 /// metadata that `groupClips` needs plus all pre-computed scalars from
 /// `RouteAggregates`. Reading 5500 summary rows costs ~5 MB of heap
@@ -401,6 +441,9 @@ pub struct RouteSummary {
     pub source: Option<String>,
     /// Tessie external signature for `splitByExternalSignature` grouping.
     pub external_signature: Option<String>,
+    /// v6 BLE telemetry rollup. Defaults to all-None for routes that
+    /// predate the sampler or whose window never overlapped a sample.
+    pub telemetry: RouteTelemetryAggregates,
 }
 
 /// Archive-side JSON structure that Sentry Studio reads from the archive

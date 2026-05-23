@@ -345,6 +345,22 @@ impl DriveStore {
             };
             let agg = compute_route_aggregates(&route);
             insert_or_update_route(&tx, &norm, &route, &agg, now)?;
+
+            // v6 telemetry rollup: join the just-inserted clip's
+            // 60s window against any telemetry_samples that landed
+            // in it. Best-effort — telemetry failure must not block
+            // the route insert (drive grouping is the critical path
+            // here, telemetry is a value-add).
+            match crate::aggregate_telemetry::compute_telemetry_for_route(&tx, &norm) {
+                Ok(tele) => {
+                    if let Err(e) = crate::aggregate_telemetry::write_route_telemetry(
+                        &tx, &norm, &tele,
+                    ) {
+                        warn!("telemetry write failed for {}: {}", norm, e);
+                    }
+                }
+                Err(e) => warn!("telemetry compute failed for {}: {}", norm, e),
+            }
         }
 
         tx.commit()?;
@@ -1349,7 +1365,10 @@ fn select_routes_by_files(conn: &Connection, files: &[&str]) -> Result<Vec<Route
     Ok(out)
 }
 
-/// Select BLOB-free summary rows — metadata + v2 aggregate columns only.
+/// Select BLOB-free summary rows — metadata + v2 aggregate columns +
+/// v6 telemetry rollups. The telemetry columns may be NULL on pre-v6
+/// rows or routes whose 60s window had no samples; the consumer
+/// handles that via the `Option` shape inside `RouteTelemetryAggregates`.
 fn select_all_route_summaries(conn: &Connection) -> Result<Vec<RouteSummary>> {
     let mut stmt = conn.prepare(
         "SELECT file, date_dir, raw_park_count, raw_frame_count, gear_runs_blob,
@@ -1359,7 +1378,10 @@ fn select_all_route_summaries(conn: &Connection) -> Result<Vec<RouteSummary>> {
                 tacc_distance_m, assisted_distance_m,
                 fsd_disengagements, fsd_accel_pushes,
                 start_lat, start_lon, end_lat, end_lon,
-                source, external_signature
+                source, external_signature,
+                battery_pct_start, battery_pct_end, battery_temp_avg,
+                interior_temp_min, interior_temp_max, exterior_temp_avg,
+                hvac_runtime_s
          FROM routes
          ORDER BY file",
     )?;
@@ -1391,6 +1413,14 @@ fn select_all_route_summaries(conn: &Connection) -> Result<Vec<RouteSummary>> {
             row.get::<_, Option<f64>>(22)?,
             row.get::<_, Option<String>>(23)?,
             row.get::<_, Option<String>>(24)?,
+            // v6 telemetry columns
+            row.get::<_, Option<f64>>(25)?,
+            row.get::<_, Option<f64>>(26)?,
+            row.get::<_, Option<f64>>(27)?,
+            row.get::<_, Option<f64>>(28)?,
+            row.get::<_, Option<f64>>(29)?,
+            row.get::<_, Option<f64>>(30)?,
+            row.get::<_, Option<i64>>(31)?,
         ))
     })?;
 
@@ -1422,6 +1452,13 @@ fn select_all_route_summaries(conn: &Connection) -> Result<Vec<RouteSummary>> {
             end_lon,
             source,
             external_signature,
+            battery_pct_start,
+            battery_pct_end,
+            battery_temp_avg,
+            interior_temp_min,
+            interior_temp_max,
+            exterior_temp_avg,
+            hvac_runtime_s,
         ) = r?;
 
         let gear_runs = decode_gear_runs(rb.as_deref())
@@ -1456,6 +1493,15 @@ fn select_all_route_summaries(conn: &Connection) -> Result<Vec<RouteSummary>> {
             },
             source,
             external_signature,
+            telemetry: crate::types::RouteTelemetryAggregates {
+                battery_pct_start,
+                battery_pct_end,
+                battery_temp_avg,
+                interior_temp_min,
+                interior_temp_max,
+                exterior_temp_avg,
+                hvac_runtime_s,
+            },
         });
     }
     Ok(out)

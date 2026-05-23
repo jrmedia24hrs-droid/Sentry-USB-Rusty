@@ -247,6 +247,28 @@ APEOF
   chmod 755 /etc/NetworkManager/dispatcher.d/10-sentryusb-ap
 fi
 
+# ── Install Tesla BLE telemetry sampler service ──
+# The sampler binary itself is shipped by the main sentryusb upgrade
+# path (it's a workspace member built by build.sh into the upgrade
+# tarball). Here we just lay down its systemd unit and enable it so
+# existing installs pick it up on next boot. Idempotent.
+if [ -f "$TMPDIR/server/ble/sentryusb-telemetry.service" ]; then
+  cp "$TMPDIR/server/ble/sentryusb-telemetry.service" "/etc/systemd/system/sentryusb-telemetry.service"
+  systemctl daemon-reload
+  systemctl enable sentryusb-telemetry 2>/dev/null || true
+  # Only attempt restart if the binary is actually present — the
+  # ConditionPathExists in the unit would otherwise log a confusing
+  # "skipped" line on every upgrade where BLE isn't set up yet.
+  if [ -x /root/bin/sentryusb-tesla-telemetry ]; then
+    systemctl restart sentryusb-telemetry 2>/dev/null || true
+  fi
+fi
+
+# Clean up the pre-v6 lock path if it's still around from an older
+# awake_start. The new path is /tmp/ble_radio_owner; leaving the old
+# file lying around looks like a held lock to the new code.
+rm -f /tmp/ble_keep_awake_active 2>/dev/null || true
+
 # ── Restart BLE daemon ──
 systemctl enable sentryusb-ble 2>/dev/null || true
 systemctl restart sentryusb-ble 2>/dev/null || true

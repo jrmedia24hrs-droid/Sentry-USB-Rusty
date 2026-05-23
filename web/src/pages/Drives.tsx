@@ -7,6 +7,7 @@ import {
   Download, Upload, Loader2, ChevronLeft, Search, List, X,
   Tag, Plus, Layers, RefreshCw, AlertTriangle, Trash2,
   Eye, EyeOff, Zap, ChevronRight,
+  BatteryLow, Thermometer, Wind,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { wsClient } from "@/lib/ws"
@@ -45,6 +46,16 @@ interface DriveSummary {
   taccDistanceKm: number
   taccDistanceMi: number
   assistedPercent: number
+  // ── v6 BLE telemetry (optional — omitted on drives that predate
+  // the sampler, or whose clip windows had no samples) ──
+  batteryPctStart?: number
+  batteryPctEnd?: number
+  batteryPctUsed?: number
+  batteryTempAvgC?: number
+  interiorTempMinC?: number
+  interiorTempMaxC?: number
+  exteriorTempAvgC?: number
+  hvacRuntimeS?: number
   source?: string
   externalSignature?: string
   tessieAutopilotPercent?: number
@@ -108,6 +119,94 @@ function formatDuration(ms: number) {
  * Single mode → that mode's specific percent and label.
  * Multiple modes → combined assistedPercent with "Assisted" label.
  */
+/** Formats `t` (always stored as °C) for display. `metric=false` → °F. */
+function formatTemp(t: number, metric: boolean): string {
+  return metric ? `${Math.round(t)}°C` : `${Math.round(t * 9 / 5 + 32)}°F`
+}
+
+/** Formats HVAC runtime seconds as "8m" / "1h 5m". */
+function formatRuntime(s: number): string {
+  if (s < 60) return `${s}s`
+  const m = Math.round(s / 60)
+  if (m < 60) return `${m}m`
+  const h = Math.floor(m / 60)
+  return `${h}h ${m - h * 60}m`
+}
+
+/**
+ * Inline telemetry strip for the drives list row. Renders nothing
+ * when the drive has no telemetry (pre-v6 drives, drives whose clip
+ * windows had no samples). Each badge omits itself individually if
+ * the field is missing, so a body-controller-only drive (battery
+ * delta but no temps) still renders the part it has.
+ */
+function TelemetryStrip({ d, metric }: {
+  d: {
+    batteryPctUsed?: number
+    batteryPctStart?: number
+    batteryPctEnd?: number
+    interiorTempMinC?: number
+    interiorTempMaxC?: number
+    exteriorTempAvgC?: number
+    hvacRuntimeS?: number
+  }
+  metric: boolean
+}) {
+  const hasAny =
+    d.batteryPctUsed != null ||
+    d.batteryPctStart != null ||
+    d.interiorTempMinC != null ||
+    d.interiorTempMaxC != null ||
+    d.exteriorTempAvgC != null ||
+    d.hvacRuntimeS != null
+  if (!hasAny) return null
+
+  return (
+    <div className="mt-1 flex flex-wrap gap-x-2.5 gap-y-0.5 text-[11px] text-slate-500">
+      {d.batteryPctUsed != null && d.batteryPctUsed > 0 && (
+        <span
+          className="inline-flex items-center gap-1"
+          title={
+            d.batteryPctStart != null && d.batteryPctEnd != null
+              ? `${d.batteryPctStart}% → ${d.batteryPctEnd}%`
+              : undefined
+          }
+        >
+          <BatteryLow className="h-3 w-3 text-amber-400/80" />
+          −{d.batteryPctUsed}%
+        </span>
+      )}
+      {d.interiorTempMinC != null && d.interiorTempMaxC != null && (
+        <span
+          className="inline-flex items-center gap-1"
+          title="Cabin temperature range during drive"
+        >
+          <Thermometer className="h-3 w-3 text-sky-400/80" />
+          {formatTemp(d.interiorTempMinC, metric)}–{formatTemp(d.interiorTempMaxC, metric)}
+        </span>
+      )}
+      {d.exteriorTempAvgC != null && (
+        <span
+          className="inline-flex items-center gap-1"
+          title="Average exterior temperature"
+        >
+          <Thermometer className="h-3 w-3 text-slate-500" />
+          {formatTemp(d.exteriorTempAvgC, metric)} ext
+        </span>
+      )}
+      {d.hvacRuntimeS != null && d.hvacRuntimeS > 0 && (
+        <span
+          className="inline-flex items-center gap-1"
+          title="Estimated HVAC runtime during drive"
+        >
+          <Wind className="h-3 w-3 text-blue-400/80" />
+          HVAC {formatRuntime(d.hvacRuntimeS)}
+        </span>
+      )}
+    </div>
+  )
+}
+
 function assistedBadge(d: { fsdPercent: number; autosteerPercent: number; taccPercent: number; assistedPercent: number }): { label: string; pct: number } | null {
   const fsd = d.fsdPercent ?? 0
   const ap = d.autosteerPercent ?? 0
@@ -997,6 +1096,7 @@ export default function Drives() {
                           <span>{formatDuration(d.durationMs)}</span>
                           <span>{avgSpd(d)}</span>
                         </div>
+                        <TelemetryStrip d={d} metric={metric} />
                         {d.source !== "tessie" && d.fsdDisengagements > 0 && (
                           <div className="mt-0.5 text-[11px] text-red-400/70">{d.fsdDisengagements} disengagement{d.fsdDisengagements !== 1 ? "s" : ""}</div>
                         )}
@@ -1146,6 +1246,7 @@ export default function Drives() {
                         <span>{formatDuration(d.durationMs)}</span>
                         <span>{avgSpd(d)}</span>
                       </div>
+                      <TelemetryStrip d={d} metric={metric} />
                       {d.source !== "tessie" && d.fsdDisengagements > 0 && (
                         <div className="mt-0.5 text-[11px] text-red-400/70">{d.fsdDisengagements} disengagement{d.fsdDisengagements !== 1 ? "s" : ""}</div>
                       )}

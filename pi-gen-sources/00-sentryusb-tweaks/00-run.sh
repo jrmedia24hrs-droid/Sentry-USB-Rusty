@@ -70,6 +70,29 @@ if [ -n "${RELEASE_TAG:-}" ]; then
     echo "Version: $RELEASE_TAG"
 fi
 
+# ── Pre-install SentryUSB Tesla BLE telemetry sampler binary ──
+# Same install pattern as the main sentryusb binary above:
+#   * SENTRYUSB_TELEMETRY_BINARY env override for CI / local builds
+#   * files/sentryusb-tesla-telemetry fallback injected by build-image.sh
+#   * GitHub release download as the last resort
+# The sentryusb-telemetry.service unit (installed below) has
+# ConditionPathExists=/root/bin/tesla-control so the service only runs
+# once the user pairs BLE — until then the binary sits idle, which is
+# safe and matches the lazy-install UX in the settings page.
+TELEMETRY_BINARY_URL="https://github.com/${REPO}/releases/latest/download/sentryusb-tesla-telemetry-${BINARY_SUFFIX}"
+TELEMETRY_DST="${ROOTFS_DIR}/root/bin/sentryusb-tesla-telemetry"
+if [ -n "${SENTRYUSB_TELEMETRY_BINARY:-}" ] && [ -f "${SENTRYUSB_TELEMETRY_BINARY}" ]; then
+    cp "${SENTRYUSB_TELEMETRY_BINARY}" "${TELEMETRY_DST}"
+elif [ -f "files/sentryusb-tesla-telemetry" ]; then
+    cp "files/sentryusb-tesla-telemetry" "${TELEMETRY_DST}"
+else
+    curl -fsSL "${TELEMETRY_BINARY_URL}" -o "${TELEMETRY_DST}" 2>/dev/null || {
+        echo "WARNING: Could not download telemetry binary from releases. Telemetry sampler will not run until installed."
+        rm -f "${TELEMETRY_DST}"
+    }
+fi
+[ -f "${TELEMETRY_DST}" ] && chmod +x "${TELEMETRY_DST}"
+
 # ── Install BLE peripheral daemon ──
 BLE_SCRIPT="${ROOTFS_DIR}/root/bin/sentryusb-ble.py"
 if [ -f "files/sentryusb-ble.py" ]; then
@@ -151,6 +174,17 @@ else
         -o "${BLE_SERVICE}" 2>/dev/null || echo "WARNING: Could not fetch BLE service file"
 fi
 
+# ── Install systemd service for the Tesla BLE telemetry sampler ──
+TELEMETRY_SERVICE="${ROOTFS_DIR}/lib/systemd/system/sentryusb-telemetry.service"
+if [ -f "files/sentryusb-telemetry.service" ]; then
+    cp "files/sentryusb-telemetry.service" "${TELEMETRY_SERVICE}"
+elif [ -f "../../server/ble/sentryusb-telemetry.service" ]; then
+    cp "../../server/ble/sentryusb-telemetry.service" "${TELEMETRY_SERVICE}"
+else
+    curl -fsSL "https://raw.githubusercontent.com/${REPO}/main-dev/server/ble/sentryusb-telemetry.service" \
+        -o "${TELEMETRY_SERVICE}" 2>/dev/null || echo "WARNING: Could not fetch telemetry service file"
+fi
+
 # ── Install systemd service for the web UI ──
 cat > "${ROOTFS_DIR}/lib/systemd/system/sentryusb.service" << 'SERVICEEOF'
 [Unit]
@@ -175,6 +209,9 @@ on_chroot << EOF
 # Enable the web server service
 systemctl enable sentryusb.service
 systemctl enable sentryusb-ble.service 2>/dev/null || true
+# Telemetry sampler — service has ConditionPathExists on tesla-control,
+# so it'll stay inactive until the user pairs BLE. Enable is safe.
+systemctl enable sentryusb-telemetry.service 2>/dev/null || true
 
 # Install prerequisites needed by setup scripts
 apt-get update -qq

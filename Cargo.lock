@@ -2036,6 +2036,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "sentryusb-tesla-telemetry"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "rusqlite",
+ "sentryusb-config",
+ "sentryusb-drives",
+ "sentryusb-shell",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "sentryusb-ws"
 version = "0.1.0"
 dependencies = [

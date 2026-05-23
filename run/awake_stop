@@ -48,11 +48,20 @@ fi
 # If another caller still needs the radio, we leave the lock in place and
 # let that caller's awake_stop handle the restore.
 # ---------------------------------------------------------------------------
-BLE_LOCK="/tmp/ble_keep_awake_active"
+BLE_LOCK="/tmp/ble_radio_owner"
+# Legacy lock path used by pre-v6 awake_start. Cleaned up
+# opportunistically below so it doesn't linger as a phantom lock.
+BLE_LOCK_LEGACY="/tmp/ble_keep_awake_active"
 
 ble_restore_gatt_daemon() {
   local have_lock=0
   if [ -e "$BLE_LOCK" ]; then
+    have_lock=1
+  fi
+  # Treat a stale legacy lock as a held lock for restore purposes —
+  # otherwise an upgrade mid-session would leave the GATT daemon down
+  # forever.
+  if [ -e "$BLE_LOCK_LEGACY" ]; then
     have_lock=1
   fi
 
@@ -90,12 +99,16 @@ ble_restore_gatt_daemon() {
   # priority chain has drained to idle.
 
   rm -f "$BLE_LOCK"
+  rm -f "$BLE_LOCK_LEGACY"
   if [ "$have_lock" = "0" ]; then
     log "Tesla BLE: Keep-awake lock was lost but GATT daemon is down — restoring mobile-app Bluetooth..."
   else
     log "Tesla BLE: Keep-awake ended. Restoring mobile-app Bluetooth (GATT daemon)..."
   fi
   systemctl start sentryusb-ble 2>/dev/null || true
+  # Bring telemetry sampler back up too — it was stopped in
+  # awake_start to give keep-awake exclusive radio access.
+  systemctl start sentryusb-telemetry 2>/dev/null || true
   log "Tesla BLE: Mobile-app Bluetooth restored. Companion apps can connect via Bluetooth again."
 }
 

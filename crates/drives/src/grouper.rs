@@ -909,6 +909,19 @@ fn build_summary(
         tacc_distance_km: round2(tacc_dist_m / 1000.0),
         tacc_distance_mi: round2(tacc_dist_m / 1609.344),
         assisted_percent,
+        // v6 telemetry: not plumbed through the full-data (`Route`)
+        // path yet — that path is used by the single-drive view, and
+        // the routes-table v6 columns aren't decoded into `Route`.
+        // Default to None; the list-view (`build_summary_from_aggregates`)
+        // does the real rollup from `RouteSummary.telemetry`.
+        battery_pct_start: None,
+        battery_pct_end: None,
+        battery_pct_used: None,
+        battery_temp_avg_c: None,
+        interior_temp_min_c: None,
+        interior_temp_max_c: None,
+        exterior_temp_avg_c: None,
+        hvac_runtime_s: None,
         // Default null source to "sei" so the JSON contract matches Go
         // (`hide_tessie_overlapping_sei` and the FSD analytics filter
         // both compare to the literal "sei" string).
@@ -2013,7 +2026,7 @@ fn downsample(points: &[GpsPoint], max_points: usize) -> Vec<GpsPoint> {
 
 /// Parse a timestamp from a Tesla dashcam filename.
 /// Expected pattern: `YYYY-MM-DD_HH-MM-SS` anywhere in the path.
-fn parse_file_timestamp(file_path: &str) -> Option<NaiveDateTime> {
+pub(crate) fn parse_file_timestamp(file_path: &str) -> Option<NaiveDateTime> {
     // Find the pattern YYYY-MM-DD_HH-MM-SS in the filename
     // We search for it with a simple scan rather than pulling in regex
     let bytes = file_path.as_bytes();
@@ -2561,6 +2574,9 @@ fn build_summary_from_aggregates(
             assisted_dist_m,
         );
 
+    // ── v6 BLE telemetry rollup across this drive's unique clips ──
+    let telemetry = roll_up_telemetry(clips);
+
     let start_time_str = start_time.format("%Y-%m-%dT%H:%M:%S").to_string();
     let drive_tags = tags.get(&start_time_str).cloned().unwrap_or_default();
 
@@ -2598,6 +2614,14 @@ fn build_summary_from_aggregates(
         tacc_distance_km: round2(tacc_dist_m / 1000.0),
         tacc_distance_mi: round2(tacc_dist_m / 1609.344),
         assisted_percent,
+        battery_pct_start: telemetry.battery_pct_start,
+        battery_pct_end: telemetry.battery_pct_end,
+        battery_pct_used: telemetry.battery_pct_used,
+        battery_temp_avg_c: telemetry.battery_temp_avg_c,
+        interior_temp_min_c: telemetry.interior_temp_min_c,
+        interior_temp_max_c: telemetry.interior_temp_max_c,
+        exterior_temp_avg_c: telemetry.exterior_temp_avg_c,
+        hvac_runtime_s: telemetry.hvac_runtime_s,
         // Match Go: null/empty source becomes "sei".
         source: Some(
             first_clip
@@ -2608,6 +2632,103 @@ fn build_summary_from_aggregates(
         ),
         external_signature: first_clip.summary.external_signature.clone(),
         tessie_autopilot_percent: None,
+    }
+}
+
+/// Drive-level telemetry rollup over the unique clips of a drive.
+/// Iteration order matters: clips are time-ordered, so the first
+/// clip with a populated `battery_pct_start` is the drive's start,
+/// the last clip with a populated `battery_pct_end` is the drive's
+/// end. The other fields are min/max/avg/sum semantically:
+///   * battery_temp_avg, exterior_temp_avg: simple averages across
+///     clips that have a value (each clip already averages its
+///     samples — clip-of-clips average is approximate but fine for
+///     a UI badge).
+///   * interior_temp_min/max: extreme across all clips' extremes.
+///   * hvac_runtime_s: sum of per-clip estimates (each clip's value
+///     is in seconds within that clip's 60 s window).
+///   * battery_pct_used: derived from start/end, rounded to one
+///     decimal so the UI doesn't have to deal with FP precision.
+struct DriveTelemetryRollup {
+    battery_pct_start: Option<f64>,
+    battery_pct_end: Option<f64>,
+    battery_pct_used: Option<f64>,
+    battery_temp_avg_c: Option<f64>,
+    interior_temp_min_c: Option<f64>,
+    interior_temp_max_c: Option<f64>,
+    exterior_temp_avg_c: Option<f64>,
+    hvac_runtime_s: Option<i64>,
+}
+
+fn roll_up_telemetry(clips: &[SubClipSummary]) -> DriveTelemetryRollup {
+    // Dedupe per parent file (same logic as the time-attributable
+    // aggregates above) so a clip split into two sub-segments doesn't
+    // get its telemetry counted twice.
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut battery_pct_start: Option<f64> = None;
+    let mut battery_pct_end: Option<f64> = None;
+    let mut interior_min: Option<f64> = None;
+    let mut interior_max: Option<f64> = None;
+    let mut bat_temp_sum = 0.0_f64;
+    let mut bat_temp_n = 0_i64;
+    let mut ext_temp_sum = 0.0_f64;
+    let mut ext_temp_n = 0_i64;
+    let mut hvac_sum = 0_i64;
+    let mut hvac_any = false;
+
+    for clip in clips {
+        if !seen.insert(clip.summary.file.as_str()) {
+            continue;
+        }
+        let t = &clip.summary.telemetry;
+        if battery_pct_start.is_none() {
+            battery_pct_start = t.battery_pct_start;
+        }
+        if let Some(v) = t.battery_pct_end {
+            battery_pct_end = Some(v);
+        }
+        if let Some(v) = t.interior_temp_min {
+            interior_min = Some(interior_min.map_or(v, |m| m.min(v)));
+        }
+        if let Some(v) = t.interior_temp_max {
+            interior_max = Some(interior_max.map_or(v, |m| m.max(v)));
+        }
+        if let Some(v) = t.battery_temp_avg {
+            bat_temp_sum += v;
+            bat_temp_n += 1;
+        }
+        if let Some(v) = t.exterior_temp_avg {
+            ext_temp_sum += v;
+            ext_temp_n += 1;
+        }
+        if let Some(v) = t.hvac_runtime_s {
+            hvac_sum += v;
+            hvac_any = true;
+        }
+    }
+
+    let battery_pct_used = match (battery_pct_start, battery_pct_end) {
+        (Some(s), Some(e)) => Some(round2(s - e)),
+        _ => None,
+    };
+
+    DriveTelemetryRollup {
+        battery_pct_start: battery_pct_start.map(round2),
+        battery_pct_end: battery_pct_end.map(round2),
+        battery_pct_used,
+        battery_temp_avg_c: if bat_temp_n > 0 {
+            Some(round2(bat_temp_sum / bat_temp_n as f64))
+        } else {
+            None
+        },
+        interior_temp_min_c: interior_min.map(round2),
+        interior_temp_max_c: interior_max.map(round2),
+        exterior_temp_avg_c: if ext_temp_n > 0 {
+            Some(round2(ext_temp_sum / ext_temp_n as f64))
+        } else {
+            None
+        },
+        hvac_runtime_s: if hvac_any { Some(hvac_sum) } else { None },
     }
 }
 
@@ -2835,6 +2956,7 @@ mod tests {
             aggregates: a1,
             source: None,
             external_signature: None,
+            telemetry: Default::default(),
         };
         let s2 = RouteSummary {
             file: "/cam/2025-01-15_12-01-00-front.mp4".to_string(),
@@ -2845,6 +2967,7 @@ mod tests {
             aggregates: a2,
             source: None,
             external_signature: None,
+            telemetry: Default::default(),
         };
 
         let ts = chrono::NaiveDateTime::parse_from_str("2025-01-15T12:00:00", "%Y-%m-%dT%H:%M:%S")
@@ -2875,6 +2998,7 @@ mod tests {
             aggregates: RouteAggregates::default(),
             source: None,
             external_signature: None,
+            telemetry: Default::default(),
         }
     }
 
@@ -2894,6 +3018,7 @@ mod tests {
             aggregates: a,
             source: None,
             external_signature: None,
+            telemetry: Default::default(),
         }
     }
 
@@ -3121,5 +3246,183 @@ mod tests {
                 clip.route.file
             );
         }
+    }
+
+    // ── Telemetry rollup tests ───────────────────────────────────────
+    //
+    // Cover the per-drive aggregation logic in `roll_up_telemetry` so
+    // future changes to the per-clip semantics don't silently regress
+    // the drives-tab badges.
+
+    fn clip_with_telemetry(
+        file: &str,
+        battery_start: Option<f64>,
+        battery_end: Option<f64>,
+        interior_min: Option<f64>,
+        interior_max: Option<f64>,
+        battery_temp_avg: Option<f64>,
+        exterior_temp_avg: Option<f64>,
+        hvac_runtime_s: Option<i64>,
+    ) -> RouteSummary {
+        RouteSummary {
+            file: file.to_string(),
+            date: "2025-01-15".to_string(),
+            raw_park_count: 0,
+            raw_frame_count: 60,
+            gear_runs: vec![GearRun { gear: 1, frames: 60 }],
+            aggregates: RouteAggregates::default(),
+            source: None,
+            external_signature: None,
+            telemetry: crate::types::RouteTelemetryAggregates {
+                battery_pct_start: battery_start,
+                battery_pct_end: battery_end,
+                battery_temp_avg,
+                interior_temp_min: interior_min,
+                interior_temp_max: interior_max,
+                exterior_temp_avg,
+                hvac_runtime_s,
+            },
+        }
+    }
+
+    fn ts(offset_min: i64) -> chrono::NaiveDateTime {
+        let base = chrono::NaiveDateTime::parse_from_str(
+            "2025-01-15T12:00:00",
+            "%Y-%m-%dT%H:%M:%S",
+        )
+        .unwrap();
+        base + chrono::Duration::minutes(offset_min)
+    }
+
+    #[test]
+    fn rollup_empty_drive_returns_all_none() {
+        let r = roll_up_telemetry(&[]);
+        assert!(r.battery_pct_start.is_none());
+        assert!(r.battery_pct_end.is_none());
+        assert!(r.battery_pct_used.is_none());
+        assert!(r.interior_temp_min_c.is_none());
+        assert!(r.interior_temp_max_c.is_none());
+        assert!(r.battery_temp_avg_c.is_none());
+        assert!(r.exterior_temp_avg_c.is_none());
+        assert!(r.hvac_runtime_s.is_none());
+    }
+
+    #[test]
+    fn rollup_battery_start_end_derived_from_first_and_last_clips() {
+        let s1 = clip_with_telemetry(
+            "/cam/2025-01-15_12-00-00-front.mp4",
+            Some(80.0), Some(79.5), None, None, None, None, None,
+        );
+        let s2 = clip_with_telemetry(
+            "/cam/2025-01-15_12-01-00-front.mp4",
+            Some(79.5), Some(78.8), None, None, None, None, None,
+        );
+        let s3 = clip_with_telemetry(
+            "/cam/2025-01-15_12-02-00-front.mp4",
+            Some(78.8), Some(78.0), None, None, None, None, None,
+        );
+        let clips = vec![
+            SubClipSummary::whole(TimedSummary { summary: &s1, timestamp: ts(0) }),
+            SubClipSummary::whole(TimedSummary { summary: &s2, timestamp: ts(1) }),
+            SubClipSummary::whole(TimedSummary { summary: &s3, timestamp: ts(2) }),
+        ];
+        let r = roll_up_telemetry(&clips);
+        assert_eq!(r.battery_pct_start, Some(80.0));
+        assert_eq!(r.battery_pct_end, Some(78.0));
+        assert_eq!(r.battery_pct_used, Some(2.0));
+    }
+
+    #[test]
+    fn rollup_interior_temp_uses_extremes_across_clips() {
+        let s1 = clip_with_telemetry(
+            "/cam/2025-01-15_12-00-00-front.mp4",
+            None, None, Some(18.0), Some(22.0), None, None, None,
+        );
+        let s2 = clip_with_telemetry(
+            "/cam/2025-01-15_12-01-00-front.mp4",
+            None, None, Some(20.0), Some(28.0), None, None, None,
+        );
+        let s3 = clip_with_telemetry(
+            "/cam/2025-01-15_12-02-00-front.mp4",
+            None, None, Some(17.0), Some(25.0), None, None, None,
+        );
+        let clips = vec![
+            SubClipSummary::whole(TimedSummary { summary: &s1, timestamp: ts(0) }),
+            SubClipSummary::whole(TimedSummary { summary: &s2, timestamp: ts(1) }),
+            SubClipSummary::whole(TimedSummary { summary: &s3, timestamp: ts(2) }),
+        ];
+        let r = roll_up_telemetry(&clips);
+        assert_eq!(r.interior_temp_min_c, Some(17.0));
+        assert_eq!(r.interior_temp_max_c, Some(28.0));
+    }
+
+    #[test]
+    fn rollup_hvac_runtime_sums_per_clip_estimates() {
+        let s1 = clip_with_telemetry(
+            "/cam/2025-01-15_12-00-00-front.mp4",
+            None, None, None, None, None, None, Some(30),
+        );
+        let s2 = clip_with_telemetry(
+            "/cam/2025-01-15_12-01-00-front.mp4",
+            None, None, None, None, None, None, Some(60),
+        );
+        let s3 = clip_with_telemetry(
+            "/cam/2025-01-15_12-02-00-front.mp4",
+            None, None, None, None, None, None, Some(45),
+        );
+        let clips = vec![
+            SubClipSummary::whole(TimedSummary { summary: &s1, timestamp: ts(0) }),
+            SubClipSummary::whole(TimedSummary { summary: &s2, timestamp: ts(1) }),
+            SubClipSummary::whole(TimedSummary { summary: &s3, timestamp: ts(2) }),
+        ];
+        let r = roll_up_telemetry(&clips);
+        assert_eq!(r.hvac_runtime_s, Some(135));
+    }
+
+    #[test]
+    fn rollup_partial_telemetry_handles_missing_clips() {
+        // First clip has battery start, middle clip is bare, last
+        // clip has battery end. Verify start/end pick the populated
+        // values across the gap rather than the bare clip's None.
+        let s1 = clip_with_telemetry(
+            "/cam/2025-01-15_12-00-00-front.mp4",
+            Some(60.0), None, None, None, None, None, None,
+        );
+        let s2 = clip_with_telemetry(
+            "/cam/2025-01-15_12-01-00-front.mp4",
+            None, None, None, None, None, None, None,
+        );
+        let s3 = clip_with_telemetry(
+            "/cam/2025-01-15_12-02-00-front.mp4",
+            None, Some(55.0), None, None, None, None, None,
+        );
+        let clips = vec![
+            SubClipSummary::whole(TimedSummary { summary: &s1, timestamp: ts(0) }),
+            SubClipSummary::whole(TimedSummary { summary: &s2, timestamp: ts(1) }),
+            SubClipSummary::whole(TimedSummary { summary: &s3, timestamp: ts(2) }),
+        ];
+        let r = roll_up_telemetry(&clips);
+        assert_eq!(r.battery_pct_start, Some(60.0));
+        assert_eq!(r.battery_pct_end, Some(55.0));
+        assert_eq!(r.battery_pct_used, Some(5.0));
+    }
+
+    #[test]
+    fn rollup_dedupes_per_parent_file_across_sub_clips() {
+        // A single parent clip split into two sub-segments should
+        // count telemetry once, not twice. (A real-world case is a
+        // clip with an internal park gap.)
+        let s = clip_with_telemetry(
+            "/cam/2025-01-15_12-00-00-front.mp4",
+            Some(70.0), Some(69.0), None, None, None, None, Some(30),
+        );
+        let clips = vec![
+            SubClipSummary::whole(TimedSummary { summary: &s, timestamp: ts(0) }),
+            SubClipSummary::whole(TimedSummary { summary: &s, timestamp: ts(0) }),
+        ];
+        let r = roll_up_telemetry(&clips);
+        assert_eq!(r.hvac_runtime_s, Some(30), "dedupe: hvac counted once, not twice");
+        assert_eq!(r.battery_pct_start, Some(70.0));
+        assert_eq!(r.battery_pct_end, Some(69.0));
     }
 }

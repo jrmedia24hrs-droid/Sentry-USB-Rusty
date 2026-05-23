@@ -91,9 +91,11 @@ else
             cd "$SCRIPT_DIR"
             cross build --release --target "$RUST_TARGET" -p sentryusb
             cross build --release --target "$RUST_TARGET" -p cttseraser
+            cross build --release --target "$RUST_TARGET" -p sentryusb-tesla-telemetry
         )
         BINARY_PATH="$SCRIPT_DIR/target/$RUST_TARGET/release/sentryusb"
         CTTS_BINARY="$SCRIPT_DIR/target/$RUST_TARGET/release/cttseraser"
+        TELEMETRY_BINARY="$SCRIPT_DIR/target/$RUST_TARGET/release/sentryusb-tesla-telemetry"
         ok "Binary built: $BINARY_PATH"
     else
         info "cross/Node not available locally. Downloading from GitHub releases..."
@@ -102,6 +104,8 @@ else
             || error "Failed to download binary. Build locally with:\n  cargo install cross\n  cd web && npm ci && npm run build\n  cross build --release --target $RUST_TARGET -p sentryusb"
         CTTS_BINARY="/tmp/cttseraser-$BINARY_SUFFIX"
         curl -fsSL "https://github.com/$REPO/releases/latest/download/cttseraser-$BINARY_SUFFIX" -o "$CTTS_BINARY" 2>/dev/null || true
+        TELEMETRY_BINARY="/tmp/sentryusb-tesla-telemetry-$BINARY_SUFFIX"
+        curl -fsSL "https://github.com/$REPO/releases/latest/download/sentryusb-tesla-telemetry-$BINARY_SUFFIX" -o "$TELEMETRY_BINARY" 2>/dev/null || true
         ok "Binary downloaded"
     fi
 fi
@@ -166,6 +170,12 @@ if [ -n "${CTTS_BINARY:-}" ] && [ -f "$CTTS_BINARY" ]; then
     info "Injecting cttseraser FUSE binary..."
     cp "$CTTS_BINARY" "$WORK_DIR/stage_sentryusb/00-sentryusb-tweaks/files/cttseraser"
     chmod +x "$WORK_DIR/stage_sentryusb/00-sentryusb-tweaks/files/cttseraser"
+fi
+
+if [ -n "${TELEMETRY_BINARY:-}" ] && [ -f "$TELEMETRY_BINARY" ]; then
+    info "Injecting Tesla BLE telemetry sampler binary..."
+    cp "$TELEMETRY_BINARY" "$WORK_DIR/stage_sentryusb/00-sentryusb-tweaks/files/sentryusb-tesla-telemetry"
+    chmod +x "$WORK_DIR/stage_sentryusb/00-sentryusb-tweaks/files/sentryusb-tesla-telemetry"
 fi
 
 if [ -n "$TESLA_CONTROL_PATH" ] && [ -f "$TESLA_CONTROL_PATH" ]; then

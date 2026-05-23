@@ -11,36 +11,68 @@ else
   # is disabled for the entire session so tesla-control has exclusive, clean
   # access to hci0.  The daemon is restored by awake_stop when keep-awake ends.
   #
-  # A lock file tracks that we own the radio.  awake_stop checks it before
-  # restoring, and overlapping callers skip the stop if the lock already exists.
+  # The lock file at /tmp/ble_radio_owner serializes access between this
+  # script (owner string "keep_awake") and the telemetry sampler
+  # (owner string "telemetry") — same path/format the sampler's
+  # crates/tesla_telemetry/src/lock.rs uses.  File format:
+  #     <owner>\n<unix_seconds>\n
   #
   # Failsafes:
   #   - awake_stop checks for active nudge loops before restoring, so an
   #     overlapping archive + webui keep-awake won't prematurely restore.
   #   - sentryusb-ble.service clears stale lock files on startup (boot/crash).
   #   - Lock files older than 24h are treated as stale and cleaned up.
+  #
+  # Master BLE kill-switch: the user-facing settings toggle writes
+  # BLE_ENABLED=no to the config when they disable Tesla BLE for
+  # security.  Honor it here even when a VIN is configured.
   # ---------------------------------------------------------------------------
-  BLE_LOCK="/tmp/ble_keep_awake_active"
+  BLE_LOCK="/tmp/ble_radio_owner"
+  BLE_LOCK_OWNER="keep_awake"
 
   # Maximum age (seconds) before a lock file is considered stale.
   BLE_LOCK_MAX_AGE=86400  # 24 hours
 
+  # Treat BLE as disabled when the user has flipped the toggle off, OR
+  # when neither the config flag nor the legacy /root/.ble/paired
+  # implicit-yes signal is present.  Matches the api crate's
+  # is_ble_enabled() resolution order.
+  ble_is_enabled() {
+    case "${BLE_ENABLED:-}" in
+      yes|true|1) return 0 ;;
+      no|false|0) return 1 ;;
+    esac
+    # Unset: implicit yes when VIN configured or pairing artifact present.
+    if [[ -n "${TESLA_BLE_VIN:+x}" ]]; then return 0; fi
+    [ -e /root/.ble/paired ]
+  }
+
   ble_disable_gatt_daemon() {
-    # If lock exists, check if it's stale before trusting it.
+    # If lock exists, check if it's stale OR owned by someone else
+    # before trusting it as ours.
     if [ -e "$BLE_LOCK" ]; then
-      local lock_age
+      local lock_age existing_owner
       lock_age=$(( $(date +%s) - $(stat -c %Y "$BLE_LOCK" 2>/dev/null || echo 0) ))
+      existing_owner=$(head -n1 "$BLE_LOCK" 2>/dev/null || echo "")
       if [ "$lock_age" -gt "$BLE_LOCK_MAX_AGE" ]; then
-        log "Tesla BLE: Stale lock detected (${lock_age}s old) — cleaning up."
+        log "Tesla BLE: Stale lock detected (${lock_age}s old, owner='${existing_owner}') — cleaning up."
         rm -f "$BLE_LOCK"
-      else
+      elif [ "$existing_owner" = "$BLE_LOCK_OWNER" ]; then
         log "Tesla BLE: GATT daemon already disabled for keep-awake (lock exists)."
         return
+      else
+        log "Tesla BLE: Radio held by '${existing_owner}' — taking over for keep-awake."
+        # Fall through and overwrite — keep-awake is the higher-priority
+        # caller (telemetry is best-effort, keep-awake prevents USB-power-off).
       fi
     fi
 
     log "Tesla BLE: Disabling mobile-app Bluetooth for keep-awake session..."
     systemctl stop sentryusb-ble 2>/dev/null || true
+
+    # Also stop the telemetry sampler if it's running so it doesn't
+    # fight us for the radio mid-session.
+    systemctl stop sentryusb-telemetry 2>/dev/null || true
 
     # Wait for the daemon process to fully exit (up to 5 s).
     local _i
@@ -67,13 +99,22 @@ else
       fi
     fi
 
-    touch "$BLE_LOCK"
+    # Write the new-format lock file: <owner>\n<unix_seconds>\n.
+    # Atomic-ish via tmp + mv since /tmp is tmpfs.
+    {
+      echo "$BLE_LOCK_OWNER"
+      date +%s
+    } > "${BLE_LOCK}.tmp"
+    mv "${BLE_LOCK}.tmp" "$BLE_LOCK"
     log "Tesla BLE: Mobile-app Bluetooth disabled. hci0 reserved for tesla-control."
   }
 
-  # If Tesla BLE is configured, disable the GATT daemon once for the session.
-  if [[ -n "${TESLA_BLE_VIN:+x}" ]]; then
+  # If Tesla BLE is configured AND user hasn't disabled it in settings,
+  # disable the GATT daemon once for the session.
+  if [[ -n "${TESLA_BLE_VIN:+x}" ]] && ble_is_enabled; then
     ble_disable_gatt_daemon
+  elif [[ -n "${TESLA_BLE_VIN:+x}" ]]; then
+    log "Tesla BLE: VIN configured but BLE_ENABLED=no — skipping BLE keep-awake path."
   fi
 
   # Returns a label like "Archive", "Drive Processing", "Manual (8m left)"
@@ -145,7 +186,7 @@ else
         fi
       fi
 
-      if [[ -n "${TESLA_BLE_VIN:+x}" ]]
+      if [[ -n "${TESLA_BLE_VIN:+x}" ]] && ble_is_enabled
       # use Tesla BLE API to nudge the car
       then
         # GATT daemon is already disabled for the session — call tesla-control
@@ -356,7 +397,7 @@ else
           fi
           break
         done
-      elif [[ -n "${TESLA_BLE_VIN:+x}" ]]
+      elif [[ -n "${TESLA_BLE_VIN:+x}" ]] && ble_is_enabled
       # Use Tesla BLE API to enable Sentry Mode
       then
         # GATT daemon already disabled above — call tesla-control directly.

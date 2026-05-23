@@ -13,6 +13,7 @@ members = [
     "crates/cttseraser",
     "crates/cloud_crypto",
     "crates/cloud_uploader",
+    "crates/tesla_telemetry",
 ]
 
 [workspace.dependencies]

@@ -250,9 +250,7 @@ export default function Settings() {
 
       <TabBar tabs={TABS} active={activeTab} onSelect={setTab} scrollable={isMobile} />
 
-      {activeTab === "Device" && (
-        <DeviceTab usesBle={piConfig?.uses_ble === "yes"} />
-      )}
+      {activeTab === "Device" && <DeviceTab />}
       {activeTab === "Network" && <NetworkTab status={status} />}
       {activeTab === "Updates" && <UpdatesTab />}
       {activeTab === "Backups" && <BackupsTab onOpenRawConfig={handleOpenRawConfig} />}

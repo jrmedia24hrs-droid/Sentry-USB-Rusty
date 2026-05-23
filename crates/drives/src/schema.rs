@@ -21,7 +21,14 @@ use rusqlite::{params, Connection, OptionalExtension};
 /// "drives" (parked Sentry recordings) and duplicates of RecentClips
 /// data. v5 deletes those rows from `routes` and `processed_files`.
 /// scan_dir + grouper now refuse to add them going forward.
-pub const CURRENT_SCHEMA_VERSION: i32 = 5;
+///
+/// v5 -> v6: add the `telemetry_samples` table (BLE-sampled vehicle
+/// state at arbitrary timestamps) and per-route aggregate columns
+/// summarizing the samples that fall within each drive's start_ts /
+/// end_ts window. Samples are written by the tesla_telemetry daemon
+/// independently of drive discovery; the aggregator joins them in
+/// during `compute_route_aggregates`. Unmatched samples are kept.
+pub const CURRENT_SCHEMA_VERSION: i32 = 6;
 
 /// v1 DDL. Each statement is idempotent (`IF NOT EXISTS`) so `migrate()`
 /// is safe on every startup. Column shapes and names match Go exactly —
@@ -121,6 +128,41 @@ pub const V4_ROUTE_TESSIE_COLUMNS: &[(&str, &str)] = &[
     ("tessie_autopilot_percent", "REAL"),
 ];
 
+/// v6 telemetry rollups on `routes`. Populated by the aggregator from
+/// `telemetry_samples` rows whose `ts` falls in `[start_ts, end_ts]`.
+/// All nullable — a drive that ran before telemetry was enabled, or one
+/// where the sampler missed every window, simply has NULLs here. The
+/// drives-tab UI reads these directly so the hot path never joins the
+/// samples table at render time.
+pub const V6_ROUTE_TELEMETRY_COLUMNS: &[(&str, &str)] = &[
+    ("battery_pct_start", "REAL"),
+    ("battery_pct_end", "REAL"),
+    ("battery_temp_avg", "REAL"),
+    ("interior_temp_min", "REAL"),
+    ("interior_temp_max", "REAL"),
+    ("exterior_temp_avg", "REAL"),
+    ("hvac_runtime_s", "INTEGER"),
+];
+
+/// v6 standalone tables. `telemetry_samples` is keyed on `ts` (unix
+/// seconds) and uses WITHOUT ROWID so the PK doubles as the storage
+/// order — range scans on `ts` for the aggregator's per-route joins
+/// are then a B-tree slice with no separate index needed. Every
+/// telemetry column is nullable because the sampler uses two source
+/// paths: `state climate/charge` (full data) and `body-controller-state`
+/// (sleep-safe, no temps/HVAC).
+const V6_NEW_TABLES: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS telemetry_samples (
+        ts                INTEGER PRIMARY KEY,
+        battery_pct       REAL,
+        battery_temp_c    REAL,
+        interior_temp_c   REAL,
+        exterior_temp_c   REAL,
+        hvac_on           INTEGER,
+        source            TEXT NOT NULL
+    ) WITHOUT ROWID",
+];
+
 /// Bring the DB up to `CURRENT_SCHEMA_VERSION`. Safe on every open —
 /// idempotent by construction.
 pub fn migrate(conn: &Connection) -> Result<()> {
@@ -129,14 +171,22 @@ pub fn migrate(conn: &Connection) -> Result<()> {
             .with_context(|| format!("migrate: applying DDL {:?}", truncate(stmt, 60)))?;
     }
 
-    // v2/v3 upgrade: add columns to existing routes tables. Check column
-    // presence rather than parsing schema_version to stay robust against
-    // DBs restored from future-version backups.
+    // v6 standalone tables. Idempotent (`IF NOT EXISTS`) so safe on
+    // every open and on first-run alongside V1_SCHEMA.
+    for stmt in V6_NEW_TABLES {
+        conn.execute(stmt, [])
+            .with_context(|| format!("migrate: applying v6 DDL {:?}", truncate(stmt, 60)))?;
+    }
+
+    // v2/v3/v4/v6 upgrade: add columns to existing routes tables. Check
+    // column presence rather than parsing schema_version to stay robust
+    // against DBs restored from future-version backups.
     let existing = list_route_columns(conn)?;
     for (name, typ) in V2_ROUTE_AGGREGATE_COLUMNS
         .iter()
         .chain(V3_ROUTE_CLOUD_COLUMNS.iter())
         .chain(V4_ROUTE_TESSIE_COLUMNS.iter())
+        .chain(V6_ROUTE_TELEMETRY_COLUMNS.iter())
     {
         if existing.contains(*name) {
             continue;
@@ -275,7 +325,7 @@ mod tests {
         migrate(&conn).unwrap();
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("5"),
+            Some("6"),
         );
         assert!(meta_get(&conn, "created_at").unwrap().is_some());
     }
@@ -304,12 +354,13 @@ mod tests {
             .iter()
             .chain(V3_ROUTE_CLOUD_COLUMNS.iter())
             .chain(V4_ROUTE_TESSIE_COLUMNS.iter())
+            .chain(V6_ROUTE_TELEMETRY_COLUMNS.iter())
         {
             assert!(existing.contains(*name), "column {} missing after migrate", name);
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("5")
+            Some("6")
         );
     }
 
@@ -332,12 +383,13 @@ mod tests {
         for (name, _) in V3_ROUTE_CLOUD_COLUMNS
             .iter()
             .chain(V4_ROUTE_TESSIE_COLUMNS.iter())
+            .chain(V6_ROUTE_TELEMETRY_COLUMNS.iter())
         {
             assert!(existing.contains(*name), "column {} missing", name);
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("5")
+            Some("6")
         );
     }
 
@@ -360,12 +412,15 @@ mod tests {
         migrate(&conn).unwrap();
 
         let existing = list_route_columns(&conn).unwrap();
-        for (name, _) in V4_ROUTE_TESSIE_COLUMNS {
-            assert!(existing.contains(*name), "v4 column {} missing", name);
+        for (name, _) in V4_ROUTE_TESSIE_COLUMNS
+            .iter()
+            .chain(V6_ROUTE_TELEMETRY_COLUMNS.iter())
+        {
+            assert!(existing.contains(*name), "column {} missing", name);
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("5")
+            Some("6")
         );
     }
 
@@ -472,7 +527,7 @@ mod tests {
         assert!(surviving_processed.starts_with("RecentClips/"));
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("5")
+            Some("6")
         );
     }
 
@@ -519,11 +574,108 @@ mod tests {
         .unwrap();
         assert_eq!(meta_get(&conn, "schema_version").unwrap(), None);
         migrate(&conn).unwrap();
-        // Fresh-DB seed path: v5 cleanup skipped, version stamped at 5.
+        // Fresh-DB seed path: v5 cleanup skipped, version stamped at 6.
         assert_eq!(count_routes(&conn), 1, "fresh-DB seed must not run v5 cleanup");
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("5")
+            Some("6")
         );
+    }
+
+    #[test]
+    fn migrate_creates_telemetry_samples_table() {
+        let conn = open();
+        migrate(&conn).unwrap();
+        let exists: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='telemetry_samples'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 1, "telemetry_samples table must be created by migrate()");
+    }
+
+    #[test]
+    fn migrate_from_v5_adds_v6_telemetry_columns() {
+        // Stand up a v5 DB (everything but v6) and confirm migrate adds
+        // both the routes columns and the standalone telemetry_samples
+        // table.
+        let conn = open();
+        for stmt in V1_SCHEMA {
+            conn.execute(stmt, []).unwrap();
+        }
+        for (name, typ) in V2_ROUTE_AGGREGATE_COLUMNS
+            .iter()
+            .chain(V3_ROUTE_CLOUD_COLUMNS.iter())
+            .chain(V4_ROUTE_TESSIE_COLUMNS.iter())
+        {
+            conn.execute(&format!("ALTER TABLE routes ADD COLUMN {} {}", name, typ), [])
+                .unwrap();
+        }
+        meta_set(&conn, "schema_version", "5").unwrap();
+
+        migrate(&conn).unwrap();
+
+        let existing = list_route_columns(&conn).unwrap();
+        for (name, _) in V6_ROUTE_TELEMETRY_COLUMNS {
+            assert!(existing.contains(*name), "v6 column {} missing", name);
+        }
+        let table_exists: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='telemetry_samples'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_exists, 1, "v6 must create telemetry_samples");
+        assert_eq!(
+            meta_get(&conn, "schema_version").unwrap().as_deref(),
+            Some("6")
+        );
+    }
+
+    #[test]
+    fn telemetry_samples_insert_and_range_query_works() {
+        let conn = open();
+        migrate(&conn).unwrap();
+
+        // Two samples from the full BLE path, one body-controller-only.
+        conn.execute(
+            "INSERT INTO telemetry_samples \
+             (ts, battery_pct, battery_temp_c, interior_temp_c, exterior_temp_c, hvac_on, source) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![1_700_000_000_i64, 73.0_f64, 18.5_f64, 22.0_f64, 12.5_f64, 0_i64, "state"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO telemetry_samples \
+             (ts, battery_pct, battery_temp_c, interior_temp_c, exterior_temp_c, hvac_on, source) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![1_700_000_060_i64, 72.5_f64, 18.7_f64, 23.5_f64, 12.4_f64, 1_i64, "state"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO telemetry_samples (ts, source) VALUES (?1, ?2)",
+            params![1_700_000_999_i64, "body_controller"],
+        )
+        .unwrap();
+
+        // Range query mirrors the aggregator's per-drive join.
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM telemetry_samples WHERE ts BETWEEN ?1 AND ?2",
+                params![1_700_000_000_i64, 1_700_000_100_i64],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2, "range query should include both `state` samples");
+
+        // PRIMARY KEY constraint: duplicate ts rejected.
+        let dup = conn.execute(
+            "INSERT INTO telemetry_samples (ts, source) VALUES (?1, ?2)",
+            params![1_700_000_000_i64, "state"],
+        );
+        assert!(dup.is_err(), "duplicate ts must violate PRIMARY KEY");
     }
 }

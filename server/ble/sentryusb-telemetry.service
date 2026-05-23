@@ -1,0 +1,44 @@
+[Unit]
+Description=SentryUSB BLE Telemetry Sampler
+Documentation=https://github.com/Sentry-Six/Sentry-USB-Rusty
+After=bluetooth.target bluetooth.service dbus.service sentryusb.service
+Requires=bluetooth.target
+# Wait for the main sentryusb daemon so the drive-data DB has had its
+# migrate() run — the sampler relies on the v6 schema being in place
+# before it starts inserting into telemetry_samples.
+After=sentryusb.service
+# Won't start if the BLE binaries haven't been installed yet. Pairing
+# the Pi via the settings page lazily installs them; the unit picks up
+# on the next start after that completes.
+ConditionPathExists=/root/bin/tesla-control
+ConditionPathExists=/root/.ble/key_private.pem
+# Match sentryusb-ble.service's burst limits so a flaky boot doesn't
+# burn through the systemd restart budget.
+StartLimitBurst=20
+StartLimitIntervalSec=120
+
+[Service]
+Type=simple
+# Clean up our own stale lock at startup (only if we own it AND it's
+# >24h old) so a crash mid-session doesn't leave the radio held forever.
+ExecStartPre=-/bin/bash -c 'f=/tmp/ble_radio_owner; if [ -e "$f" ] && [ "$(head -n1 "$f" 2>/dev/null)" = "telemetry" ] && [ $(( $(date +%s) - $(stat -c %Y "$f" 2>/dev/null || echo 0) )) -gt 86400 ]; then rm -f "$f"; fi; exit 0'
+# Source sentryusb.conf so BLE_ENABLED and TESLA_BLE_VIN are visible
+# inside the daemon's env. The Rust code re-reads on each iteration,
+# but seeding the initial env here makes the systemd status output
+# show the active VIN.
+EnvironmentFile=-/root/sentryusb.conf
+EnvironmentFile=-/boot/firmware/sentryusb.conf
+ExecStart=/root/bin/sentryusb-tesla-telemetry
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sentryusb-telemetry
+# Send SIGTERM and give the process up to 8s to release the radio
+# lock and restart sentryusb-ble before SIGKILL. The signal handler
+# in main.rs does both before returning.
+KillSignal=SIGTERM
+TimeoutStopSec=8
+
+[Install]
+WantedBy=multi-user.target

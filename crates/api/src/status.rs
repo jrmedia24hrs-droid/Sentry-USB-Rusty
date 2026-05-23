@@ -290,13 +290,25 @@ pub async fn get_config(
         if std::path::Path::new(p).exists() { "yes".into() } else { "no".into() }
     };
 
-    let mut uses_ble = "no".to_string();
-    let config_path = sentryusb_config::find_config_path();
-    if let Ok((active, _)) = sentryusb_config::parse_file(config_path) {
-        if active.contains_key("TESLA_BLE_VIN") {
-            uses_ble = "yes".to_string();
-        }
-    }
+    // `uses_ble` controls whether the BLE pair card renders in Device
+    // settings. Historically it was VIN-gated, meaning users who didn't
+    // pick BLE during initial setup couldn't even see the card to opt
+    // in later. Now it returns "yes" whenever BLE *could* be used:
+    //   * user has explicitly enabled BLE in settings, OR
+    //   * a VIN is already set (legacy install), OR
+    //   * the binaries are installed (already opted in at some point), OR
+    //   * pairing artifacts exist (paired marker present).
+    // Fresh installs that never touched BLE still return "no", so the
+    // card stays hidden until the user enables BLE — preserving the
+    // clean default for non-Tesla / non-BLE users.
+    let uses_ble = if crate::ble::is_ble_enabled()
+        || std::path::Path::new("/root/bin/tesla-control").exists()
+        || std::path::Path::new("/root/.ble/paired").exists()
+    {
+        "yes".to_string()
+    } else {
+        "no".to_string()
+    };
 
     (StatusCode::OK, Json(serde_json::json!({
         "has_cam": has("/backingfiles/cam_disk.bin"),

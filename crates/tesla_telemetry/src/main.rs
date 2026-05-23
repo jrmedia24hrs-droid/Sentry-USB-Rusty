@@ -1,0 +1,225 @@
+//! `sentryusb-tesla-telemetry` — BLE telemetry sampler daemon.
+//!
+//! Runs as a systemd service alongside `sentryusb.service`. Watches
+//! the USB gadget LUN for clip writes (car-awake signal), takes
+//! samples via `tesla-control`, and inserts them into the
+//! `telemetry_samples` table.
+//!
+//! Design notes:
+//!   * Sampling rate adapts to car state — 15 s while awake, 15 min
+//!     while asleep (using the non-waking `body-controller-state`).
+//!   * Holds the `/tmp/ble_radio_owner` lock while sampling so the
+//!     keep-awake nudge and iOS GATT daemon serialize cleanly.
+//!   * Stops `sentryusb-ble.service` (iOS GATT) while the lock is
+//!     held, restarts it on release.
+//!   * Re-reads `sentryusb.conf` on every loop iteration — toggling
+//!     BLE off in settings stops sampling within ~15 s without a
+//!     daemon restart.
+
+mod config;
+mod db;
+mod lock;
+mod sample;
+mod usb_watch;
+
+use std::time::Duration;
+
+use anyhow::Result;
+use rusqlite::Connection;
+use tracing::{debug, error, info, warn};
+
+use crate::config::BleConfig;
+use crate::sample::Sample;
+use crate::usb_watch::CarState;
+
+/// Lock-owner string this daemon writes into `/tmp/ble_radio_owner`.
+/// Coordinated with `awake_start`'s owner string ("keep_awake").
+const OWNER: &str = "telemetry";
+
+/// Sample cadence while the car is awake. Storage cost is ~12 KB/h
+/// per the user's design call.
+const AWAKE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Sample cadence while the car is asleep. Uses
+/// `body-controller-state` which doesn't wake the car.
+const ASLEEP_INTERVAL: Duration = Duration::from_secs(15 * 60);
+
+/// How long to sleep when we can't take the BLE radio (some other
+/// owner holds the lock). Short so we resume quickly when the
+/// keep-awake nudge releases.
+const RADIO_CONTENDED_BACKOFF: Duration = Duration::from_secs(5);
+
+/// How long to sleep when BLE is disabled in settings. Doesn't need
+/// to be aggressive — settings changes are infrequent.
+const DISABLED_POLL: Duration = Duration::from_secs(60);
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info".into()),
+        )
+        .with_target(false)
+        .init();
+
+    info!("sentryusb-tesla-telemetry starting");
+
+    let conn = db::open()?;
+    let mut held_radio = false;
+
+    // SIGTERM handler — release the radio on shutdown so the iOS
+    // GATT daemon can come back up cleanly.
+    let mut sigterm = tokio::signal::unix::signal(
+        tokio::signal::unix::SignalKind::terminate(),
+    )?;
+    let mut sigint = tokio::signal::unix::signal(
+        tokio::signal::unix::SignalKind::interrupt(),
+    )?;
+
+    loop {
+        tokio::select! {
+            _ = sigterm.recv() => {
+                info!("SIGTERM received, releasing radio and exiting");
+                if held_radio { release_radio().await; }
+                return Ok(());
+            }
+            _ = sigint.recv() => {
+                info!("SIGINT received, releasing radio and exiting");
+                if held_radio { release_radio().await; }
+                return Ok(());
+            }
+            sleep = tick(&conn, &mut held_radio) => {
+                tokio::time::sleep(sleep).await;
+            }
+        }
+    }
+}
+
+/// One iteration of the main loop. Returns the duration to sleep
+/// before the next iteration.
+async fn tick(conn: &Connection, held_radio: &mut bool) -> Duration {
+    let cfg = match BleConfig::load() {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("failed to load BLE config: {e}");
+            return DISABLED_POLL;
+        }
+    };
+
+    if !cfg.enabled {
+        if *held_radio {
+            info!("BLE disabled in settings — releasing radio");
+            release_radio().await;
+            *held_radio = false;
+        }
+        return DISABLED_POLL;
+    }
+    if cfg.vin.is_empty() {
+        debug!("no TESLA_BLE_VIN configured, idling");
+        if *held_radio {
+            release_radio().await;
+            *held_radio = false;
+        }
+        return DISABLED_POLL;
+    }
+
+    let state = usb_watch::observe();
+
+    match state {
+        CarState::Awake | CarState::Idle => {
+            // Need the radio. Try to acquire.
+            if !*held_radio {
+                match lock::try_acquire(OWNER) {
+                    Ok(true) => {
+                        *held_radio = true;
+                        stop_ios_gatt().await;
+                    }
+                    Ok(false) => {
+                        debug!(
+                            "radio held by {:?}, backing off",
+                            lock::current_owner()
+                        );
+                        return RADIO_CONTENDED_BACKOFF;
+                    }
+                    Err(e) => {
+                        warn!("failed to acquire radio lock: {e}");
+                        return RADIO_CONTENDED_BACKOFF;
+                    }
+                }
+            }
+
+            match sample::sample_state(&cfg.vin).await {
+                Ok(s) => persist(conn, s),
+                Err(e) => {
+                    warn!("sample_state failed: {e}");
+                    // Keep the radio — transient failure (car
+                    // briefly out of range, BLE jitter). If
+                    // failures persist the next clip-write probe
+                    // will eventually flip us to Asleep.
+                }
+            }
+            AWAKE_INTERVAL
+        }
+        CarState::Asleep => {
+            // Briefly take the radio for one sample, then release
+            // so iOS GATT can come back.
+            let acquired = if *held_radio {
+                true
+            } else {
+                match lock::try_acquire(OWNER) {
+                    Ok(true) => {
+                        stop_ios_gatt().await;
+                        true
+                    }
+                    Ok(false) => {
+                        debug!("radio contended during asleep sample, skipping");
+                        false
+                    }
+                    Err(e) => {
+                        warn!("failed to acquire radio lock for asleep sample: {e}");
+                        false
+                    }
+                }
+            };
+
+            if acquired {
+                match sample::sample_body_controller(&cfg.vin).await {
+                    Ok(s) => persist(conn, s),
+                    Err(e) => warn!("sample_body_controller failed: {e}"),
+                }
+                release_radio().await;
+                *held_radio = false;
+            }
+            ASLEEP_INTERVAL
+        }
+    }
+}
+
+fn persist(conn: &Connection, sample: Sample) {
+    let ts = sample.ts;
+    let source = sample.source.clone();
+    if let Err(e) = db::insert(conn, &sample) {
+        error!("failed to insert telemetry sample (ts={ts}): {e}");
+    } else {
+        debug!("inserted telemetry sample (ts={ts}, source={source})");
+    }
+}
+
+/// Stop the iOS GATT daemon (`sentryusb-ble.service`) so this
+/// daemon has exclusive `hci0` access. Best-effort — if systemctl
+/// fails, log and continue; the tesla-control call will surface a
+/// real BLE error if there's actual contention.
+async fn stop_ios_gatt() {
+    debug!("stopping sentryusb-ble for telemetry session");
+    let _ = sentryusb_shell::run("systemctl", &["stop", "sentryusb-ble"]).await;
+}
+
+/// Restart the iOS GATT daemon and clear our radio-lock entry.
+/// Called on radio release transitions and SIGTERM.
+async fn release_radio() {
+    let _ = sentryusb_shell::run("systemctl", &["start", "sentryusb-ble"]).await;
+    if let Err(e) = lock::release(OWNER) {
+        warn!("failed to release radio lock: {e}");
+    }
+}

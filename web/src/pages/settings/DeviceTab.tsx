@@ -1,20 +1,17 @@
 import { PrefGrid } from "@/components/settings/PrefCard"
 import { KeepAwakePreference } from "@/components/settings/sections/KeepAwakePreference"
 import { AwayModeControl } from "@/components/settings/sections/AwayModeControl"
+import { BleEnableToggle } from "@/components/settings/sections/BleEnableToggle"
 import { BlePairButton } from "@/components/settings/sections/BlePairButton"
 import { DisplayUnitsSection } from "@/components/settings/sections/DisplayUnitsSection"
 
-interface Props {
-  /** Show BLE card only when this Pi configuration supports it. */
-  usesBle: boolean
-}
-
-export function DeviceTab({ usesBle }: Props) {
+export function DeviceTab() {
   return (
     <PrefGrid>
       <KeepAwakePreference />
       <AwayModeControl />
-      {usesBle && <BlePairButton />}
+      <BleEnableToggle />
+      <BlePairButton />
       <DisplayUnitsSection />
     </PrefGrid>
   )

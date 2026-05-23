@@ -1,4 +1,5 @@
 pub mod aggregate;
+pub mod aggregate_telemetry;
 pub mod backfill;
 pub mod blob;
 pub mod db;
