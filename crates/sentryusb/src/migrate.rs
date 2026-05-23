@@ -122,6 +122,36 @@ fn build_migration_script(tarball_url: &str) -> String {
 # so cp targets below would otherwise fail.
 mkdir -p /root/bin
 
+# ── Migrate broken cttseraser FUSE fstab entry to bind mount ──
+# Installs that completed setup before PR #13 (FUSE → bind mount) still
+# carry the legacy `mount.ctts#/mutable/TeslaCam …` fstab line, which
+# depends on a /sbin/mount.ctts helper and the cttseraser binary —
+# both removed in the bind-mount switch. With the helper gone the mount
+# unit fails on every boot and /var/www/html/TeslaCam stays empty,
+# returning 404 for every clip in the dashboard player. The setup
+# wizard rewrites the fstab on first run, but already-set-up installs
+# never re-run it, so they need this one-shot migration instead.
+# Idempotent: skipped entirely when no `mount.ctts#` entry exists.
+if grep -qE '^[^#]*mount\.ctts#' /etc/fstab 2>/dev/null; then
+  # Strip the legacy entry AND any prior bind-mount line targeting the
+  # same path, then append the canonical bind entry. awk + mv is atomic
+  # so a power loss mid-write leaves /etc/fstab in its previous state.
+  awk '
+    /^[^#]*mount\.ctts#/ {{ next }}
+    /^[^#]*\/var\/www\/html\/TeslaCam[[:space:]]+none[[:space:]]+bind/ {{ next }}
+    {{ print }}
+  ' /etc/fstab > /etc/fstab.new
+  echo '/mutable/TeslaCam /var/www/html/TeslaCam none bind,nofail,x-systemd.requires=/mutable 0 0' >> /etc/fstab.new
+  mv /etc/fstab.new /etc/fstab
+  systemctl daemon-reload 2>/dev/null || true
+  # Clear the failed state from the legacy FUSE mount unit so the new
+  # bind-mount unit (same name, generated from the new fstab entry by
+  # systemd-fstab-generator) can activate without the residual error.
+  systemctl reset-failed var-www-html-TeslaCam.mount 2>/dev/null || true
+  systemctl start var-www-html-TeslaCam.mount 2>/dev/null || true
+  echo "migrate: replaced legacy mount.ctts# fstab entry with bind mount"
+fi
+
 TMPDIR=$(mktemp -d)
 trap "rm -rf $TMPDIR" EXIT
 
