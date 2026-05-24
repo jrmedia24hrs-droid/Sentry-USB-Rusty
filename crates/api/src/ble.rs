@@ -99,6 +99,19 @@ pub async fn ble_enabled_set(
             "BLE_ENABLED".to_string(),
             if enabled { "yes" } else { "no" }.to_string(),
         );
+        // On first-time enable: if BLE_ADAPTER isn't already set and
+        // an external USB BLE dongle is plugged in, auto-select it.
+        // Matches the prebuilt-image flow — user flashes the image,
+        // plugs in their dongle, boots the Pi, and runs setup. They
+        // shouldn't have to know about the adapter chooser at all;
+        // having a dongle inserted at enable time is intent enough.
+        // Won't override an existing value, so a user who explicitly
+        // picked the onboard radio earlier keeps their choice.
+        if enabled && !active.contains_key("BLE_ADAPTER") {
+            if let Some(external_id) = first_external_adapter() {
+                active.insert("BLE_ADAPTER".to_string(), external_id);
+            }
+        }
         // The Pi's root partition is normally mounted read-only;
         // `remountfs_rw` flips it to rw for the duration of the
         // write. Match the existing pattern from
@@ -125,6 +138,28 @@ pub async fn ble_enabled_set(
             &format!("config write task panicked: {}", e),
         ),
     }
+}
+
+/// Return the lowest-numbered `hci*` device that isn't `hci0`, if
+/// any exists. `hci0` is always the Pi's onboard radio; any other
+/// entry under `/sys/class/bluetooth/` is necessarily an external
+/// USB dongle. Used by the first-time-enable auto-select to pick
+/// the better radio without bothering the user.
+fn first_external_adapter() -> Option<String> {
+    let entries = std::fs::read_dir("/sys/class/bluetooth").ok()?;
+    let mut ids: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.starts_with("hci") && name != "hci0" && !name.contains(':') {
+                Some(name)
+            } else {
+                None
+            }
+        })
+        .collect();
+    ids.sort();
+    ids.into_iter().next()
 }
 
 /// POST /api/system/ble-vin
@@ -392,6 +427,177 @@ pub async fn ble_latest_sample(
             Json(serde_json::json!({ "ts": null })),
         ),
     }
+}
+
+/// GET /api/system/ble-adapters
+///
+/// Returns the list of Bluetooth adapters the kernel is currently
+/// aware of (parsed from `/sys/class/bluetooth/hci*`), plus the
+/// currently-configured `BLE_ADAPTER` value. Used by the BLE pair
+/// card to show a "Use external adapter" switch when the user
+/// plugs in a USB BLE dongle.
+///
+/// Response shape:
+/// ```json
+/// {
+///   "current": "hci0",
+///   "default": "hci0",
+///   "available": [
+///     { "id": "hci0", "source": "onboard", "address": "88:A2:9E:..." },
+///     { "id": "hci1", "source": "external", "address": "00:1A:7D:..." }
+///   ]
+/// }
+/// ```
+///
+/// `source` heuristic: `onboard` for hci0 (always the Pi's built-in
+/// chip), `external` for hci1+. Not perfect (you could in theory
+/// disable hci0 via rfkill) but matches reality for every realistic
+/// Pi setup.
+pub async fn ble_adapters(
+    State(_s): State<AppState>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let mut adapters: Vec<serde_json::Value> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir("/sys/class/bluetooth") {
+        let mut ids: Vec<String> = entries
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                if name.starts_with("hci") && !name.contains(':') {
+                    Some(name)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        ids.sort();
+        for id in ids {
+            let address = std::fs::read_to_string(format!(
+                "/sys/class/bluetooth/{id}/address"
+            ))
+            .ok()
+            .map(|s| s.trim().to_string());
+            let source = if id == "hci0" { "onboard" } else { "external" };
+            adapters.push(serde_json::json!({
+                "id": id,
+                "source": source,
+                "address": address,
+            }));
+        }
+    }
+
+    let current = current_ble_adapter();
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "current": current,
+            "default": "hci0",
+            "available": adapters,
+        })),
+    )
+}
+
+/// Read `BLE_ADAPTER` from the config. Returns `"hci0"` when unset
+/// or unparseable — mirrors the resolution the telemetry sampler
+/// and sentryusb-ble.py both do, so all three surfaces agree on
+/// which adapter is "current".
+fn current_ble_adapter() -> String {
+    let config_path = sentryusb_config::find_config_path();
+    if let Ok((active, _commented)) = sentryusb_config::parse_file(config_path) {
+        if let Some(v) = active.get("BLE_ADAPTER") {
+            let trimmed = v.trim();
+            if trimmed.starts_with("hci") {
+                return trimmed.to_string();
+            }
+        }
+    }
+    "hci0".to_string()
+}
+
+/// POST /api/system/ble-adapter
+///
+/// Body: `{"adapter": "hci1"}`. Writes `BLE_ADAPTER` to the config
+/// file and restarts both BLE services (`sentryusb-telemetry` for
+/// the Tesla sampler, `sentryusb-ble` for the iOS GATT peripheral)
+/// so the new adapter takes effect immediately without a Pi reboot.
+///
+/// Validation: must start with `hci` and match a real entry under
+/// `/sys/class/bluetooth/`. An invalid value would just be ignored
+/// at the consumer level, but defending here gives the UI a clear
+/// error message instead of a silent revert.
+pub async fn ble_adapter_set(
+    State(_s): State<AppState>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let adapter = match body.get("adapter").and_then(|v| v.as_str()) {
+        Some(s) => s.trim().to_string(),
+        None => {
+            return crate::json_error(
+                StatusCode::BAD_REQUEST,
+                "missing or non-string `adapter` field",
+            );
+        }
+    };
+
+    if !adapter.starts_with("hci") {
+        return crate::json_error(
+            StatusCode::BAD_REQUEST,
+            "adapter must start with 'hci' (e.g. hci0, hci1)",
+        );
+    }
+
+    // Verify the adapter actually exists in /sys
+    if !std::path::Path::new(&format!("/sys/class/bluetooth/{adapter}")).exists() {
+        return crate::json_error(
+            StatusCode::BAD_REQUEST,
+            &format!("adapter {adapter} not found — is the dongle plugged in?"),
+        );
+    }
+
+    let adapter_for_write = adapter.clone();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let config_path = sentryusb_config::find_config_path();
+        let (mut active, _) = sentryusb_config::parse_file(config_path)?;
+        active.insert("BLE_ADAPTER".to_string(), adapter_for_write);
+        // /root is read-only at rest; flip to rw for the write.
+        let _ = std::process::Command::new("bash")
+            .args(["-c", "/root/bin/remountfs_rw"])
+            .status();
+        sentryusb_config::write_file(config_path, &active)?;
+        Ok(())
+    })
+    .await;
+
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            return crate::json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("failed to write config: {e}"),
+            );
+        }
+        Err(e) => {
+            return crate::json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("config write task panicked: {e}"),
+            );
+        }
+    }
+
+    // Restart both BLE services so the new adapter is picked up.
+    // Best-effort — log on failure but don't error the request, the
+    // config write already succeeded and a Pi reboot would also work.
+    let _ = std::process::Command::new("systemctl")
+        .args(["restart", "sentryusb-telemetry"])
+        .status();
+    let _ = std::process::Command::new("systemctl")
+        .args(["restart", "sentryusb-ble"])
+        .status();
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "adapter": adapter })),
+    )
 }
 
 /// GET /api/system/ble-diagnostics

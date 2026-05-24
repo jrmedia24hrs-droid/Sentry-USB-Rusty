@@ -24,7 +24,12 @@ Type=simple
 # the next Pi reboot.
 ExecStartPre=-/bin/bash -c 'f=/tmp/ble_keep_awake_active; [ -e "$f" ] && [ $(( $(date +%s) - $(stat -c %Y "$f" 2>/dev/null || echo 0) )) -gt 86400 ] && rm -f "$f"; exit 0'
 ExecStartPre=/usr/sbin/rfkill unblock bluetooth
-ExecStartPre=-/usr/bin/hciconfig hci0 up
+# Bring up all detected hci adapters (onboard + any USB dongles), not
+# just hci0 — when the user has configured BLE_ADAPTER=hci1 in
+# sentryusb.conf the Python script will pick that one, but the
+# kernel needs the device powered on first regardless of which one
+# we end up using.
+ExecStartPre=-/bin/bash -c 'for hci in /sys/class/bluetooth/hci*; do [ -d "$hci" ] && /usr/bin/hciconfig $(basename "$hci") up; done'
 # Wait for BlueZ DBus before invoking btmgmt below. btmgmt acquires the
 # kernel BT management socket via BlueZ, and at boot time runs the risk
 # of starting before bluetoothd has claimed the socket. When that happens

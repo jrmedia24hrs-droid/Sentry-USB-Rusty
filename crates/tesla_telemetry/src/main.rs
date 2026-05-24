@@ -316,7 +316,7 @@ async fn tick(
         if acquired {
             // Always probe body-controller first — it's the
             // canonical source of user_presence and is sleep-safe.
-            let presence_now = match sample::sample_body_controller(&cfg.vin).await {
+            let presence_now = match sample::sample_body_controller(&cfg.vin, &cfg.adapter).await {
                 Ok(bc) => {
                     let p = bc.user_presence;
                     persist(conn, bc.sample);
@@ -356,7 +356,7 @@ async fn tick(
             // scheduler kicks in on the next tick if we detect a
             // shift change.
             if presence_now == Some(true) {
-                match sample::sample_drive(&cfg.vin).await {
+                match sample::sample_drive(&cfg.vin, &cfg.adapter).await {
                     Ok(d) => {
                         let shift_changed_to_drive = d
                             .shift_state
@@ -455,7 +455,7 @@ async fn tick(
         // Carries: shiftState (drive detection), locationName,
         // odometer. The "must stay fresh" signals.
         if schedule.drive_due(tick_now) {
-            match sample::sample_drive(&cfg.vin).await {
+            match sample::sample_drive(&cfg.vin, &cfg.adapter).await {
                 Ok(d) => {
                     sample.odometer_mi = d.odometer_mi;
                     sample.location_name = d.location_name;
@@ -473,7 +473,7 @@ async fn tick(
 
         // ── 2. CLIMATE (every 60s) ──
         if schedule.climate_due(tick_now) {
-            match sample::sample_climate(&cfg.vin).await {
+            match sample::sample_climate(&cfg.vin, &cfg.adapter).await {
                 Ok(c) => {
                     sample.interior_temp_c = c.interior_temp_c;
                     sample.exterior_temp_c = c.exterior_temp_c;
@@ -489,7 +489,7 @@ async fn tick(
 
         // ── 3. CHARGE (every 60s, offset 30s from climate) ──
         if schedule.charge_due(tick_now) {
-            match sample::sample_charge(&cfg.vin).await {
+            match sample::sample_charge(&cfg.vin, &cfg.adapter).await {
                 Ok(c) => {
                     sample.battery_pct = c.battery_pct;
                 }
@@ -503,7 +503,7 @@ async fn tick(
 
         // ── 4. TIRES (every 5 min) ──
         if schedule.tires_due(tick_now) {
-            match sample::sample_tires(&cfg.vin).await {
+            match sample::sample_tires(&cfg.vin, &cfg.adapter).await {
                 Ok(t) => {
                     sample.tire_fl_psi = t.tire_fl_psi;
                     sample.tire_fr_psi = t.tire_fr_psi;

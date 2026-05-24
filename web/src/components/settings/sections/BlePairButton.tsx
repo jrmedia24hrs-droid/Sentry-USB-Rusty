@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from "react"
-import { Bluetooth, CheckCircle, AlertCircle, Loader2, Wifi, WifiOff, ChevronDown, ChevronUp, Eye, EyeOff, Stethoscope, Copy, Check } from "lucide-react"
+import { Bluetooth, CheckCircle, AlertCircle, Loader2, Wifi, WifiOff, ChevronDown, ChevronUp, Eye, EyeOff, Stethoscope, Copy, Check, Usb, Cpu } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { wsClient } from "@/lib/ws"
 import { PrefCard } from "@/components/settings/PrefCard"
@@ -41,6 +41,18 @@ interface BleConnectedResp {
   /** True when archiveloop reports phase=="archiving" — the most
    *  common reason `radio_owner === "keep_awake"`. */
   archiving: boolean
+}
+
+interface BleAdapter {
+  id: string                          // "hci0", "hci1", ...
+  source: "onboard" | "external"     // hci0 = onboard, hci1+ = external
+  address: string | null              // BD address (best-effort)
+}
+
+interface BleAdaptersResp {
+  current: string                     // currently configured adapter id
+  default: string                     // default if BLE_ADAPTER unset
+  available: BleAdapter[]
 }
 
 interface BleDiagnosticsResp {
@@ -98,6 +110,9 @@ export function BlePairButton() {
   const [latestSample, setLatestSample] = useState<BleLatestSample | null>(null)
   const [sampleLoading, setSampleLoading] = useState(false)
   const [sampleFetchedAt, setSampleFetchedAt] = useState<number>(0)
+  const [adapters, setAdapters] = useState<BleAdaptersResp | null>(null)
+  const [adapterSwitching, setAdapterSwitching] = useState(false)
+  const [adapterError, setAdapterError] = useState<string | null>(null)
   const [diagOpen, setDiagOpen] = useState(false)
   const [diagLines, setDiagLines] = useState<string[]>([])
   const [diagTotalLines, setDiagTotalLines] = useState(0)
@@ -306,6 +321,63 @@ export function BlePairButton() {
       samplePollRef.current = null
     }
   }, [outputOpen, fetchLatestSample])
+
+  // ---------------------------------------------------------------------------
+  // BLE adapter detection + switch. Polls /api/system/ble-adapters
+  // every 5s so that plugging in an external USB BLE dongle is
+  // detected near-instantly without a page refresh. The "switch to
+  // external" button only appears when MORE than one adapter is
+  // detected — single-adapter users see no UI change at all.
+  // ---------------------------------------------------------------------------
+  const fetchAdapters = useCallback(async () => {
+    try {
+      const res = await fetch("/api/system/ble-adapters")
+      if (res.ok) {
+        const d = (await res.json()) as BleAdaptersResp
+        setAdapters(d)
+      }
+    } catch {
+      /* leave previous value */
+    }
+  }, [])
+
+  useEffect(() => {
+    fetchAdapters()
+    const iv = setInterval(fetchAdapters, 5_000)
+    return () => clearInterval(iv)
+  }, [fetchAdapters])
+
+  const switchAdapter = useCallback(async (id: string) => {
+    setAdapterSwitching(true)
+    setAdapterError(null)
+    try {
+      const res = await fetch("/api/system/ble-adapter", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ adapter: id }),
+      })
+      if (!res.ok) {
+        const err = await res.json().catch(() => null)
+        setAdapterError(err?.error || `Switch failed (${res.status})`)
+      } else {
+        // Optimistically reflect the change; the next 5s poll will
+        // also confirm by re-reading current from the API.
+        setAdapters((prev) => prev ? { ...prev, current: id } : prev)
+        // Both BLE services restart server-side — give them a moment
+        // then refresh the connection pill and adapter list so the
+        // UI catches up to the new state.
+        setTimeout(() => {
+          fetchAdapters()
+        }, 2_000)
+      }
+    } catch (e) {
+      setAdapterError(
+        e instanceof Error ? e.message : "Could not reach server",
+      )
+    } finally {
+      setAdapterSwitching(false)
+    }
+  }, [fetchAdapters])
 
   // ---------------------------------------------------------------------------
   // Diagnostics panel — polls journalctl-derived sampler logs while
@@ -754,7 +826,113 @@ export function BlePairButton() {
           onRefresh={fetchDiagnostics}
         />
       )}
+
+      {/* Adapter chooser — only shown when the kernel sees more than
+          one BLE adapter (i.e. the user has plugged in a USB BLE
+          dongle alongside the Pi's onboard radio). Single-adapter
+          systems see nothing — no clutter. */}
+      {adapters && adapters.available.length > 1 && (
+        <AdapterPicker
+          adapters={adapters}
+          switching={adapterSwitching}
+          error={adapterError}
+          onSwitch={switchAdapter}
+        />
+      )}
     </PrefCard>
+  )
+}
+
+/** Live adapter picker. Only rendered when 2+ BLE adapters are
+ *  detected, which in practice means the user has a USB BLE dongle
+ *  plugged in alongside the Pi's onboard radio. Switching the
+ *  selection writes BLE_ADAPTER to sentryusb.conf and restarts both
+ *  BLE services (Tesla telemetry + iOS GATT) so the new adapter
+ *  takes effect within a few seconds — no reboot. */
+function AdapterPicker({
+  adapters,
+  switching,
+  error,
+  onSwitch,
+}: {
+  adapters: BleAdaptersResp
+  switching: boolean
+  error: string | null
+  onSwitch: (id: string) => void
+}) {
+  const external = adapters.available.find((a) => a.source === "external")
+  const onboard = adapters.available.find((a) => a.source === "onboard")
+  const usingExternal = external && adapters.current === external.id
+
+  return (
+    <div className="rounded-lg border border-blue-500/20 bg-blue-500/[0.04] p-3 text-xs">
+      <div className="mb-2 flex items-center gap-2">
+        <Usb className="h-3.5 w-3.5 text-blue-400" />
+        <span className="font-semibold text-slate-200">External BLE adapter detected</span>
+      </div>
+      <p className="mb-2 text-[11px] leading-relaxed text-slate-400">
+        A USB BLE dongle gives you a dedicated radio with a better antenna —
+        substantially more reliable for the Tesla connection than the Pi's
+        onboard chip (which shares an antenna with Wi-Fi). Switching applies
+        to both Tesla telemetry and the SentryUSB iOS app peripheral.
+      </p>
+      <div className="mb-2 flex flex-col gap-1.5">
+        {adapters.available.map((a) => {
+          const isCurrent = adapters.current === a.id
+          return (
+            <button
+              key={a.id}
+              onClick={() => !isCurrent && !switching && onSwitch(a.id)}
+              disabled={isCurrent || switching}
+              className={cn(
+                "flex items-center justify-between gap-2 rounded-md border px-2.5 py-1.5 text-left transition-colors",
+                isCurrent
+                  ? "border-blue-500/40 bg-blue-500/15"
+                  : "border-white/10 bg-white/[0.02] hover:border-white/20 hover:bg-white/[0.05]",
+                switching && "opacity-50",
+              )}
+            >
+              <span className="flex items-center gap-2">
+                {a.source === "external" ? (
+                  <Usb className="h-3 w-3 text-blue-400" />
+                ) : (
+                  <Cpu className="h-3 w-3 text-slate-400" />
+                )}
+                <span className="font-medium text-slate-200">
+                  {a.source === "external" ? "External dongle" : "Onboard radio"} ({a.id})
+                </span>
+                {a.address && (
+                  <span className="text-[10px] text-slate-600">{a.address}</span>
+                )}
+              </span>
+              {isCurrent && (
+                <span className="inline-flex items-center gap-1 text-[10px] font-semibold text-blue-400">
+                  <Check className="h-3 w-3" /> In use
+                </span>
+              )}
+            </button>
+          )
+        })}
+      </div>
+      {!usingExternal && external && (
+        <p className="mb-1 text-[10px] text-emerald-400/80">
+          Recommended: switch to the external dongle for better reliability.
+        </p>
+      )}
+      {usingExternal && onboard && (
+        <p className="mb-1 text-[10px] text-slate-500">
+          You can fall back to the onboard radio if you unplug the dongle.
+        </p>
+      )}
+      {switching && (
+        <p className="mt-1.5 inline-flex items-center gap-1 text-[10px] text-slate-400">
+          <Loader2 className="h-3 w-3 animate-spin" /> Restarting BLE services…
+        </p>
+      )}
+      {error && (
+        <p className="mt-1.5 text-[10px] text-red-400">{error}</p>
+      )}
+    </div>
   )
 }
 

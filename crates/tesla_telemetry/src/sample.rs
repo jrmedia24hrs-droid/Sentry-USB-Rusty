@@ -164,8 +164,8 @@ pub struct Sample {
 /// never the currently-installed `car_version`. That field lives in
 /// `VehicleState` which tesla-control doesn't expose as a state
 /// category, so there's no point burning BLE air time on it.
-pub async fn sample_drive(vin: &str) -> Result<DriveResult> {
-    let (result, outcome) = run_state_timed(vin, "drive").await;
+pub async fn sample_drive(vin: &str, adapter: &str) -> Result<DriveResult> {
+    let (result, outcome) = run_state_timed(vin, adapter, "drive").await;
     info!("state-poll: drive={}", outcome.fmt_short());
     if let Some(err) = &outcome.error {
         warn!(
@@ -205,8 +205,8 @@ pub async fn sample_drive(vin: &str) -> Result<DriveResult> {
 
 /// Slow-cadence sample: `state climate`. Polled every ~60s in
 /// Active mode. Returns the cabin/exterior temps + HVAC on/off.
-pub async fn sample_climate(vin: &str) -> Result<ClimateResult> {
-    let (result, outcome) = run_state_timed(vin, "climate").await;
+pub async fn sample_climate(vin: &str, adapter: &str) -> Result<ClimateResult> {
+    let (result, outcome) = run_state_timed(vin, adapter, "climate").await;
     info!("state-poll: climate={}", outcome.fmt_short());
     if let Some(err) = &outcome.error {
         warn!(
@@ -240,8 +240,8 @@ pub async fn sample_climate(vin: &str) -> Result<ClimateResult> {
 /// only return `battery_heater_on` (boolean — is the heater
 /// running, not how hot the pack is). We leave the column nullable
 /// in the schema for forward compatibility but don't waste a probe.
-pub async fn sample_charge(vin: &str) -> Result<ChargeResult> {
-    let (result, outcome) = run_state_timed(vin, "charge").await;
+pub async fn sample_charge(vin: &str, adapter: &str) -> Result<ChargeResult> {
+    let (result, outcome) = run_state_timed(vin, adapter, "charge").await;
     info!("state-poll: charge={}", outcome.fmt_short());
     if let Some(err) = &outcome.error {
         warn!(
@@ -260,8 +260,8 @@ pub async fn sample_charge(vin: &str) -> Result<ChargeResult> {
 /// a single drive, so the slow cadence saves BLE air time without
 /// noticeable freshness cost. Values converted from Tesla's native
 /// BAR to PSI to match what US vehicles display.
-pub async fn sample_tires(vin: &str) -> Result<TiresResult> {
-    let (result, outcome) = run_state_timed(vin, "tire-pressure").await;
+pub async fn sample_tires(vin: &str, adapter: &str) -> Result<TiresResult> {
+    let (result, outcome) = run_state_timed(vin, adapter, "tire-pressure").await;
     info!("state-poll: tires={}", outcome.fmt_short());
     if let Some(err) = &outcome.error {
         warn!(
@@ -289,9 +289,9 @@ pub async fn sample_tires(vin: &str) -> Result<TiresResult> {
 /// machine notice when the driver gets back in to a parked car so
 /// it can resume state polling without waiting for the next slow
 /// asleep-mode tick.
-pub async fn sample_body_controller(vin: &str) -> Result<BodyControllerSample> {
+pub async fn sample_body_controller(vin: &str, adapter: &str) -> Result<BodyControllerSample> {
     let start = std::time::Instant::now();
-    let result = run_tesla_control(vin, &["body-controller-state"]).await;
+    let result = run_tesla_control(vin, adapter, &["body-controller-state"]).await;
     let elapsed_ms = start.elapsed().as_millis() as u64;
     match &result {
         Ok(_) => info!("body-controller poll: ok({}ms)", elapsed_ms),
@@ -325,8 +325,8 @@ pub async fn sample_body_controller(vin: &str) -> Result<BodyControllerSample> {
 // internals
 // ---------------------------------------------------------------------------
 
-async fn run_state(vin: &str, category: &str) -> Result<Value> {
-    let out = run_tesla_control(vin, &["state", category]).await?;
+async fn run_state(vin: &str, adapter: &str, category: &str) -> Result<Value> {
+    let out = run_tesla_control(vin, adapter, &["state", category]).await?;
     serde_json::from_str::<Value>(&out)
         .with_context(|| format!("failed to parse tesla-control state {} output", category))
 }
@@ -356,9 +356,13 @@ impl InvocationOutcome {
 /// Wraps `run_state` to capture timing + error text for the
 /// diagnostic summary. The Result is returned unchanged so existing
 /// success/failure handling paths are unaffected.
-async fn run_state_timed(vin: &str, category: &str) -> (Result<Value>, InvocationOutcome) {
+async fn run_state_timed(
+    vin: &str,
+    adapter: &str,
+    category: &str,
+) -> (Result<Value>, InvocationOutcome) {
     let start = std::time::Instant::now();
-    let result = run_state(vin, category).await;
+    let result = run_state(vin, adapter, category).await;
     let outcome = InvocationOutcome {
         elapsed_ms: start.elapsed().as_millis() as u64,
         error: result.as_ref().err().map(|e| format!("{e:#}")),
@@ -366,19 +370,29 @@ async fn run_state_timed(vin: &str, category: &str) -> (Result<Value>, Invocatio
     (result, outcome)
 }
 
-async fn run_tesla_control(vin: &str, subcommand: &[&str]) -> Result<String> {
+async fn run_tesla_control(
+    vin: &str,
+    adapter: &str,
+    subcommand: &[&str],
+) -> Result<String> {
     // Pass tesla-control's own connect/command timeouts explicitly.
     // Defaults are 20s connect / 5s command — too tight for our use
     // case, which routinely sees 10-15s latencies during BLE
     // contention. The vehicle-command library has an internal retry
     // loop inside the connect window, so giving it more headroom
     // converts what would be a hard failure into a successful retry.
+    //
+    // `-bt-adapter` selects which HCI device to use. Defaults to
+    // hci0 (onboard) but the user can switch to an external dongle
+    // (hci1+) via settings for substantially better reliability.
     let mut args: Vec<&str> = vec![
         "-ble",
         "-key-file",
         KEY_FILE,
         "-vin",
         vin,
+        "-bt-adapter",
+        adapter,
         "-connect-timeout",
         CONNECT_TIMEOUT,
         "-command-timeout",

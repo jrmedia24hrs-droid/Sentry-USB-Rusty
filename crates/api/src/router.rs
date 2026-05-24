@@ -79,6 +79,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/system/ble-install", post(crate::ble::ble_install))
         .route("/api/system/ble-latest-sample", get(crate::ble::ble_latest_sample))
         .route("/api/system/ble-diagnostics", get(crate::ble::ble_diagnostics))
+        .route("/api/system/ble-adapters", get(crate::ble::ble_adapters))
+        .route("/api/system/ble-adapter", post(crate::ble::ble_adapter_set))
         .route("/api/system/speedtest", get(crate::system::speedtest))
         .route("/api/system/rtc-status", get(crate::system::get_rtc_status))
         .route("/api/system/ssh-pubkey", get(crate::system::get_ssh_pubkey))

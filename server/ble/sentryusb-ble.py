@@ -1084,18 +1084,56 @@ class Advertisement(dbus.service.Object):
 # Main
 # ============================================================
 
-def find_adapter(bus):
-    """Find the first Bluetooth adapter that supports LE."""
-    remote_om = dbus.Interface(
-        bus.get_object(BLUEZ_SERVICE, '/'), DBUS_OM_IFACE)
-    objects = remote_om.GetManagedObjects()
-    for path, interfaces in objects.items():
-        if LE_ADVERTISING_MANAGER_IFACE in interfaces:
-            return path
+def read_ble_adapter_from_config():
+    """Read BLE_ADAPTER from /root/sentryusb.conf.
+
+    Returns the value (e.g. 'hci1') or None if unset / file unreadable.
+    The Rust telemetry sampler reads the same key from the same file,
+    so swapping the adapter in settings affects both processes.
+    """
+    try:
+        with open('/root/sentryusb.conf') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                key, _, value = line.partition('=')
+                if key.strip() == 'BLE_ADAPTER':
+                    val = value.strip().strip('"').strip("'")
+                    return val if val else None
+    except (IOError, OSError):
+        pass
     return None
 
 
-def wait_for_adapter(bus, timeout_s=15, poll_interval_s=0.2):
+def find_adapter(bus, preferred_hci=None):
+    """Find a Bluetooth adapter that supports LE.
+
+    If `preferred_hci` (e.g. 'hci1') is set and that adapter exists
+    and supports LE, returns it. Otherwise falls back to the first
+    LE-capable adapter found. The fallback path means that if an
+    external dongle is unplugged after being configured, we don't
+    crash — we just quietly use the onboard radio instead.
+    """
+    remote_om = dbus.Interface(
+        bus.get_object(BLUEZ_SERVICE, '/'), DBUS_OM_IFACE)
+    objects = remote_om.GetManagedObjects()
+    le_paths = [
+        path for path, interfaces in objects.items()
+        if LE_ADVERTISING_MANAGER_IFACE in interfaces
+    ]
+    if preferred_hci:
+        wanted = f'/org/bluez/{preferred_hci}'
+        if wanted in le_paths:
+            return wanted
+        log.warning(
+            f'Preferred BLE adapter {preferred_hci} not found among '
+            f'{[p.rsplit("/", 1)[-1] for p in le_paths]} — falling back'
+        )
+    return le_paths[0] if le_paths else None
+
+
+def wait_for_adapter(bus, preferred_hci=None, timeout_s=15, poll_interval_s=0.2):
     """Wait for BlueZ to expose an LE adapter, polling up to `timeout_s`.
 
     The systemd unit waits for the org.bluez D-Bus name to be claimed before
@@ -1116,7 +1154,7 @@ def wait_for_adapter(bus, timeout_s=15, poll_interval_s=0.2):
     deadline = time.time() + timeout_s
     last_log = 0.0
     while time.time() < deadline:
-        path = find_adapter(bus)
+        path = find_adapter(bus, preferred_hci=preferred_hci)
         if path:
             return path
         if time.time() - last_log >= 1.0:
@@ -1304,7 +1342,15 @@ def main():
     # Wait up to 15s for BlueZ to expose the LE adapter — see wait_for_adapter()
     # docstring for race-condition rationale. Single-shot find_adapter() loses
     # the race on slow boots, busy SD cards, or service restarts after archiveloop.
-    adapter_path = wait_for_adapter(bus, timeout_s=15)
+    #
+    # `BLE_ADAPTER` in /root/sentryusb.conf selects a preferred adapter
+    # (e.g. `hci1` when the user has plugged in an external USB BLE
+    # dongle). Same key the Rust telemetry sampler reads. If unset
+    # or unavailable, we use the first LE-capable adapter (hci0 onboard).
+    preferred = read_ble_adapter_from_config()
+    if preferred:
+        log.info(f'Config requests BLE adapter: {preferred}')
+    adapter_path = wait_for_adapter(bus, preferred_hci=preferred, timeout_s=15)
     if not adapter_path:
         log.error('No Bluetooth LE adapter found after 15s — BlueZ may be misconfigured')
         sys.exit(1)
