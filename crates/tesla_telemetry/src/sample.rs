@@ -23,6 +23,16 @@ use tracing::{info, warn};
 
 const TESLA_CONTROL: &str = "/root/bin/tesla-control";
 const KEY_FILE: &str = "/root/.ble/key_private.pem";
+/// Persistent session cache. The vehicle-command library saves the
+/// BLE handshake state here after a successful connect; subsequent
+/// invocations skip the handshake round-trip and connect ~1-5s
+/// faster. Per the upstream docs, a stale cache is auto-detected
+/// and re-handshaken with zero penalty — pure upside.
+///
+/// Lives on `/backingfiles/` (the writable data partition) because
+/// `/root` is normally mounted read-only on the Pi image. Same
+/// partition as the SQLite DB, so writes are cheap.
+const SESSION_CACHE: &str = "/backingfiles/tesla-session-cache.json";
 /// Outer wall-clock budget for a single tesla-control invocation.
 /// Sized to comfortably cover the inner `-connect-timeout 40s` +
 /// `-command-timeout 10s` budget we pass to tesla-control plus a
@@ -373,6 +383,11 @@ async fn run_tesla_control(vin: &str, subcommand: &[&str]) -> Result<String> {
         CONNECT_TIMEOUT,
         "-command-timeout",
         CMD_TIMEOUT,
+        // Skip the handshake round-trip on subsequent calls — pure
+        // upside per upstream docs (stale cache → auto re-handshake
+        // with no penalty).
+        "-session-cache",
+        SESSION_CACHE,
     ];
     args.extend_from_slice(subcommand);
     sentryusb_shell::run_with_timeout(COMMAND_TIMEOUT, TESLA_CONTROL, &args)
