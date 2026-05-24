@@ -2,7 +2,6 @@ import { useEffect, useRef, useState } from "react"
 import L from "leaflet"
 import "leaflet/dist/leaflet.css"
 import { Layers } from "lucide-react"
-import { cn } from "@/lib/utils"
 import { useScrubberState } from "@/hooks/useScrubberSync"
 import type { FsdEvent } from "@/types/drives"
 
@@ -10,6 +9,7 @@ interface DriveMapProps {
   points: [number, number, number, number][]
   fsdStates?: number[]
   fsdEvents?: FsdEvent[]
+  showEvents?: boolean
   source?: string
 }
 
@@ -70,14 +70,13 @@ function fsdEventIcon(kind: "disengagement" | "accel_push") {
   })
 }
 
-export function DriveMap({ points, fsdStates, fsdEvents, source }: DriveMapProps) {
+export function DriveMap({ points, fsdStates, fsdEvents, showEvents = true, source }: DriveMapProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const mapRef = useRef<L.Map | null>(null)
   const tileRef = useRef<L.TileLayer | null>(null)
   const pulseRef = useRef<L.Marker | null>(null)
   const eventsLayerRef = useRef<L.LayerGroup | null>(null)
   const [style, setStyle] = useState<Style>("dark")
-  const [showEvents, setShowEvents] = useState(true)
   const { currentIndex } = useScrubberState()
 
   useEffect(() => {
@@ -201,23 +200,6 @@ export function DriveMap({ points, fsdStates, fsdEvents, source }: DriveMapProps
         <ControlBtn label={`Map style: ${style}`} onClick={cycleStyle}>
           <Layers className="h-4 w-4" />
         </ControlBtn>
-        {fsdEvents && fsdEvents.length > 0 && (
-          <button
-            type="button"
-            onClick={() => setShowEvents((s) => !s)}
-            className={cn(
-              "rounded-md border border-white/10 bg-slate-900/85 px-2 py-1 text-[10px] font-semibold uppercase tracking-wider backdrop-blur transition-colors",
-              showEvents ? "text-emerald-300" : "text-slate-300 hover:text-slate-100",
-            )}
-            title={
-              showEvents
-                ? "Hide FSD event markers"
-                : "Show FSD event markers"
-            }
-          >
-            FSD
-          </button>
-        )}
       </div>
     </div>
   )

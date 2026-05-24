@@ -17,7 +17,6 @@ export type DatePreset =
   | "thisYear"
   | "lastYear"
   | "all"
-  | "sinceLastCharge"
 
 export interface DrivesFilters {
   origin?: string
@@ -99,7 +98,6 @@ function rangeBounds(range: DateRange, now: Date): { from?: Date; to?: Date } {
       const t = new Date(now.getFullYear(), 0, 1)
       return { from: f, to: t }
     }
-    case "sinceLastCharge":
     case "all":
     default:
       return {}

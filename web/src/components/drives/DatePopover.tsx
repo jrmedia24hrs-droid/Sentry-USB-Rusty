@@ -16,7 +16,6 @@ const PRESETS: { value: DatePreset; label: string }[] = [
   { value: "thisYear", label: "This year" },
   { value: "lastYear", label: "Last year" },
   { value: "all", label: "All time" },
-  { value: "sinceLastCharge", label: "Since last charge" },
 ]
 
 function presetLabel(range: DateRange): string {

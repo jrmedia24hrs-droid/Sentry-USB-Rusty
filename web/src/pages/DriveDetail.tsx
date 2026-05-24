@@ -1,4 +1,4 @@
-import { Suspense, lazy, useEffect, useMemo } from "react"
+import { Suspense, lazy, useEffect, useMemo, useState } from "react"
 import { Link, useParams } from "react-router-dom"
 import {
   ArrowLeft,
@@ -13,6 +13,7 @@ import {
   Thermometer,
   Wind,
 } from "lucide-react"
+import { cn } from "@/lib/utils"
 import { useDriveDetail } from "@/hooks/useDriveDetail"
 import { ScrubberProvider, useScrubberActions } from "@/hooks/useScrubberSync"
 import {
@@ -76,6 +77,8 @@ interface DriveDetailContentProps {
 function DriveDetailContent({ drive, onSaveTags }: DriveDetailContentProps) {
   const { setTotal } = useScrubberActions()
   const metric = false
+  const [showFsdEvents, setShowFsdEvents] = useState(true)
+  const hasFsdEvents = (drive.fsdEvents ?? []).length > 0
 
   useEffect(() => {
     setTotal(drive.points.length)
@@ -112,13 +115,41 @@ function DriveDetailContent({ drive, onSaveTags }: DriveDetailContentProps) {
         </span>
       </div>
 
-      <div className="mt-4">
-        <DriveMap
-          points={drive.points}
-          fsdStates={drive.fsdStates}
-          fsdEvents={drive.fsdEvents}
-          source={drive.source}
-        />
+      {hasFsdEvents && (
+        <div className="mt-4 flex justify-end">
+          <button
+            type="button"
+            onClick={() => setShowFsdEvents((s) => !s)}
+            className={cn(
+              "inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-medium transition-colors",
+              showFsdEvents
+                ? "border-emerald-400/40 bg-emerald-400/10 text-emerald-200 hover:bg-emerald-400/20"
+                : "border-white/10 bg-white/[0.03] text-slate-300 hover:bg-white/[0.06]",
+            )}
+            aria-pressed={showFsdEvents}
+          >
+            <Sparkles className="h-3.5 w-3.5" />
+            FSD events {showFsdEvents ? "on" : "off"}
+          </button>
+        </div>
+      )}
+
+      <div className={hasFsdEvents ? "mt-2" : "mt-4"}>
+        <div className="relative">
+          <DriveMap
+            points={drive.points}
+            fsdStates={drive.fsdStates}
+            fsdEvents={drive.fsdEvents}
+            showEvents={showFsdEvents}
+            source={drive.source}
+          />
+          {/* Drive tag chip floats over the bottom-left of the map.
+              Click to open the popover; when no tags, shows just a
+              tag icon. */}
+          <div className="absolute bottom-3 left-3 z-[400]">
+            <TagPopover tags={drive.tags ?? []} onChange={onSaveTags} />
+          </div>
+        </div>
         <DriveScrubber points={drive.points} startTime={drive.startTime} />
         {drive.fsdStates && drive.fsdStates.length > 0 && (
           <FsdEngagementStripe fsdStates={drive.fsdStates} />
@@ -176,22 +207,6 @@ function DriveDetailContent({ drive, onSaveTags }: DriveDetailContentProps) {
       <ClimateSection drive={drive} metric={metric} />
       <TirePressureSection drive={drive} />
       <DashcamSection drive={drive} />
-
-      <SectionHeading>Tags</SectionHeading>
-      <div className="flex flex-wrap items-center gap-2">
-        {(drive.tags ?? []).length === 0 && (
-          <span className="text-sm text-slate-500">No tags</span>
-        )}
-        {(drive.tags ?? []).map((t) => (
-          <span
-            key={t}
-            className="rounded-full bg-emerald-400/10 px-2.5 py-0.5 text-xs text-emerald-200"
-          >
-            {t}
-          </span>
-        ))}
-        <TagPopover tags={drive.tags ?? []} onChange={onSaveTags} />
-      </div>
     </>
   )
 }

@@ -32,3 +32,45 @@ export async function fetchTags(): Promise<string[]> {
   if (!res.ok) throw new Error(`tags: ${res.status}`)
   return res.json()
 }
+
+export async function triggerProcessNew(): Promise<void> {
+  const res = await fetch("/api/drives/process", { method: "POST" })
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}))
+    throw new Error(body.error || `process: ${res.status}`)
+  }
+}
+
+export async function triggerReprocessAll(): Promise<void> {
+  const res = await fetch("/api/drives/reprocess", { method: "POST" })
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}))
+    throw new Error(body.error || `reprocess: ${res.status}`)
+  }
+}
+
+export async function uploadDriveData(file: File): Promise<{ imported: number }> {
+  const res = await fetch("/api/drives/data/upload", {
+    method: "POST",
+    body: file,
+  })
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}))
+    throw new Error(body.error || `upload: ${res.status}`)
+  }
+  return res.json()
+}
+
+export async function deleteAllDrives(): Promise<void> {
+  const res = await fetch("/api/drives/data", { method: "DELETE" })
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}))
+    throw new Error(body.error || `delete: ${res.status}`)
+  }
+}
+
+export async function fetchProcessingStatus(): Promise<{ running: boolean; importing: boolean }> {
+  const res = await fetch("/api/drives/status")
+  if (!res.ok) throw new Error(`status: ${res.status}`)
+  return res.json()
+}

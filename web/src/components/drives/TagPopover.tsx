@@ -58,6 +58,8 @@ export function TagPopover({ tags, onChange }: TagPopoverProps) {
   }
 
   const hasTags = tags.length > 0
+  const displayTag = hasTags ? tags[0] : null
+  const extraCount = hasTags ? tags.length - 1 : 0
 
   return (
     <div ref={wrapRef} className="relative">
@@ -70,13 +72,17 @@ export function TagPopover({ tags, onChange }: TagPopoverProps) {
           setOpen((o) => !o)
         }}
         className={cn(
-          "flex h-7 w-7 items-center justify-center rounded-md transition-colors",
+          "inline-flex items-center gap-1 rounded-full transition-colors",
           hasTags
-            ? "text-emerald-300 hover:bg-emerald-400/10"
-            : "text-slate-500 hover:bg-white/5 hover:text-slate-300",
+            ? "bg-emerald-400/15 px-2.5 py-0.5 text-xs font-medium text-emerald-200 ring-1 ring-inset ring-emerald-400/20 hover:bg-emerald-400/20"
+            : "h-7 w-7 justify-center text-slate-500 hover:bg-white/5 hover:text-slate-300",
         )}
       >
-        <Tag className="h-4 w-4" />
+        <Tag className={hasTags ? "h-3 w-3" : "h-4 w-4"} />
+        {displayTag && <span>{displayTag}</span>}
+        {extraCount > 0 && (
+          <span className="text-emerald-300/80">+{extraCount}</span>
+        )}
       </button>
       {open && (
         <div
@@ -104,7 +110,7 @@ export function TagPopover({ tags, onChange }: TagPopoverProps) {
               ))}
             </div>
           )}
-          <div className="flex gap-1">
+          <div className="flex gap-1.5">
             <input
               type="text"
               autoFocus
@@ -117,13 +123,13 @@ export function TagPopover({ tags, onChange }: TagPopoverProps) {
                 }
               }}
               placeholder="New tag"
-              className="flex-1 rounded-md border border-white/10 bg-slate-950/60 px-2 py-1 text-sm text-slate-100 placeholder:text-slate-600 focus:border-emerald-400/40 focus:outline-none"
+              className="min-w-0 flex-1 rounded-md border border-white/10 bg-slate-950/60 px-2 py-1 text-sm text-slate-100 placeholder:text-slate-600 focus:border-emerald-400/40 focus:outline-none"
             />
             <button
               type="button"
               disabled={busy || !draft.trim()}
               onClick={addTag}
-              className="rounded-md bg-emerald-500/90 px-2.5 py-1 text-xs font-medium text-slate-950 transition-colors hover:bg-emerald-400 disabled:opacity-50"
+              className="shrink-0 whitespace-nowrap rounded-md bg-emerald-500/90 px-2.5 py-1 text-xs font-medium text-slate-950 transition-colors hover:bg-emerald-400 disabled:opacity-50"
             >
               Add
             </button>
