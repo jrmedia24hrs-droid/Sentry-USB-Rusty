@@ -24,17 +24,22 @@ impl PiModel {
             .replace('\0', "");
         let lower = model.to_lowercase();
 
-        if lower.contains("pi 5") {
+        // Require the "raspberry pi" prefix on every match so non-Pi boards
+        // whose model string happens to contain "zero" / "pi N" (e.g.
+        // "Radxa Zero 3W", "Radxa ROCK Pi 4") fall through to Other and
+        // get routed via the non-Pi setup paths instead of inheriting
+        // Pi-specific config.txt / dwc2 / UDC assumptions.
+        if lower.contains("raspberry pi 5") {
             PiModel::Pi5
-        } else if lower.contains("pi 4") {
+        } else if lower.contains("raspberry pi 4") {
             PiModel::Pi4
-        } else if lower.contains("pi 3") {
+        } else if lower.contains("raspberry pi 3") {
             PiModel::Pi3
-        } else if lower.contains("zero 2") {
+        } else if lower.contains("raspberry pi zero 2") {
             PiModel::PiZero2
-        } else if lower.contains("zero") {
+        } else if lower.contains("raspberry pi zero") {
             PiModel::PiZeroW
-        } else if lower.contains("pi 2") {
+        } else if lower.contains("raspberry pi 2") {
             PiModel::Pi2
         } else {
             PiModel::Other

@@ -434,6 +434,15 @@ async fn configure_dwc2_overlay(env: &SetupEnv, emitter: &SetupEmitter) -> Resul
 
 /// Check whether the root partition needs shrinking (Pi Imager auto-expand case).
 async fn check_root_shrink(env: &SetupEnv, emitter: &SetupEmitter) -> Result<bool> {
+    // Mirror the verify_disk_space branch: the shrink exists solely to free
+    // 8 GB on the SD for backingfiles+mutable. When DATA_DRIVE is set those
+    // partitions live on the external drive and the SD doesn't need any
+    // unpartitioned space — install-pi.sh's user-facing note advertises
+    // exactly this behavior.
+    if env.data_drive.is_some() {
+        return Ok(false);
+    }
+
     if crate::partition::partitions_exist().await {
         return Ok(false);
     }
