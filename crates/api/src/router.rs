@@ -163,7 +163,17 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/drives/fsd-analytics", get(crate::drives_handler::fsd_analytics))
         .route("/api/drives/migration-status", get(crate::drives_handler::migration_status))
         .route("/api/drives/{id}/tags", put(crate::drives_handler::set_drive_tags))
+        .route(
+            "/api/drives/{id}/temperature-series",
+            get(crate::drives_handler::temperature_series),
+        )
         .route("/api/drives/{id}", get(crate::drives_handler::single_drive))
+        // Telemetry — global rollups over telemetry_samples, not scoped
+        // to one drive. Powers the Dashboard's TirePressureCard.
+        .route(
+            "/api/telemetry/tire-history",
+            get(crate::drives_handler::tire_history),
+        )
         // Keep-awake
         .route("/api/keep-awake/start", post(crate::keep_awake::start))
         .route("/api/keep-awake/stop", post(crate::keep_awake::stop))

@@ -29,6 +29,7 @@ import { StatusTile, Row, TileDivider } from "@/components/ui/StatusTile"
 import { BannerStack, type BannerItem } from "@/components/ui/Banner"
 import { Pill, LiveDot } from "@/components/ui/Pill"
 import type { Halo } from "@/components/ui/StatusTile"
+import { TirePressureCard } from "@/components/dashboard/TirePressureCard"
 
 function getTempHalo(milliC: number): Halo {
   if (milliC <= 0) return "blue"
@@ -369,6 +370,12 @@ export default function Dashboard() {
         <KeepAwakeTile />
         {isAwayActive && <AwayModeTile />}
       </div>
+
+      {/* TirePressureCard renders below the tile grid because it needs
+          the full row width for the multi-line history chart. The card
+          self-fetches /api/telemetry/tire-history; it'll show an empty
+          state when the BLE telemetry sampler hasn't run yet. */}
+      <TirePressureCard />
     </div>
   )
 }

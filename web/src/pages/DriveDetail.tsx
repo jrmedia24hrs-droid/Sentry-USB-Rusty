@@ -32,8 +32,12 @@ import { DriveScrubber } from "@/components/drives/DriveScrubber"
 import { DualPinBlock } from "@/components/drives/DualPinBlock"
 import { SectionHeading, StatTile } from "@/components/drives/StatTile"
 import { TagPopover } from "@/components/drives/TagPopover"
+import type { TemperaturePoint } from "@/components/drives/TemperatureChart"
 
 const DriveChart = lazy(() => import("@/components/drives/DriveChart"))
+const TemperatureChart = lazy(
+  () => import("@/components/drives/TemperatureChart"),
+)
 
 export default function DriveDetail() {
   const { id } = useParams<{ id: string }>()
@@ -416,7 +420,38 @@ function ClimateSection({ drive, metric }: ClimateSectionProps) {
     drive.interiorTempMaxC !== undefined ||
     drive.exteriorTempAvgC !== undefined ||
     drive.hvacRuntimeS !== undefined
+
+  // Per-sample temperature series for the chart. Fetched only when
+  // the section will actually render, so drives without climate data
+  // never trigger the request. The endpoint is cheap (one indexed
+  // SELECT bounded by the drive's clip window) but skipping the
+  // round-trip when there's nothing to show keeps the network panel
+  // clean.
+  const [tempPoints, setTempPoints] = useState<TemperaturePoint[] | null>(null)
+  useEffect(() => {
+    if (!anyClimate) return
+    let cancelled = false
+    fetch(`/api/drives/${drive.id}/temperature-series`)
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
+      .then((data: { points?: TemperaturePoint[] }) => {
+        if (cancelled) return
+        setTempPoints(Array.isArray(data.points) ? data.points : [])
+      })
+      .catch(() => {
+        if (!cancelled) setTempPoints([])
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [drive.id, anyClimate])
+
   if (!anyClimate) return null
+
+  // Decide whether the chart has enough material to render. A single
+  // sample produces a degenerate flat line that's worse than just the
+  // min/max/avg tiles above it.
+  const chartReady = tempPoints !== null && tempPoints.length >= 2
+
   return (
     <>
       <SectionHeading>Climate</SectionHeading>
@@ -442,6 +477,13 @@ function ClimateSection({ drive, metric }: ClimateSectionProps) {
           icon={<Wind className="h-4 w-4" />}
         />
       </div>
+      {chartReady && (
+        <div className="mt-4 rounded-2xl border border-white/[0.06] bg-white/[0.02] p-3">
+          <Suspense fallback={<ChartFallback />}>
+            <TemperatureChart points={tempPoints!} metric={metric} />
+          </Suspense>
+        </div>
+      )}
     </>
   )
 }

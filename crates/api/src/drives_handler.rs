@@ -9,7 +9,7 @@ use axum::http::StatusCode;
 use serde::Deserialize;
 
 use crate::router::AppState;
-use sentryusb_drives::{DriveStore, grouper};
+use sentryusb_drives::{DriveStore, aggregate_telemetry, grouper};
 
 /// Filename kept identical to Go (`server/api/keepawake.go`) so existing
 /// `awake_stop` deployments work without changes after this binary lands.
@@ -847,4 +847,205 @@ pub async fn set_drive_tags(
 #[derive(Deserialize)]
 pub struct SetTagsRequest {
     pub tags: Vec<String>,
+}
+
+/// GET /api/drives/{id}/temperature-series
+///
+/// Time-series of interior + exterior cabin temperature across the
+/// drive, sourced from `telemetry_samples` (BLE sampler at 60s cadence)
+/// for the union of clip windows that make up the drive. The frontend
+/// renders this as a two-line chart on the DriveDetail Climate section
+/// — equivalent to Tessie's "Interior temperature" / "Exterior
+/// temperature" graphs combined into one.
+///
+/// Response shape:
+/// ```json
+/// {
+///   "points": [
+///     { "ts": 1716471234000, "interiorC": 22.3, "exteriorC": 14.1 },
+///     ...
+///   ]
+/// }
+/// ```
+/// `interiorC` / `exteriorC` are omitted when the underlying sample had
+/// NULL in that column — the frontend treats gaps as "no data" rather
+/// than dropping to zero.
+pub async fn temperature_series(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let files = match state
+        .drives
+        .store
+        .with_route_summaries(|summaries| grouper::find_drive_files(summaries, &id))
+    {
+        Ok(Some((_idx, f))) => f,
+        Ok(None) => {
+            return crate::json_error(
+                StatusCode::NOT_FOUND,
+                &format!("drive not found for id='{}'", id),
+            )
+        }
+        Err(e) => return crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+
+    // Derive the drive's wall-clock window from the min/max of its
+    // clip windows. Files without parseable timestamps (event folders,
+    // manual imports) are silently skipped — they wouldn't contribute
+    // telemetry rows anyway since the sampler keys by clock time.
+    let mut start_ts: Option<i64> = None;
+    let mut end_ts: Option<i64> = None;
+    for f in &files {
+        if let Some((s, e)) = aggregate_telemetry::window_for_route_file(f) {
+            start_ts = Some(start_ts.map_or(s, |cur| cur.min(s)));
+            end_ts = Some(end_ts.map_or(e, |cur| cur.max(e)));
+        }
+    }
+    let (start_ts, end_ts) = match (start_ts, end_ts) {
+        (Some(s), Some(e)) => (s, e),
+        _ => return (StatusCode::OK, Json(serde_json::json!({ "points": [] }))),
+    };
+
+    let result = state.drives.store.with_locked_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT ts, interior_temp_c, exterior_temp_c \
+             FROM telemetry_samples \
+             WHERE ts BETWEEN ?1 AND ?2 \
+               AND (interior_temp_c IS NOT NULL OR exterior_temp_c IS NOT NULL) \
+             ORDER BY ts ASC",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![start_ts, end_ts],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, Option<f64>>(1)?,
+                    r.get::<_, Option<f64>>(2)?,
+                ))
+            },
+        )?;
+        let mut out: Vec<serde_json::Value> = Vec::new();
+        for row in rows {
+            let (ts, interior, exterior) = row?;
+            let mut obj = serde_json::Map::new();
+            // Ship ts in milliseconds — JS Date and recharts work in ms,
+            // saves the frontend a multiply per row.
+            obj.insert("ts".to_string(), serde_json::json!(ts * 1000));
+            if let Some(v) = interior {
+                obj.insert("interiorC".to_string(), serde_json::json!(v));
+            }
+            if let Some(v) = exterior {
+                obj.insert("exteriorC".to_string(), serde_json::json!(v));
+            }
+            out.push(serde_json::Value::Object(obj));
+        }
+        Ok::<_, anyhow::Error>(out)
+    });
+
+    match result {
+        Ok(points) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "points": points })),
+        ),
+        Err(e) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+#[derive(Deserialize, Default)]
+pub struct TireHistoryQuery {
+    /// Window size in days. Clamped to [1, 365] to keep the down-sample
+    /// query bounded. Defaults to 30 to match the dashboard card spec.
+    #[serde(default)]
+    pub days: Option<u32>,
+}
+
+/// GET /api/telemetry/tire-history
+///
+/// Per-tire pressure samples for the last `days` days (default 30),
+/// down-sampled to one row per hour bucket (the latest non-null sample
+/// in each bucket). Rendered as the Dashboard's TirePressureCard.
+///
+/// The 5-minute BLE sampler cadence (`TIRES_INTERVAL` in the telemetry
+/// crate) means a 30-day window contains ~8.6k samples uncompressed;
+/// the hourly down-sample cuts that to ~720 — small enough to ship
+/// over the wire and to render smoothly in recharts.
+///
+/// Response shape:
+/// ```json
+/// {
+///   "points": [
+///     { "ts": 1716471234000, "fl": 41.7, "fr": 41.5, "rl": 42.4, "rr": 41.3 },
+///     ...
+///   ],
+///   "days": 30
+/// }
+/// ```
+pub async fn tire_history(
+    State(state): State<AppState>,
+    Query(q): Query<TireHistoryQuery>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let days = q.days.unwrap_or(30).clamp(1, 365);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let cutoff = now - (days as i64) * 86_400;
+
+    let result = state.drives.store.with_locked_conn(|conn| {
+        // Window function picks the latest non-null sample per hour
+        // bucket. Filter on "at least one tire populated" so we don't
+        // emit empty rows for samples that only carried e.g. battery.
+        let mut stmt = conn.prepare(
+            "WITH bucketed AS ( \
+                SELECT ts, tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi, \
+                  ROW_NUMBER() OVER (PARTITION BY (ts / 3600) ORDER BY ts DESC) AS rn \
+                FROM telemetry_samples \
+                WHERE ts >= ?1 \
+                  AND (tire_fl_psi IS NOT NULL OR tire_fr_psi IS NOT NULL \
+                       OR tire_rl_psi IS NOT NULL OR tire_rr_psi IS NOT NULL) \
+             ) \
+             SELECT ts, tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi \
+             FROM bucketed WHERE rn = 1 ORDER BY ts ASC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![cutoff], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, Option<f64>>(1)?,
+                r.get::<_, Option<f64>>(2)?,
+                r.get::<_, Option<f64>>(3)?,
+                r.get::<_, Option<f64>>(4)?,
+            ))
+        })?;
+        let mut out: Vec<serde_json::Value> = Vec::new();
+        for row in rows {
+            let (ts, fl, fr, rl, rr) = row?;
+            let mut obj = serde_json::Map::new();
+            obj.insert("ts".to_string(), serde_json::json!(ts * 1000));
+            if let Some(v) = fl {
+                obj.insert("fl".to_string(), serde_json::json!(v));
+            }
+            if let Some(v) = fr {
+                obj.insert("fr".to_string(), serde_json::json!(v));
+            }
+            if let Some(v) = rl {
+                obj.insert("rl".to_string(), serde_json::json!(v));
+            }
+            if let Some(v) = rr {
+                obj.insert("rr".to_string(), serde_json::json!(v));
+            }
+            out.push(serde_json::Value::Object(obj));
+        }
+        Ok::<_, anyhow::Error>(out)
+    });
+
+    match result {
+        Ok(points) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "points": points,
+                "days": days,
+            })),
+        ),
+        Err(e) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
 }
