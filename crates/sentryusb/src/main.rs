@@ -300,7 +300,23 @@ async fn main() {
     // match nginx/Cloudflare defaults — sub-1 KB JSON responses don't benefit
     // from gzip and incur per-request compression CPU. JSON above 1 KB and
     // the SPA JS/CSS bundle still compress normally (1.2 MB → ~280 KB).
-    let compression = CompressionLayer::new().compress_when(
+    // Explicitly enable brotli + gzip + deflate. tower-http's
+    // `compression-full` feature compiles all three in; the
+    // CompressionLayer default already enables them, but spelling it
+    // out makes the supported codecs obvious to anyone auditing the
+    // file. Brotli is preferred when the client supports it (15–25%
+    // smaller than gzip for JSON/HTML at comparable CPU).
+    //
+    // Embedded SPA assets that build.sh pre-compressed into
+    // .br/.gz siblings are served by embed.rs with a
+    // Content-Encoding header already set — tower-http detects that
+    // and skips re-compressing, so no per-request CPU is wasted on
+    // the bundle.
+    let compression = CompressionLayer::new()
+        .br(true)
+        .gzip(true)
+        .deflate(true)
+        .compress_when(
         SizeAbove::new(1024)
             .and(NotForContentType::new("video/"))
             .and(NotForContentType::new("audio/"))
