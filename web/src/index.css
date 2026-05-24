@@ -244,6 +244,55 @@ code, pre, .font-mono {
   border-right-color: rgba(11, 14, 19, 0.95);
 }
 
+/* Playback info card — permanent tooltip bound to the DriveMap pulse
+   marker that floats alongside it as the route plays. Strips the
+   default tooltip's arrow/padding so the inner content controls the
+   look entirely (rounded card, larger typography, two-line layout). */
+.leaflet-tooltip.playback-info-tooltip {
+  padding: 8px 10px;
+  border-radius: 12px;
+  border-color: #2a3140;
+  font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  font-size: 12px;
+  line-height: 1.25;
+  white-space: nowrap;
+  pointer-events: none;
+}
+.leaflet-tooltip.playback-info-tooltip:before {
+  display: none;
+}
+.playback-info__time {
+  color: #b8bfcf;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  margin-bottom: 4px;
+}
+.playback-info__row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.playback-info__speed {
+  color: #e6e9ef;
+  font-size: 14px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.playback-info__wheel {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: rgba(122, 130, 148, 0.18);
+  color: #8a93a3;
+}
+.playback-info__wheel--fsd {
+  background: rgba(59, 130, 246, 0.22);
+  color: #3b82f6;
+}
+
 /* Dark popup styling */
 .leaflet-popup-content-wrapper {
   background: rgba(11, 14, 19, 0.95);

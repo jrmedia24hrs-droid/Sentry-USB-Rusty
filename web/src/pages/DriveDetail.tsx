@@ -30,7 +30,6 @@ import type { DriveDetail as DriveDetailType } from "@/types/drives"
 import { DriveMap } from "@/components/drives/DriveMap"
 import { DriveScrubber } from "@/components/drives/DriveScrubber"
 import { DualPinBlock } from "@/components/drives/DualPinBlock"
-import { FsdEngagementStripe } from "@/components/drives/FsdEngagementStripe"
 import { SectionHeading, StatTile } from "@/components/drives/StatTile"
 import { TagPopover } from "@/components/drives/TagPopover"
 
@@ -76,7 +75,30 @@ interface DriveDetailContentProps {
 
 function DriveDetailContent({ drive, onSaveTags }: DriveDetailContentProps) {
   const { setTotal } = useScrubberActions()
-  const metric = false
+  // Distance/speed/temperature unit, sourced from setup config
+  // (DRIVE_MAP_UNIT). Default to imperial — same default as the wizard
+  // and as Drives.tsx so the first paint never shows an unintended
+  // unit. The pattern mirrors Drives.tsx / Dashboard.tsx.
+  const [metric, setMetric] = useState(false)
+  useEffect(() => {
+    let cancelled = false
+    fetch("/api/setup/config")
+      .then((r) => r.json())
+      .then((cfg) => {
+        if (cancelled) return
+        const entry = cfg?.DRIVE_MAP_UNIT
+        if (!entry) return
+        const val =
+          typeof entry === "object" ? (entry.active ? entry.value : null) : entry
+        if (val !== null && val !== undefined) setMetric(val === "km")
+      })
+      .catch(() => {
+        /* non-critical — fall back to default unit */
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [])
   const [showFsdEvents, setShowFsdEvents] = useState(true)
   const hasFsdEvents = (drive.fsdEvents ?? []).length > 0
 
@@ -142,6 +164,8 @@ function DriveDetailContent({ drive, onSaveTags }: DriveDetailContentProps) {
             fsdEvents={drive.fsdEvents}
             showEvents={showFsdEvents}
             source={drive.source}
+            startTime={drive.startTime}
+            metric={metric}
           />
           {/* Drive tag chip floats over the bottom-left of the map.
               Click to open the popover; when no tags, shows just a
@@ -150,10 +174,13 @@ function DriveDetailContent({ drive, onSaveTags }: DriveDetailContentProps) {
             <TagPopover tags={drive.tags ?? []} onChange={onSaveTags} />
           </div>
         </div>
-        <DriveScrubber points={drive.points} startTime={drive.startTime} />
-        {drive.fsdStates && drive.fsdStates.length > 0 && (
-          <FsdEngagementStripe fsdStates={drive.fsdStates} />
-        )}
+        {/* DriveScrubber now renders the FSD engagement overlay on its
+            own track — the standalone FsdEngagementStripe is retired. */}
+        <DriveScrubber
+          points={drive.points}
+          startTime={drive.startTime}
+          fsdStates={drive.fsdStates}
+        />
       </div>
 
       <div className="mt-6">

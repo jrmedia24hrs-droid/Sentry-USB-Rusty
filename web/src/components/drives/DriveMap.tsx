@@ -11,6 +11,13 @@ interface DriveMapProps {
   fsdEvents?: FsdEvent[]
   showEvents?: boolean
   source?: string
+  // ISO start_time of the drive — needed to convert each point's
+  // relative-ms field into an absolute clock time for the playback
+  // info card. Without it the card would show offsets, not times.
+  startTime?: string
+  // True when the user's DRIVE_MAP_UNIT === "km". Controls the speed
+  // unit displayed in the playback card.
+  metric?: boolean
 }
 
 const TILES = {
@@ -70,7 +77,64 @@ function fsdEventIcon(kind: "disengagement" | "accel_push") {
   })
 }
 
-export function DriveMap({ points, fsdStates, fsdEvents, showEvents = true, source }: DriveMapProps) {
+// SVG markup for the steering-wheel glyph in the playback info card.
+// Three spokes (top, lower-left, lower-right) sketch a Tesla-yoke look
+// in a 24-viewBox stroke-only icon — colour comes from CSS currentColor.
+const WHEEL_SVG =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="14" height="14">' +
+  '<circle cx="12" cy="12" r="9"/>' +
+  '<circle cx="12" cy="12" r="2"/>' +
+  '<line x1="12" y1="3" x2="12" y2="10"/>' +
+  '<line x1="4.5" y1="16.5" x2="10" y2="13"/>' +
+  '<line x1="19.5" y1="16.5" x2="14" y2="13"/>' +
+  "</svg>"
+
+const MPS_TO_MPH = 2.23694
+const MPS_TO_KPH = 3.6
+
+// Build the HTML body of the playback tooltip for the given scrubber
+// index. Returns a string so Leaflet's `tooltip.setContent` can swap
+// it on every tick without paying React-reconciliation cost.
+function renderPlaybackHTML(
+  pt: [number, number, number, number] | undefined,
+  fsd: number | undefined,
+  baseMs: number,
+  metric: boolean,
+): string {
+  if (!pt) return ""
+  const speedMps = pt[3] ?? 0
+  const speed = Math.round(metric ? speedMps * MPS_TO_KPH : speedMps * MPS_TO_MPH)
+  const unit = metric ? "km/h" : "mph"
+  const time = Number.isFinite(baseMs)
+    ? new Date(baseMs + pt[2]).toLocaleTimeString([], {
+        hour: "numeric",
+        minute: "2-digit",
+        second: "2-digit",
+      })
+    : ""
+  const isFsd = (fsd ?? 0) > 0
+  const wheelClass = isFsd
+    ? "playback-info__wheel playback-info__wheel--fsd"
+    : "playback-info__wheel"
+  const wheelTitle = isFsd ? "FSD engaged" : "Manual driving"
+  return (
+    `<div class="playback-info__time">${time}</div>` +
+    `<div class="playback-info__row">` +
+    `<span class="playback-info__speed">${speed} ${unit}</span>` +
+    `<span class="${wheelClass}" title="${wheelTitle}" aria-label="${wheelTitle}">${WHEEL_SVG}</span>` +
+    `</div>`
+  )
+}
+
+export function DriveMap({
+  points,
+  fsdStates,
+  fsdEvents,
+  showEvents = true,
+  source,
+  startTime,
+  metric = false,
+}: DriveMapProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const mapRef = useRef<L.Map | null>(null)
   const tileRef = useRef<L.TileLayer | null>(null)
@@ -139,12 +203,38 @@ export function DriveMap({ points, fsdStates, fsdEvents, showEvents = true, sour
     // canvas-rendered polylines.
     L.marker(latLngs[0], { icon: startMarkerIcon(), interactive: false }).addTo(map)
     L.marker(latLngs[latLngs.length - 1], { icon: endMarkerIcon(), interactive: false }).addTo(map)
+    // The pulse marker MUST be interactive so the bound tooltip can
+    // open via openTooltip() — Leaflet refuses to open tooltips on
+    // non-interactive markers. We still set keyboard:false so it
+    // doesn't capture tab focus.
     pulseRef.current = L.marker(latLngs[0], {
       icon: pulseMarkerIcon(),
-      interactive: false,
+      interactive: true,
       keyboard: false,
       zIndexOffset: 1000,
     }).addTo(map)
+
+    // Playback info card — permanent tooltip floating next to the
+    // pulse marker. Bound once here, content swapped on each scrubber
+    // tick by the dedicated effect below. Position "right" so the
+    // card sits to the side of the pulse like Tessie's playback view;
+    // Leaflet auto-flips when it would go off the map edge.
+    const baseMs = startTime ? new Date(startTime).getTime() : NaN
+    const initialHtml = renderPlaybackHTML(
+      points[0],
+      fsdStates?.[0],
+      baseMs,
+      metric,
+    )
+    pulseRef.current
+      .bindTooltip(initialHtml, {
+        permanent: true,
+        direction: "right",
+        offset: [10, 0],
+        className: "playback-info-tooltip",
+        opacity: 1,
+      })
+      .openTooltip()
 
     eventsLayerRef.current = L.layerGroup().addTo(map)
     map.fitBounds(L.latLngBounds(latLngs), { padding: [24, 24], maxZoom: 16 })
@@ -187,7 +277,17 @@ export function DriveMap({ points, fsdStates, fsdEvents, showEvents = true, sour
     if (!pulse || points.length === 0) return
     const i = Math.min(points.length - 1, Math.max(0, currentIndex))
     pulse.setLatLng(L.latLng(points[i][0], points[i][1]))
-  }, [currentIndex, points])
+    // Refresh the playback info card to match the new position.
+    // setContent on an attached Leaflet tooltip patches its innerHTML
+    // in place — no React render, no marker rebind, no map redraw.
+    const tooltip = pulse.getTooltip()
+    if (tooltip) {
+      const baseMs = startTime ? new Date(startTime).getTime() : NaN
+      tooltip.setContent(
+        renderPlaybackHTML(points[i], fsdStates?.[i], baseMs, metric),
+      )
+    }
+  }, [currentIndex, points, fsdStates, startTime, metric])
 
   const cycleStyle = () => {
     setStyle((s) => (s === "dark" ? "streets" : s === "streets" ? "satellite" : "dark"))

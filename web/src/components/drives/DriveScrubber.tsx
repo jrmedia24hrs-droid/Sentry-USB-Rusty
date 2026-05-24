@@ -1,4 +1,4 @@
-import { useRef } from "react"
+import { useMemo, useRef } from "react"
 import { Pause, Play } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useScrubberActions, useScrubberState } from "@/hooks/useScrubberSync"
@@ -6,20 +6,32 @@ import { useScrubberActions, useScrubberState } from "@/hooks/useScrubberSync"
 interface DriveScrubberProps {
   points: [number, number, number, number][]
   startTime: string
+  // Parallel to `points` (length must match). When present, the bar
+  // overlays emerald-on-blue segments showing FSD engagement; otherwise
+  // the bar renders as a single solid blue track.
+  fsdStates?: number[]
 }
 
 const SPEEDS = [0.5, 1, 2, 5] as const
 
-export function DriveScrubber({ points, startTime }: DriveScrubberProps) {
+// Match DriveMap's polyline palette so the scrubber and the route
+// visually agree on which colour means "FSD engaged" vs "manual driving".
+// Tailwind's blue-* palette is theme-remapped to green in this app
+// (index.css), so we use literal hex here to render actual blue.
+const COLOR_MANUAL = "#3b82f6"
+const COLOR_FSD = "#34d399"
+
+export function DriveScrubber({ points, startTime, fsdStates }: DriveScrubberProps) {
   const { currentIndex, playing, playbackSpeed } = useScrubberState()
   const { setIndex, setPlaying, setPlaybackSpeed } = useScrubberActions()
   const max = Math.max(0, points.length - 1)
+  const n = points.length
 
   // requestAnimationFrame-throttled writes from the slider so dragging
   // never queues more than one state update per frame. Combined with
   // the split state/actions contexts (the parent detail page no longer
   // re-renders on currentIndex change), the thumb tracks the mouse
-  // smoothly even with the FSD stripe + map pulse listening.
+  // smoothly even with the map pulse + tooltip listening.
   const rafRef = useRef<number | null>(null)
   const pendingRef = useRef<number | null>(null)
   const onSliderInput = (val: number) => {
@@ -33,6 +45,27 @@ export function DriveScrubber({ points, startTime }: DriveScrubberProps) {
       })
     }
   }
+
+  // Compress fsdStates into contiguous on/off runs. Only the "on" runs
+  // need to render (the underlying track is already blue). Skip entirely
+  // when length doesn't match — a length mismatch means the data is
+  // unreliable and a plain bar is safer than a misaligned overlay.
+  const fsdSegments = useMemo(() => {
+    if (!fsdStates || fsdStates.length !== n || n === 0) return null
+    const out: { start: number; end: number }[] = []
+    let curStart = 0
+    let curOn = fsdStates[0] > 0
+    for (let i = 1; i < n; i++) {
+      const on = fsdStates[i] > 0
+      if (on !== curOn) {
+        if (curOn) out.push({ start: curStart, end: i })
+        curStart = i
+        curOn = on
+      }
+    }
+    if (curOn) out.push({ start: curStart, end: n })
+    return out
+  }, [fsdStates, n])
 
   const baseMs = new Date(startTime).getTime()
   const driveStartLabel =
@@ -69,16 +102,53 @@ export function DriveScrubber({ points, startTime }: DriveScrubberProps) {
           {driveStartLabel}
         </span>
 
-        <div className="relative flex-1">
+        <div className="relative h-4 flex-1">
+          {/* Visible track: solid manual-blue background, FSD segments
+              overlay in emerald. Vertically centred in the 16px-tall
+              container so the thumb has room to extend above/below. */}
+          <div
+            className="pointer-events-none absolute left-0 right-0 top-1/2 h-1.5 -translate-y-1/2 overflow-hidden rounded-full"
+            style={{ background: COLOR_MANUAL }}
+            aria-hidden
+          >
+            {fsdSegments?.map((seg, i) => {
+              const left = (seg.start / n) * 100
+              const width = ((seg.end - seg.start) / n) * 100
+              return (
+                <span
+                  key={i}
+                  className="absolute top-0 h-full"
+                  style={{
+                    left: `${left}%`,
+                    width: `${width}%`,
+                    background: COLOR_FSD,
+                  }}
+                />
+              )
+            })}
+          </div>
+
+          {/* Transparent input handles drag/click/keyboard. opacity-0
+              keeps it invisible while still capturing pointer + focus.
+              `peer` lets the thumb pick up a focus ring via Tailwind. */}
           <input
             type="range"
             min={0}
             max={max}
             value={currentIndex}
             onChange={(e) => onSliderInput(Number(e.target.value))}
-            className="h-1 w-full cursor-pointer appearance-none rounded-full bg-white/10 accent-emerald-400"
+            className="peer absolute inset-0 h-full w-full cursor-pointer appearance-none bg-transparent opacity-0 focus:outline-none"
             aria-label="Drive scrubber"
           />
+
+          {/* Custom thumb — pointer-events-none so clicks pass through
+              to the input. Larger ring on focus for keyboard users. */}
+          <div
+            className="pointer-events-none absolute top-1/2 h-3.5 w-3.5 -translate-x-1/2 -translate-y-1/2 rounded-full bg-white shadow ring-2 ring-emerald-500/80 transition-shadow peer-focus-visible:ring-emerald-300 peer-focus-visible:ring-offset-2 peer-focus-visible:ring-offset-slate-900"
+            style={{ left: `${cursorPct}%` }}
+            aria-hidden
+          />
+
           {/* Floating current-time label tracks the thumb position. */}
           <div
             className="pointer-events-none absolute -bottom-5 text-[10px] font-semibold tabular-nums text-emerald-300"
