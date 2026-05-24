@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react"
-import { fetchDriveDetail, setDriveTags } from "@/api/drives"
-import type { DriveDetail } from "@/types/drives"
+import { fetchDriveDetail, fetchDrives, setDriveTags } from "@/api/drives"
+import type { DriveDetail, DriveSummary } from "@/types/drives"
 
 export interface DriveDetailState {
   drive: DriveDetail | null
@@ -8,6 +8,33 @@ export interface DriveDetailState {
   error: string | null
   saveTags: (tags: string[]) => Promise<void>
   refresh: () => Promise<void>
+}
+
+// Telemetry fields live on DriveSummary (built from RouteTelemetryAggregates
+// in the BLOB-free path) but NOT on the Drive struct returned by
+// /api/drives/:id. Without this merge the detail page would silently hide
+// Battery, Climate, Tire pressure, Odometer sections and render "Unknown
+// origin/destination" + "Drive to Drive" as the title.
+function mergeTelemetry(detail: DriveDetail, summary: DriveSummary): DriveDetail {
+  return {
+    ...detail,
+    batteryPctStart: summary.batteryPctStart,
+    batteryPctEnd: summary.batteryPctEnd,
+    batteryPctUsed: summary.batteryPctUsed,
+    interiorTempMinC: summary.interiorTempMinC,
+    interiorTempMaxC: summary.interiorTempMaxC,
+    exteriorTempAvgC: summary.exteriorTempAvgC,
+    hvacRuntimeS: summary.hvacRuntimeS,
+    tireFlPsi: summary.tireFlPsi,
+    tireFrPsi: summary.tireFrPsi,
+    tireRlPsi: summary.tireRlPsi,
+    tireRrPsi: summary.tireRrPsi,
+    odometerMiStart: summary.odometerMiStart,
+    odometerMiEnd: summary.odometerMiEnd,
+    odometerMiDriven: summary.odometerMiDriven,
+    startLocation: summary.startLocation,
+    endLocation: summary.endLocation,
+  }
 }
 
 export function useDriveDetail(id: string | undefined): DriveDetailState {
@@ -27,10 +54,15 @@ export function useDriveDetail(id: string | undefined): DriveDetailState {
     let cancelled = false
     setLoading(true)
     setError(null)
-    fetchDriveDetail(id)
-      .then((d) => {
+    Promise.all([
+      fetchDriveDetail(id),
+      fetchDrives().catch(() => [] as DriveSummary[]),
+    ])
+      .then(([detail, summaries]) => {
         if (cancelled) return
-        setDrive(d)
+        const numericId = Number(id)
+        const summary = summaries.find((s) => s.id === numericId)
+        setDrive(summary ? mergeTelemetry(detail, summary) : detail)
       })
       .catch((e) => {
         if (cancelled) return
