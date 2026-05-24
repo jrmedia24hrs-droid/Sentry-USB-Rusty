@@ -6,48 +6,85 @@ import {
   Line,
   LineChart,
   ReferenceArea,
+  ReferenceLine,
   ResponsiveContainer,
   Tooltip,
   XAxis,
   YAxis,
 } from "recharts"
 
-// Tire-pressure zones — labels match the Tessie convention. The
-// "Optimal" band intentionally has no explicit numeric label inside
-// the chart (the surrounding bands' edges already imply the range).
-// Colour intent:
-//   red      → unsafe (top & bottom)
-//   amber    → harsher ride / wear (high end of safe)
-//   green    → optimal
-//   orange   → reduced handling / efficiency (low end of safe)
+// Tire-pressure zones — labels and styling match Tessie's convention
+// (see user's reference screenshot). Each band is a solid-feeling
+// translucent block with the label centered vertically inside; the
+// boundaries between bands are drawn separately as dashed ReferenceLines
+// so the dividers read as a single line, not two stacked borders.
+//
+// Colour intent: red (unsafe top + bottom), amber (harsher ride near top
+// of safe), green (optimal), orange (reduced handling near bottom of safe).
+// Opacities are higher than the previous pass so the zones read as
+// blocks rather than tints.
 const ZONES = [
-  { y1: 50, y2: 60, color: "rgba(239, 68, 68, 0.18)", label: ">50 PSI • UNSAFE" },
+  {
+    y1: 50,
+    y2: 60,
+    fill: "rgba(127, 29, 29, 0.55)",
+    label: ">50 PSI • UNSAFE",
+    labelColor: "#fca5a5",
+  },
   {
     y1: 45,
     y2: 50,
-    color: "rgba(251, 191, 36, 0.16)",
+    fill: "rgba(63, 98, 18, 0.55)",
     label: ">45 PSI • HARSHER RIDE & WEAR",
+    labelColor: "#bef264",
   },
-  { y1: 36, y2: 45, color: "rgba(52, 211, 153, 0.14)", label: "OPTIMAL" },
+  {
+    y1: 36,
+    y2: 45,
+    fill: "rgba(22, 78, 51, 0.55)",
+    label: "OPTIMAL",
+    labelColor: "rgba(167, 243, 208, 0.85)",
+  },
   {
     y1: 28,
     y2: 36,
-    color: "rgba(249, 115, 22, 0.16)",
+    fill: "rgba(124, 45, 18, 0.55)",
     label: "<36 PSI • REDUCED HANDLING & EFFICIENCY",
+    labelColor: "#fcd34d",
   },
-  { y1: 15, y2: 28, color: "rgba(239, 68, 68, 0.18)", label: "<28 PSI • UNSAFE" },
+  {
+    y1: 15,
+    y2: 28,
+    fill: "rgba(127, 29, 29, 0.55)",
+    label: "<28 PSI • UNSAFE",
+    labelColor: "#fca5a5",
+  },
 ] as const
 
-const Y_DOMAIN: [number, number] = [25, 55]
+// Interior boundaries (dashed lines drawn between adjacent zones).
+// Colour-coded to the warning band immediately above/below so the
+// divider reads as a transition cue, not chrome.
+const ZONE_BOUNDARIES = [
+  { y: 50, color: "rgba(252, 165, 165, 0.7)" }, // red boundary above harsh
+  { y: 45, color: "rgba(190, 242, 100, 0.7)" }, // amber/lime above optimal
+  { y: 36, color: "rgba(252, 211, 77, 0.7)" }, // amber above reduced
+  { y: 28, color: "rgba(252, 165, 165, 0.7)" }, // red above bottom-unsafe
+] as const
 
-// Per-tire line colours — distinct hues so all four read on top of
-// the coloured zone bands. Picked to avoid the band colours (red,
-// amber, green, orange) so the lines never blend into a backdrop.
+// Y range chosen so the visible bottom "UNSAFE" band has the same
+// presence Tessie gives it (~25-30% of the chart height). Going below
+// 20 just wastes space — tires never read that low in practice.
+const Y_DOMAIN: [number, number] = [20, 55]
+
+// Per-tire line colours — green family to match Tessie's all-green
+// tracings while keeping the four wheels distinguishable on hover.
+// Picked far enough apart in lightness/hue that they don't melt into
+// each other or into the green OPTIMAL band when stacked.
 const TIRE_COLORS = {
-  fl: "#60a5fa", // sky-400  — front-left
-  fr: "#a78bfa", // violet-400 — front-right
-  rl: "#22d3ee", // cyan-400  — rear-left
-  rr: "#f472b6", // pink-400  — rear-right
+  fl: "#34d399", // emerald-400  — front-left
+  fr: "#a3e635", // lime-400     — front-right
+  rl: "#5eead4", // teal-300     — rear-left
+  rr: "#facc15", // yellow-400   — rear-right (warm contrast against the greens)
 } as const
 
 interface TirePoint {
@@ -177,16 +214,26 @@ export function TirePressureCard({ days = 30 }: TirePressureCardProps) {
                   key={z.label}
                   y1={z.y1}
                   y2={z.y2}
-                  fill={z.color}
+                  fill={z.fill}
                   stroke="transparent"
                   label={{
                     value: z.label,
-                    position: "insideTop",
-                    fill: "rgba(226,232,240,0.55)",
-                    fontSize: 9,
+                    position: "center",
+                    fill: z.labelColor,
+                    fontSize: 10,
                     fontWeight: 600,
                     letterSpacing: "0.08em",
                   }}
+                  ifOverflow="hidden"
+                />
+              ))}
+              {ZONE_BOUNDARIES.map((b) => (
+                <ReferenceLine
+                  key={b.y}
+                  y={b.y}
+                  stroke={b.color}
+                  strokeWidth={1}
+                  strokeDasharray="6 4"
                   ifOverflow="hidden"
                 />
               ))}
