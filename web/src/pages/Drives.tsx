@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from "react"
+import { useCallback, useEffect, useMemo, useState } from "react"
 import { Loader2 } from "lucide-react"
 import { setDriveTags } from "@/api/drives"
 import { DriveRow } from "@/components/drives/DriveRow"
@@ -9,7 +9,31 @@ import { useDrivesList } from "@/hooks/useDrivesList"
 
 export default function Drives() {
   const list = useDrivesList()
-  const [metric] = useState(false)
+  // Distance/speed unit preference, sourced from setup config
+  // (DRIVE_MAP_UNIT). Default to imperial — matches the wizard default
+  // and Dashboard's behaviour before the config fetch resolves, so the
+  // first paint never shows a unit the user didn't pick. The fetch
+  // pattern mirrors Dashboard.tsx / Viewer.tsx / FSDAnalytics.tsx.
+  const [metric, setMetric] = useState(false)
+  useEffect(() => {
+    let cancelled = false
+    fetch("/api/setup/config")
+      .then((r) => r.json())
+      .then((cfg) => {
+        if (cancelled) return
+        const entry = cfg?.DRIVE_MAP_UNIT
+        if (!entry) return
+        const val =
+          typeof entry === "object" ? (entry.active ? entry.value : null) : entry
+        if (val !== null && val !== undefined) setMetric(val === "km")
+      })
+      .catch(() => {
+        /* non-critical — fall back to default unit */
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [])
   const [selectMode, setSelectMode] = useState(false)
   const [selected, setSelected] = useState<Set<number>>(new Set())
 
@@ -35,8 +59,19 @@ export default function Drives() {
 
   const onTagsChange = useCallback(
     async (id: number, tags: string[]) => {
-      await setDriveTags(id, tags)
-      await list.refresh()
+      // Snapshot the previous tags so we can roll back if the PUT fails.
+      // Optimistic update keeps the popover snappy and avoids a full
+      // /api/drives refetch on every tag click. The backend invalidates
+      // the drive-list cache on set_drive_tags, so the next natural fetch
+      // (page revisit, manual refresh) rebuilds authoritatively.
+      const prev = list.drives.find((d) => d.id === id)?.tags ?? []
+      list.patchDriveTags(id, tags)
+      try {
+        await setDriveTags(id, tags)
+      } catch (e) {
+        list.patchDriveTags(id, prev)
+        throw e
+      }
     },
     [list],
   )
@@ -80,6 +115,7 @@ export default function Drives() {
         onTagSelected={() => alert("Bulk tag is not implemented yet.")}
         onExportSelected={() => alert("Bulk export is not implemented yet.")}
         onDeleteSelected={() => alert("Bulk delete is not implemented yet.")}
+        metric={metric}
       />
 
       <div className="mt-4 flex items-center justify-between text-sm text-slate-400">

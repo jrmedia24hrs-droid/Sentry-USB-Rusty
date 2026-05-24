@@ -807,13 +807,38 @@ pub async fn delete_all_drives(
     }
 }
 
-/// PUT /api/drives/{id}/tags — set tags for a drive
+/// PUT /api/drives/{id}/tags — set tags for a drive.
+///
+/// `id` from the URL is either the numeric grouper index (what the
+/// drives-list response stamps onto `DriveSummary.id`) or the
+/// `%Y-%m-%dT%H:%M:%S` start_time string (the same form
+/// `/api/drives/{id}` accepts). Either way, the grouper joins tags
+/// onto drives strictly by start_time string, so we MUST resolve the
+/// URL id to that canonical key before writing — otherwise the row
+/// lands under a key like `"3"` that the list endpoint never reads
+/// back, and the tag silently disappears from the UI even though the
+/// PUT returned 200.
 pub async fn set_drive_tags(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(body): Json<SetTagsRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    match state.drives.store.set_drive_tags(&id, &body.tags) {
+    let key = match state
+        .drives
+        .store
+        .with_route_summaries(|summaries| grouper::find_drive_start_time(summaries, &id))
+    {
+        Ok(Some(k)) => k,
+        Ok(None) => {
+            return crate::json_error(
+                StatusCode::NOT_FOUND,
+                &format!("drive not found for id='{}'", id),
+            )
+        }
+        Err(e) => return crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+
+    match state.drives.store.set_drive_tags(&key, &body.tags) {
         Ok(()) => crate::json_ok(),
         Err(e) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }

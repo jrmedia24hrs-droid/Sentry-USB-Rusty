@@ -214,6 +214,44 @@ pub fn find_drive_files(
     None
 }
 
+/// Resolve a drive id to the canonical start_time string used as the
+/// `drive_tags.drive_key` join key.
+///
+/// Accepts the same id forms `find_drive_files` does — numeric index
+/// or `%Y-%m-%dT%H:%M:%S` start_time string — and always returns the
+/// start_time string the grouper uses when joining tags onto drives
+/// (`build_summary_from_aggregates` / `build_drive_stats`).
+///
+/// Without this resolver, `PUT /api/drives/{id}/tags` stored rows keyed
+/// by the raw URL id (typically the numeric index), which never matched
+/// the start_time key the list endpoint later read by — so tags were
+/// written but never displayed.
+pub fn find_drive_start_time(summaries: &[RouteSummary], id: &str) -> Option<String> {
+    let groups = group_summary_clips(summaries);
+
+    let key_of = |idx: usize| -> Option<String> {
+        groups
+            .get(idx)
+            .and_then(|g| g.first())
+            .map(|c| c.timestamp.format("%Y-%m-%dT%H:%M:%S").to_string())
+    };
+
+    if let Ok(idx) = id.parse::<usize>() {
+        if let Some(st) = key_of(idx) {
+            return Some(st);
+        }
+    }
+    for group in groups.iter() {
+        if let Some(first) = group.first() {
+            let st = first.timestamp.format("%Y-%m-%dT%H:%M:%S").to_string();
+            if st == id {
+                return Some(st);
+            }
+        }
+    }
+    None
+}
+
 /// Build a full `Drive` (with all merged point data, gear/FSD arrays,
 /// and FSD events) from a slice of routes that are **already known to
 /// belong to a single drive**. Skips `group_clips` entirely so the
