@@ -196,6 +196,61 @@ impl PersistentSession {
     pub async fn shutdown(&self) {
         let _ = self.cmd_tx.send(Command::Shutdown).await;
     }
+
+    // -------------------------------------------------------------
+    // Typed convenience wrappers. Each does a raw `query()` to the
+    // Infotainment domain + decodes the response into the relevant
+    // car_server sub-message. Sampler code can use these directly
+    // without learning about proto bytes.
+    // -------------------------------------------------------------
+
+    /// `state climate`. Interior/exterior temps, HVAC, defroster, etc.
+    pub async fn get_climate(&self) -> Result<crate::proto::car_server::ClimateState> {
+        let bytes = self
+            .query(Domain::Infotainment, VehicleDataState::Climate)
+            .await?;
+        crate::responses::parse_climate(&bytes)
+    }
+
+    /// `state charge`. Battery %, charger info, range estimate.
+    pub async fn get_charge(&self) -> Result<crate::proto::car_server::ChargeState> {
+        let bytes = self
+            .query(Domain::Infotainment, VehicleDataState::Charge)
+            .await?;
+        crate::responses::parse_charge(&bytes)
+    }
+
+    /// `state drive`. Shift state, speed, heading.
+    pub async fn get_drive(&self) -> Result<crate::proto::car_server::DriveState> {
+        let bytes = self
+            .query(Domain::Infotainment, VehicleDataState::Drive)
+            .await?;
+        crate::responses::parse_drive(&bytes)
+    }
+
+    /// `state location`. GPS coords (when authorized).
+    pub async fn get_location(&self) -> Result<crate::proto::car_server::LocationState> {
+        let bytes = self
+            .query(Domain::Infotainment, VehicleDataState::Location)
+            .await?;
+        crate::responses::parse_location(&bytes)
+    }
+
+    /// `state tire-pressure`. PSI per tire.
+    pub async fn get_tire_pressure(&self) -> Result<crate::proto::car_server::TirePressureState> {
+        let bytes = self
+            .query(Domain::Infotainment, VehicleDataState::TirePressure)
+            .await?;
+        crate::responses::parse_tire_pressure(&bytes)
+    }
+
+    /// `state closures`. Door/window/trunk/charge-port states.
+    pub async fn get_closures(&self) -> Result<crate::proto::car_server::ClosuresState> {
+        let bytes = self
+            .query(Domain::Infotainment, VehicleDataState::Closures)
+            .await?;
+        crate::responses::parse_closures(&bytes)
+    }
 }
 
 async fn run_session_task(

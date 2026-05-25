@@ -7,6 +7,7 @@ pub mod gatt;
 pub mod keys;
 pub mod local_name;
 pub mod manager;
+pub mod responses;
 pub mod scan;
 pub mod session;
 pub mod state_query;
@@ -30,6 +31,9 @@ pub mod proto {
     }
     pub mod car_server {
         include!(concat!(env!("OUT_DIR"), "/car_server.rs"));
+    }
+    pub mod managed_charging {
+        include!(concat!(env!("OUT_DIR"), "/managed_charging.rs"));
     }
 }
 
