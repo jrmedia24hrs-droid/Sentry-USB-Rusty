@@ -9,6 +9,7 @@ import {
   XAxis,
   YAxis,
 } from "recharts"
+import { useScrubberActions } from "@/hooks/useScrubberSync"
 
 export interface TemperaturePoint {
   // Unix ms — backend (drives_handler::temperature_series) emits the
@@ -27,12 +28,23 @@ interface TemperatureChartProps {
   // True when DRIVE_MAP_UNIT === "km" (so the user prefers metric —
   // we mirror that for temperature with °C). False → °F.
   metric: boolean
+  // Drive points (`[lat, lng, rel_ms, speed_mps]`) and start_time used
+  // to translate a clicked telemetry timestamp into a scrubber index.
+  // Optional: when omitted, the chart renders without click-to-seek.
+  drivePoints?: [number, number, number, number][]
+  startTime?: string
 }
 
 const INTERIOR_COLOR = "#f97316" // orange — warm = inside
 const EXTERIOR_COLOR = "#38bdf8" // sky — cool = outside (sky-500-ish)
 
-export default function TemperatureChart({ points, metric }: TemperatureChartProps) {
+export default function TemperatureChart({
+  points,
+  metric,
+  drivePoints,
+  startTime,
+}: TemperatureChartProps) {
+  const { setIndex } = useScrubberActions()
   // Convert °C → °F once at the boundary so the chart's data, axis,
   // and tooltip all speak the same unit. Skipping with `undefined`
   // preserves the gap-handling behaviour from the raw payload.
@@ -45,14 +57,61 @@ export default function TemperatureChart({ points, metric }: TemperatureChartPro
     }))
   }, [points, metric])
 
+  // Pre-compute the drive's start clock-time so we can convert a clicked
+  // telemetry `ts` (absolute Unix ms) to the matching scrubber index in
+  // O(log n) per click. The drive's points carry relative ms offsets
+  // from start_time so we binary-search by `(ts - baseMs)`.
+  const baseMs = useMemo(
+    () => (startTime ? new Date(startTime).getTime() : NaN),
+    [startTime],
+  )
+
+  const canSeek = drivePoints && drivePoints.length > 0 && Number.isFinite(baseMs)
+
+  const seekToTs = (ts: number) => {
+    if (!canSeek || !drivePoints) return
+    const targetRel = ts - baseMs
+    // Binary search for nearest point by relative ms.
+    let lo = 0
+    let hi = drivePoints.length - 1
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1
+      if (drivePoints[mid][2] < targetRel) lo = mid + 1
+      else hi = mid
+    }
+    let best = lo
+    if (lo > 0) {
+      const a = Math.abs(drivePoints[lo - 1][2] - targetRel)
+      const b = Math.abs(drivePoints[lo][2] - targetRel)
+      if (a < b) best = lo - 1
+    }
+    setIndex(best)
+  }
+
   const unit = metric ? "°C" : "°F"
 
   return (
-    <div className="h-56 w-full" aria-label="Temperature chart">
+    <div
+      className={canSeek ? "h-56 w-full cursor-crosshair" : "h-56 w-full"}
+      aria-label="Temperature chart"
+    >
       <ResponsiveContainer>
         <LineChart
           data={converted}
           margin={{ top: 10, right: 16, bottom: 24, left: 4 }}
+          onClick={(s) => {
+            const idx = s?.activeTooltipIndex
+            if (typeof idx === "number" && idx >= 0 && idx < converted.length) {
+              seekToTs(converted[idx].ts)
+            }
+          }}
+          onMouseMove={(s) => {
+            if (!canSeek) return
+            const idx = s?.activeTooltipIndex
+            if (typeof idx === "number" && idx >= 0 && idx < converted.length) {
+              seekToTs(converted[idx].ts)
+            }
+          }}
         >
           <CartesianGrid stroke="#1e242f" strokeDasharray="3 3" vertical={false} />
           <XAxis

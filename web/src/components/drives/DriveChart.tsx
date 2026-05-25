@@ -26,12 +26,21 @@ export default function DriveChart({
   const baseMs = useMemo(() => new Date(startTime).getTime(), [startTime])
 
   return (
-    <div className="h-56 w-full" aria-label={`${valueLabel} chart`}>
+    <div
+      className="h-56 w-full cursor-crosshair"
+      aria-label={`${valueLabel} chart`}
+    >
       <ResponsiveContainer>
         <AreaChart
           data={series}
           margin={{ top: 10, right: 16, bottom: 16, left: 4 }}
           onMouseMove={(s) => {
+            const idx = s?.activeTooltipIndex
+            if (typeof idx === "number" && idx >= 0 && idx < series.length) {
+              setIndex(series[idx].index)
+            }
+          }}
+          onClick={(s) => {
             const idx = s?.activeTooltipIndex
             if (typeof idx === "number" && idx >= 0 && idx < series.length) {
               setIndex(series[idx].index)
