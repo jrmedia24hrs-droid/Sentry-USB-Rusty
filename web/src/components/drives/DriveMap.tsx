@@ -40,6 +40,12 @@ const TILES = {
     "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
 } as const
 
+// CartoDB "labels only" overlay — transparent tiles with street + place
+// names, drawn on top of the satellite base so the user can actually
+// read the map. Dark/streets already include labels in their base tile.
+const SATELLITE_LABELS_URL =
+  "https://{s}.basemaps.cartocdn.com/rastertiles/voyager_only_labels/{z}/{x}/{y}{r}.png"
+
 type Style = keyof typeof TILES
 
 // Colors for the route polyline segments.
@@ -203,6 +209,10 @@ export function DriveMap({
   const containerRef = useRef<HTMLDivElement>(null)
   const mapRef = useRef<L.Map | null>(null)
   const tileRef = useRef<L.TileLayer | null>(null)
+  // Transparent labels layer drawn on top of satellite imagery so place
+  // and street names remain readable. Only attached in the "satellite"
+  // style; the dark/streets base tiles already include labels.
+  const labelsRef = useRef<L.TileLayer | null>(null)
   const pulseRef = useRef<L.Marker | null>(null)
   const eventsLayerRef = useRef<L.LayerGroup | null>(null)
   const [style, setStyle] = useState<Style>("dark")
@@ -311,6 +321,7 @@ export function DriveMap({
       map.remove()
       mapRef.current = null
       tileRef.current = null
+      labelsRef.current = null
       pulseRef.current = null
       eventsLayerRef.current = null
     }
@@ -321,6 +332,19 @@ export function DriveMap({
     if (!map || !tileRef.current) return
     map.removeLayer(tileRef.current)
     tileRef.current = L.tileLayer(TILES[style], { maxZoom: 19 }).addTo(map)
+    // Manage the satellite labels overlay: attach on switch-to-satellite,
+    // remove on switch-away. Pane "shadowPane" keeps it above the
+    // base tiles but below polylines and markers.
+    if (labelsRef.current) {
+      map.removeLayer(labelsRef.current)
+      labelsRef.current = null
+    }
+    if (style === "satellite") {
+      labelsRef.current = L.tileLayer(SATELLITE_LABELS_URL, {
+        maxZoom: 19,
+        pane: "shadowPane",
+      }).addTo(map)
+    }
   }, [style])
 
   useEffect(() => {
