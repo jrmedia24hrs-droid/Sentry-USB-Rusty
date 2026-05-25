@@ -10,7 +10,7 @@
 //!  - AP connection profile name is `SENTRYUSB_AP` (Go's convention).
 
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 use axum::Json;
 use axum::extract::State;
@@ -391,10 +391,4 @@ fn status_snapshot_sync(inner: &Inner) -> serde_json::Value {
         }
     }
     v
-}
-
-// Unused helpers to silence dead-code warnings if added later.
-#[allow(dead_code)]
-fn _touch() {
-    let _ = UNIX_EPOCH;
 }

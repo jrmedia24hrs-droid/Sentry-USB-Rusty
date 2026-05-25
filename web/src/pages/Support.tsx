@@ -398,6 +398,7 @@ export default function Support() {
                             alt={a.name}
                             className="max-h-64 rounded-lg border border-white/10 object-contain"
                             loading="lazy"
+                            decoding="async"
                           />
                         </a>
                       ) : (

@@ -331,10 +331,6 @@ struct WavInfo {
     num_channels: u16,
     sample_rate: u32,
     bits_per_sample: u16,
-    #[allow(dead_code)]
-    duration: f64,
-    #[allow(dead_code)]
-    fmt_offset: usize,
     data_offset: usize,
     data_size: u32,
 }
@@ -353,8 +349,6 @@ fn parse_wav_info(data: &[u8]) -> Result<WavInfo, String> {
         num_channels: 0,
         sample_rate: 0,
         bits_per_sample: 0,
-        duration: 0.0,
-        fmt_offset: 0,
         data_offset: 0,
         data_size: 0,
     };
@@ -368,7 +362,6 @@ fn parse_wav_info(data: &[u8]) -> Result<WavInfo, String> {
             if pos + 8 + chunk_size as usize > data.len() || chunk_size < 16 {
                 return Err("malformed WAV fmt chunk".into());
             }
-            info.fmt_offset = pos;
             info.audio_format = u16::from_le_bytes([data[pos + 8], data[pos + 9]]);
             info.num_channels = u16::from_le_bytes([data[pos + 10], data[pos + 11]]);
             info.sample_rate = u32::from_le_bytes([data[pos + 12], data[pos + 13], data[pos + 14], data[pos + 15]]);
@@ -377,13 +370,6 @@ fn parse_wav_info(data: &[u8]) -> Result<WavInfo, String> {
         } else if chunk_id == b"data" && fmt_found {
             info.data_offset = pos + 8;
             info.data_size = chunk_size;
-            if info.sample_rate > 0 && info.num_channels > 0 && info.bits_per_sample > 0 {
-                let bytes_per_sample = info.num_channels as u32 * info.bits_per_sample as u32 / 8;
-                let byte_rate = info.sample_rate * bytes_per_sample;
-                if byte_rate > 0 {
-                    info.duration = chunk_size as f64 / byte_rate as f64;
-                }
-            }
             return Ok(info);
         }
 

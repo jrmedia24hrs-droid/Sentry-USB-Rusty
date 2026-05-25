@@ -336,7 +336,7 @@ pub async fn speedtest(State(_s): State<AppState>) -> impl IntoResponse {
 }
 
 /// GET /api/system/rtc-status
-pub async fn get_rtc_status(State(_s): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
+pub async fn get_rtc_status(State(_s): State<AppState>) -> impl IntoResponse {
     let rtc_exists = std::path::Path::new("/dev/rtc0").exists();
     let mut rtc_time = String::new();
     if rtc_exists {
@@ -344,18 +344,90 @@ pub async fn get_rtc_status(State(_s): State<AppState>) -> (StatusCode, Json<ser
             rtc_time = out.trim().to_string();
         }
     }
-    (StatusCode::OK, Json(serde_json::json!({
-        "available": rtc_exists,
-        "time": rtc_time,
-    })))
+    // RTC presence is a hardware fact that doesn't change at runtime.
+    // The Dashboard hits this on every load — let the browser short-
+    // circuit subsequent requests for 5 min and save a round trip.
+    (
+        StatusCode::OK,
+        [(axum::http::header::CACHE_CONTROL, "private, max-age=300")],
+        Json(serde_json::json!({
+            "available": rtc_exists,
+            "time": rtc_time,
+        })),
+    )
+}
+
+/// GET /api/system/clock-status
+///
+/// Reports whether the Pi's system clock can be trusted for
+/// timestamping samples + matching them to drives later. Used by the
+/// BLE pair card to show a short "clock not synced" hint ONLY when
+/// all of:
+///   * The system clock looks bogus (year < 2025 = unset / Jan-1-2000
+///     fallback / etc.)
+///   * No RTC battery is installed (with RTC, clock survives reboots)
+///   * No NTP sync has happened yet
+///
+/// Note: the telemetry sampler can now self-correct the system clock
+/// from any successful BLE state-poll response (Tesla embeds a
+/// GPS-derived timestamp in every state reply). So even without RTC
+/// or WiFi, the clock comes good as soon as the car responds once.
+/// The warning is now informational ("we're waiting on the first
+/// reading") rather than blocking.
+///
+/// Response shape:
+/// ```json
+/// {
+///   "synced": true,            // year >= 2025 OR systemd-timesyncd marker
+///   "has_rtc": true,           // /dev/rtc0 exists
+///   "ntp_synced": true,        // /run/systemd/timesync/synchronized exists
+///   "show_warning": false      // !synced && !has_rtc && !ntp_synced
+/// }
+/// ```
+pub async fn get_clock_status(
+    State(_s): State<AppState>,
+) -> impl IntoResponse {
+    let ntp_synced =
+        std::path::Path::new("/run/systemd/timesync/synchronized").exists();
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // 2025-01-01 00:00:00 UTC = 1735689600.
+    let year_looks_recent = secs > 1_735_689_600;
+    let synced = ntp_synced || year_looks_recent;
+    let has_rtc = std::path::Path::new("/dev/rtc0").exists();
+
+    // NTP sync state flips at most a handful of times per boot. A 10s
+    // cache cuts repeat polling without hiding state changes that
+    // matter to the BLE warning UI.
+    (
+        StatusCode::OK,
+        [(axum::http::header::CACHE_CONTROL, "private, max-age=10")],
+        Json(serde_json::json!({
+            "synced": synced,
+            "has_rtc": has_rtc,
+            "ntp_synced": ntp_synced,
+            // The single boolean the UI cares about — don't pester
+            // RTC users, only warn when clock is bad AND there's no
+            // hardware fallback.
+            "show_warning": !synced && !has_rtc,
+        })),
+    )
 }
 
 /// GET /api/system/ssh-pubkey
-pub async fn get_ssh_pubkey(State(_s): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
+pub async fn get_ssh_pubkey(State(_s): State<AppState>) -> impl IntoResponse {
     let pub_key = std::fs::read_to_string("/root/.ssh/id_ed25519.pub")
         .or_else(|_| std::fs::read_to_string("/root/.ssh/id_rsa.pub"))
         .unwrap_or_default();
-    (StatusCode::OK, Json(serde_json::json!({"public_key": pub_key.trim()})))
+    // The pubkey only changes when generate_ssh_key runs; cache an
+    // hour and let users explicitly reload when they regenerate.
+    (
+        StatusCode::OK,
+        [(axum::http::header::CACHE_CONTROL, "private, max-age=3600")],
+        Json(serde_json::json!({"public_key": pub_key.trim()})),
+    )
 }
 
 /// POST /api/system/ssh-keygen

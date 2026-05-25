@@ -81,8 +81,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/system/ble-diagnostics", get(crate::ble::ble_diagnostics))
         .route("/api/system/ble-adapters", get(crate::ble::ble_adapters))
         .route("/api/system/ble-adapter", post(crate::ble::ble_adapter_set))
+        .route("/api/system/ble-force-poll", post(crate::ble::ble_force_poll))
         .route("/api/system/speedtest", get(crate::system::speedtest))
         .route("/api/system/rtc-status", get(crate::system::get_rtc_status))
+        .route("/api/system/clock-status", get(crate::system::get_clock_status))
         .route("/api/system/ssh-pubkey", get(crate::system::get_ssh_pubkey))
         .route("/api/system/ssh-keygen", post(crate::system::generate_ssh_key))
         .route("/api/system/check-internet", get(crate::update::check_internet))
@@ -158,12 +160,27 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/drives/data/upload", post(crate::drives_handler::upload_data))
         .route("/api/drives/data/import-history", get(crate::drives_handler::import_history))
         .route("/api/drives/data", axum::routing::delete(crate::drives_handler::delete_all_drives))
+        .route("/api/drives/bulk-delete", post(crate::drives_handler::bulk_delete_drives))
         .route("/api/drives/data/export-for-sync", post(crate::drives_handler::export_for_sync))
         .route("/api/drives/stats", get(crate::drives_handler::drive_stats))
         .route("/api/drives/fsd-analytics", get(crate::drives_handler::fsd_analytics))
         .route("/api/drives/migration-status", get(crate::drives_handler::migration_status))
         .route("/api/drives/{id}/tags", put(crate::drives_handler::set_drive_tags))
+        .route(
+            "/api/drives/{id}/battery-series",
+            get(crate::drives_handler::battery_series),
+        )
+        .route(
+            "/api/drives/{id}/temperature-series",
+            get(crate::drives_handler::temperature_series),
+        )
         .route("/api/drives/{id}", get(crate::drives_handler::single_drive))
+        // Telemetry — global rollups over telemetry_samples, not scoped
+        // to one drive. Powers the Dashboard's TirePressureCard.
+        .route(
+            "/api/telemetry/tire-history",
+            get(crate::drives_handler::tire_history),
+        )
         // Keep-awake
         .route("/api/keep-awake/start", post(crate::keep_awake::start))
         .route("/api/keep-awake/stop", post(crate::keep_awake::stop))

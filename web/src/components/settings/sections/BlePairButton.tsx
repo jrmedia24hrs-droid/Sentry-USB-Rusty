@@ -43,6 +43,16 @@ interface BleConnectedResp {
   archiving: boolean
 }
 
+interface ClockStatusResp {
+  synced: boolean
+  has_rtc: boolean
+  ntp_synced: boolean
+  /** True only when the clock is bad AND there's no RTC battery —
+   *  the only case where the user needs to do something (connect to
+   *  WiFi to let NTP catch up). RTC users always see false. */
+  show_warning: boolean
+}
+
 interface BleAdapter {
   id: string                          // "hci0", "hci1", ...
   source: "onboard" | "external"     // hci0 = onboard, hci1+ = external
@@ -109,10 +119,10 @@ export function BlePairButton() {
   const [outputOpen, setOutputOpen] = useState(false)
   const [latestSample, setLatestSample] = useState<BleLatestSample | null>(null)
   const [sampleLoading, setSampleLoading] = useState(false)
-  const [sampleFetchedAt, setSampleFetchedAt] = useState<number>(0)
   const [adapters, setAdapters] = useState<BleAdaptersResp | null>(null)
   const [adapterSwitching, setAdapterSwitching] = useState(false)
   const [adapterError, setAdapterError] = useState<string | null>(null)
+  const [clockStatus, setClockStatus] = useState<ClockStatusResp | null>(null)
   const [diagOpen, setDiagOpen] = useState(false)
   const [diagLines, setDiagLines] = useState<string[]>([])
   const [diagTotalLines, setDiagTotalLines] = useState(0)
@@ -283,7 +293,6 @@ export function BlePairButton() {
       const res = await fetch("/api/system/ble-latest-sample")
       const d = (await res.json()) as BleLatestSample
       setLatestSample(d)
-      setSampleFetchedAt(Math.floor(Date.now() / 1000))
     } catch {
       /* leave previous value */
     } finally {
@@ -346,6 +355,37 @@ export function BlePairButton() {
     const iv = setInterval(fetchAdapters, 5_000)
     return () => clearInterval(iv)
   }, [fetchAdapters])
+
+  // Clock-sync status — polled until synced, then stops. The
+  // sampler pauses while the system clock is bogus (avoids stranded
+  // samples that would never match a drive window later). RTC users
+  // never see this warning because their clock is sane from boot.
+  useEffect(() => {
+    let stopped = false
+    let iv: ReturnType<typeof setInterval> | null = null
+    const fetchClock = async () => {
+      try {
+        const res = await fetch("/api/system/clock-status")
+        if (!res.ok) return
+        const d = (await res.json()) as ClockStatusResp
+        if (stopped) return
+        setClockStatus(d)
+        // Once synced, no need to keep polling.
+        if (d.synced && iv) {
+          clearInterval(iv)
+          iv = null
+        }
+      } catch {
+        /* leave previous value */
+      }
+    }
+    fetchClock()
+    iv = setInterval(fetchClock, 5_000)
+    return () => {
+      stopped = true
+      if (iv) clearInterval(iv)
+    }
+  }, [])
 
   const switchAdapter = useCallback(async (id: string) => {
     setAdapterSwitching(true)
@@ -788,14 +828,40 @@ export function BlePairButton() {
         )}
       </div>
 
+      {/* Clock-not-synced info — only shown briefly during the
+          window between boot and the first successful BLE/NTP sync.
+          The telemetry sampler auto-corrects the Pi's clock from the
+          first Tesla state response (Tesla embeds a GPS-derived
+          timestamp), so this normally disappears within 30 seconds
+          of first BLE contact. */}
+      {clockStatus?.show_warning && (
+        <div className="rounded-lg border border-blue-500/20 bg-blue-500/[0.04] p-3 text-xs">
+          <div className="flex items-start gap-2">
+            <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-blue-400" />
+            <div>
+              <p className="font-semibold text-blue-300">
+                Setting Pi clock from car
+              </p>
+              <p className="mt-1 text-[11px] leading-relaxed text-slate-400">
+                The Pi's clock isn't set yet. As soon as the car responds
+                to one BLE poll, the Pi will pick up the correct time from
+                Tesla's GPS clock — no WiFi or NTP needed.
+                <br />
+                <span className="text-slate-500">
+                  Tip: a $5 coin-cell battery on the Pi's BAT pin keeps
+                  the clock set across reboots so this doesn't happen at all.
+                </span>
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
+
       {outputOpen && (
         <TelemetryOutputPanel
           sample={latestSample}
           loading={sampleLoading}
           metric={metric}
-          fetchedSecondsAgo={
-            sampleFetchedAt > 0 ? Math.max(0, nowTs - sampleFetchedAt) : null
-          }
           onRefresh={async () => {
             // Also refetch the connection pill so the user sees
             // immediate visible feedback (Last seen Xm ago updates)
@@ -868,13 +934,13 @@ function AdapterPicker({
     <div className="rounded-lg border border-blue-500/20 bg-blue-500/[0.04] p-3 text-xs">
       <div className="mb-2 flex items-center gap-2">
         <Usb className="h-3.5 w-3.5 text-blue-400" />
-        <span className="font-semibold text-slate-200">External BLE adapter detected</span>
+        <span className="font-semibold text-slate-200">Bluetooth adapter</span>
       </div>
       <p className="mb-2 text-[11px] leading-relaxed text-slate-400">
-        A USB BLE dongle gives you a dedicated radio with a better antenna —
-        substantially more reliable for the Tesla connection than the Pi's
-        onboard chip (which shares an antenna with Wi-Fi). Switching applies
-        to both Tesla telemetry and the SentryUSB iOS app peripheral.
+        Using a USB Bluetooth dongle instead of the Pi's built-in radio is
+        more reliable — the dongle has its own antenna and isn't competing
+        with Wi-Fi. The change applies to both your Tesla connection and the
+        SentryUSB iOS app.
       </p>
       <div className="mb-2 flex flex-col gap-1.5">
         {adapters.available.map((a) => {
@@ -899,7 +965,7 @@ function AdapterPicker({
                   <Cpu className="h-3 w-3 text-slate-400" />
                 )}
                 <span className="font-medium text-slate-200">
-                  {a.source === "external" ? "External dongle" : "Onboard radio"} ({a.id})
+                  {a.source === "external" ? "USB Bluetooth dongle" : "Pi built-in Bluetooth"}
                 </span>
                 {a.address && (
                   <span className="text-[10px] text-slate-600">{a.address}</span>
@@ -916,17 +982,18 @@ function AdapterPicker({
       </div>
       {!usingExternal && external && (
         <p className="mb-1 text-[10px] text-emerald-400/80">
-          Recommended: switch to the external dongle for better reliability.
+          Tap the USB dongle above to start using it — recommended.
         </p>
       )}
       {usingExternal && onboard && (
         <p className="mb-1 text-[10px] text-slate-500">
-          You can fall back to the onboard radio if you unplug the dongle.
+          If you unplug the dongle, the Pi will switch back to its built-in
+          Bluetooth automatically.
         </p>
       )}
       {switching && (
         <p className="mt-1.5 inline-flex items-center gap-1 text-[10px] text-slate-400">
-          <Loader2 className="h-3 w-3 animate-spin" /> Restarting BLE services…
+          <Loader2 className="h-3 w-3 animate-spin" /> Switching Bluetooth adapter…
         </p>
       )}
       {error && (
@@ -1005,16 +1072,16 @@ function DiagnosticsPanel({
         </div>
       </div>
       <p className="mb-2 text-[10px] leading-relaxed text-slate-600">
-        Per-poll outcomes from the BLE sampler. Each <code className="text-slate-500">state-poll</code> line shows climate / charge / tires /
-        drive timing + success. Failure lines explain why a subcommand
-        timed out (e.g. <code className="text-slate-500">context deadline exceeded</code> usually means
-        too many phone keys connected to the car).
+        Behind-the-scenes log of every Bluetooth read from your car. Useful
+        when readings stop updating — most failures point to too many phone
+        keys connected to the car at once (Tesla limits this to 3-4) or
+        Bluetooth range/interference.
       </p>
       {lines.length === 0 ? (
         <p className="rounded bg-white/[0.02] p-3 text-center text-[11px] text-slate-500">
           {totalJournalLines === 0
-            ? "Journal is empty — has the sampler started yet?"
-            : "No diagnostic lines yet. Wait ~15s for the next poll."}
+            ? "Nothing logged yet — the Pi may still be starting up."
+            : "No issues to report. Check back after a drive."}
         </p>
       ) : (
         <pre className="max-h-72 overflow-auto whitespace-pre rounded bg-black/40 p-2 text-[10px] leading-relaxed text-slate-300">
@@ -1031,7 +1098,6 @@ function TelemetryOutputPanel({
   sample,
   loading,
   metric,
-  fetchedSecondsAgo,
   onRefresh,
   radioOwner,
   archiving,
@@ -1039,7 +1105,6 @@ function TelemetryOutputPanel({
   sample: BleLatestSample | null
   loading: boolean
   metric: boolean
-  fetchedSecondsAgo: number | null
   onRefresh: () => void
   radioOwner: string | null
   archiving: boolean
@@ -1049,19 +1114,66 @@ function TelemetryOutputPanel({
   // de-emphasize so the user understands they're looking at past
   // values, not a real-time read like the Tesla app shows.
   const isStale = hasSample && (sample?.seconds_ago ?? 0) > 60
+  // Translate the (possibly-old) sample age into a friendlier
+  // label. The raw "polled 240s ago" is true but reads like a
+  // log line — these phrasings are how a non-engineer would say
+  // the same thing.
+  const ageLabel = sample?.seconds_ago != null ? friendlyAge(sample.seconds_ago) : null
+
+  // "Poll now" sends SIGUSR1 to the sampler so it does a fresh
+  // full state read immediately instead of waiting for the next
+  // scheduled cycle. Useful for testing (just turned on Sentry,
+  // just plugged in to charge, etc) and as a manual override
+  // when the user wants to verify the connection works regardless
+  // of what the phase machine thinks.
+  const [polling, setPolling] = useState(false)
+  const [pollMsg, setPollMsg] = useState<string | null>(null)
+  const forcePoll = async () => {
+    setPolling(true)
+    setPollMsg(null)
+    try {
+      const res = await fetch("/api/system/ble-force-poll", { method: "POST" })
+      if (!res.ok) {
+        setPollMsg("Couldn't reach the Pi — try again in a moment.")
+      } else {
+        setPollMsg("Reading now…")
+        // Give the sampler ~8s to do its thing, then refresh the
+        // displayed values. Most state polls complete in 2-15s.
+        setTimeout(() => {
+          onRefresh()
+          setPollMsg(null)
+        }, 8_000)
+      }
+    } catch {
+      setPollMsg("Couldn't reach the Pi — try again in a moment.")
+    } finally {
+      setPolling(false)
+    }
+  }
+
   return (
     <div className="rounded-lg border border-white/5 bg-black/20 p-3 text-xs">
       <div className="mb-2 flex items-center justify-between">
-        <span className="font-semibold text-slate-300">Live telemetry from car</span>
+        <span className="font-semibold text-slate-300">Live data from car</span>
         <div className="flex items-center gap-2">
-          {fetchedSecondsAgo !== null && (
+          {ageLabel && (
             <span className="text-[10px] text-slate-600">
-              polled {fetchedSecondsAgo}s ago
+              updated {ageLabel}
             </span>
           )}
           <button
+            onClick={forcePoll}
+            disabled={polling || loading}
+            title="Ask the Pi to read your car's data right now"
+            className="inline-flex items-center gap-1 rounded bg-blue-500/15 px-2 py-0.5 text-[10px] font-medium text-blue-400 hover:bg-blue-500/25 disabled:opacity-50"
+          >
+            {polling ? <Loader2 className="h-3 w-3 animate-spin" /> : null}
+            Poll now
+          </button>
+          <button
             onClick={onRefresh}
             disabled={loading}
+            title="Reload the values from the Pi's database"
             className="inline-flex items-center gap-1 rounded bg-white/5 px-2 py-0.5 text-[10px] text-slate-400 hover:bg-white/10 disabled:opacity-50"
           >
             {loading ? <Loader2 className="h-3 w-3 animate-spin" /> : null}
@@ -1069,11 +1181,14 @@ function TelemetryOutputPanel({
           </button>
         </div>
       </div>
+      {pollMsg && (
+        <p className="mb-2 text-[10px] text-blue-400/80">{pollMsg}</p>
+      )}
 
       {!hasSample && (
         <p className="text-slate-500">
-          No samples in the database yet. If the car is awake and the Pi is in
-          range, this should populate within ~15 s.
+          Waiting for the first reading from your car. This usually takes
+          15-30 seconds once the car is awake and within Bluetooth range.
         </p>
       )}
 
@@ -1112,22 +1227,22 @@ function TelemetryOutputPanel({
           {isStale && radioOwner === "keep_awake" && (
             <p className="pt-1 text-[10px] text-amber-400/80">
               {archiving
-                ? "Sampler paused while the Pi is archiving — keep-awake is holding the BLE radio. New samples will resume once archive completes."
-                : "Sampler paused — the keep-awake nudge is holding the BLE radio. New samples will resume once it finishes."}
+                ? "Paused while we back up your dashcam clips. Live readings will resume once that finishes."
+                : "Paused while another part of the Pi is using Bluetooth. Live readings will resume in a moment."}
             </p>
           )}
           {isStale && radioOwner !== "keep_awake" && (
             <p className="pt-1 text-[10px] text-amber-400/70">
-              These values are {sample.seconds_ago}s old. The Tesla app reads
-              live data over LTE — small differences from what's shown here
-              are expected when the car has been driving or charging.
+              These values are from {ageLabel} — your car may have moved or
+              charged since. The Tesla app uses a different connection (LTE)
+              so small differences are normal.
             </p>
           )}
           {sample.source === "body_controller" && (
             <p className="pt-1 text-[10px] text-slate-600">
-              <code>body_controller</code> samples are taken while the car is
-              asleep — temperatures and HVAC stay blank because reading them
-              would wake the car.
+              Your car is asleep right now, so we're showing the last known
+              values. Live updates resume when you start driving, open the
+              door, or Sentry Mode triggers.
             </p>
           )}
         </div>
@@ -1151,6 +1266,20 @@ function Row({ label, value }: { label: string; value: string }) {
  *  value. */
 function fmtPct(v: number | null | undefined): string {
   return v == null ? "—" : `${Math.round(v)}%`
+}
+
+/** Turn a "seconds ago" integer into a phrase a human would say.
+ *  Used for the "updated X" line so the panel reads like natural
+ *  English instead of a log message. */
+function friendlyAge(seconds: number): string {
+  if (seconds < 5) return "just now"
+  if (seconds < 60) return `${seconds} seconds ago`
+  const minutes = Math.round(seconds / 60)
+  if (minutes < 60) return minutes === 1 ? "1 minute ago" : `${minutes} minutes ago`
+  const hours = Math.round(minutes / 60)
+  if (hours < 24) return hours === 1 ? "1 hour ago" : `${hours} hours ago`
+  const days = Math.round(hours / 24)
+  return days === 1 ? "1 day ago" : `${days} days ago`
 }
 
 /** Backend always stores Celsius (single source of truth). Convert

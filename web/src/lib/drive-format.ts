@@ -6,8 +6,18 @@ export function formatDuration(ms: number): string {
   return `${h}h ${m}m`
 }
 
-export function formatHvacRuntime(seconds: number): string {
-  const totalMin = Math.max(0, Math.floor(seconds / 60))
+// HVAC seconds come from per-clip BLE samples whose windows can extend
+// slightly past the drive's true end_time (e.g. HVAC was still on after
+// motion stopped, or pre-conditioning before motion started). Clamping
+// to the drive duration when supplied avoids the surprising "19m drive
+// / 20m HVAC" display. Both sides round to the nearest minute so they
+// agree at the minute boundary.
+export function formatHvacRuntime(seconds: number, drivenMs?: number): string {
+  let secs = Math.max(0, seconds)
+  if (typeof drivenMs === "number" && drivenMs > 0) {
+    secs = Math.min(secs, drivenMs / 1000)
+  }
+  const totalMin = Math.max(0, Math.round(secs / 60))
   const h = Math.floor(totalMin / 60)
   const m = totalMin % 60
   if (h === 0) return `${m}m`
@@ -30,6 +40,17 @@ export function formatMiles(mi: number, decimals = 1): string {
     minimumFractionDigits: decimals,
     maximumFractionDigits: decimals,
   })} mi`
+}
+
+/** Format an odometer reading (raw value in miles) honouring the user's
+ *  metric/imperial preference. metric=true converts to km. */
+export function formatOdometer(mi: number, metric: boolean, decimals = 1): string {
+  const value = metric ? mi * 1.609344 : mi
+  const unit = metric ? "km" : "mi"
+  return `${value.toLocaleString(undefined, {
+    minimumFractionDigits: decimals,
+    maximumFractionDigits: decimals,
+  })} ${unit}`
 }
 
 export function formatSpeed(mph: number, kmh: number, metric: boolean): string {

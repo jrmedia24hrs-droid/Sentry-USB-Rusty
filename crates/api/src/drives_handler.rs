@@ -9,7 +9,7 @@ use axum::http::StatusCode;
 use serde::Deserialize;
 
 use crate::router::AppState;
-use sentryusb_drives::{DriveStore, grouper};
+use sentryusb_drives::{DriveStore, aggregate_telemetry, grouper};
 
 /// Filename kept identical to Go (`server/api/keepawake.go`) so existing
 /// `awake_stop` deployments work without changes after this binary lands.
@@ -187,12 +187,24 @@ pub async fn single_drive(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let tags = state.drives.store.get_all_drive_tags().unwrap_or_default();
 
-    let (idx, files) = match state
+    // Resolve the drive id to (idx, files) AND grab the canonical
+    // DriveSummary the list view emits, in a single summary pass. We
+    // overlay the summary's headline aggregates onto the full Drive so
+    // the detail page can't disagree with the list on FSD %, distance,
+    // etc. — the two are computed via different algorithms (point walk
+    // vs per-clip aggregate sum) and drift ~0.1–0.5 % otherwise.
+    let (idx, files, summary) = match state
         .drives
         .store
-        .with_route_summaries(|summaries| grouper::find_drive_files(summaries, &id))
-    {
-        Ok(Some((i, f))) => (i, f),
+        .with_route_summaries(|summaries| {
+            let resolved = grouper::find_drive_files(summaries, &id);
+            let summary =
+                resolved
+                    .as_ref()
+                    .and_then(|(i, _)| grouper::build_summary_for_idx(summaries, *i, &tags));
+            resolved.map(|(i, f)| (i, f, summary))
+        }) {
+        Ok(Some((i, f, s))) => (i, f, s),
         Ok(None) => {
             return crate::json_error(
                 StatusCode::NOT_FOUND,
@@ -214,10 +226,39 @@ pub async fn single_drive(
             grouper::build_single_drive_from_clips(routes, idx as i32, &tags),
         )
     }) {
-        Ok((_, Some(drive))) => (
-            StatusCode::OK,
-            Json(serde_json::to_value(drive).unwrap_or_default()),
-        ),
+        Ok((_, Some(mut drive))) => {
+            if let Some(s) = summary.as_ref() {
+                // Overlay the headline numbers from the canonical
+                // aggregate path. Per-point data (points, fsd_states,
+                // fsd_events) stays from build_drive_stats — those
+                // need the full BLOB walk.
+                drive.distance_mi = s.distance_mi;
+                drive.distance_km = s.distance_km;
+                drive.avg_speed_mph = s.avg_speed_mph;
+                drive.max_speed_mph = s.max_speed_mph;
+                drive.avg_speed_kmh = s.avg_speed_kmh;
+                drive.max_speed_kmh = s.max_speed_kmh;
+                drive.fsd_engaged_ms = s.fsd_engaged_ms;
+                drive.fsd_disengagements = s.fsd_disengagements;
+                drive.fsd_accel_pushes = s.fsd_accel_pushes;
+                drive.fsd_percent = s.fsd_percent;
+                drive.fsd_distance_km = s.fsd_distance_km;
+                drive.fsd_distance_mi = s.fsd_distance_mi;
+                drive.autosteer_engaged_ms = s.autosteer_engaged_ms;
+                drive.autosteer_percent = s.autosteer_percent;
+                drive.autosteer_distance_km = s.autosteer_distance_km;
+                drive.autosteer_distance_mi = s.autosteer_distance_mi;
+                drive.tacc_engaged_ms = s.tacc_engaged_ms;
+                drive.tacc_percent = s.tacc_percent;
+                drive.tacc_distance_km = s.tacc_distance_km;
+                drive.tacc_distance_mi = s.tacc_distance_mi;
+                drive.assisted_percent = s.assisted_percent;
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::to_value(drive).unwrap_or_default()),
+            )
+        }
         Ok((rows_fetched, None)) => crate::json_error(
             StatusCode::NOT_FOUND,
             &format!(
@@ -807,13 +848,141 @@ pub async fn delete_all_drives(
     }
 }
 
-/// PUT /api/drives/{id}/tags — set tags for a drive
+#[derive(Deserialize)]
+pub struct BulkDeleteRequest {
+    pub ids: Vec<String>,
+}
+
+/// POST /api/drives/bulk-delete — remove the listed drives from the DB.
+///
+/// Body: `{ "ids": ["<numeric index>" or "<start_time>", ...] }`.
+/// Resolves each id through the grouper to the clip files that make up
+/// the drive, deduplicates across ids (a parent clip can never be
+/// shared between two drives, but the dedupe is a cheap guard against
+/// future grouper changes), then deletes the matching rows from
+/// `routes`, `processed_files`, and `drive_tags` in one transaction.
+///
+/// Guards against the two jobs that actually write to these tables:
+/// the clip processor (`processor.is_running()`) and a JSON import
+/// (`importing`). We deliberately do NOT block on `is_archiving()`:
+/// the archive script copies clip files between disks and doesn't
+/// touch the DB during the archiving phase; the post-archive
+/// reprocess that DOES write goes through `POST /api/drives/process`,
+/// which would trip the processor guard at that point. Blocking on
+/// archive here is what `delete_all_drives` does, but for a
+/// targeted per-drive delete it's just user-hostile latency.
+pub async fn bulk_delete_drives(
+    State(state): State<AppState>,
+    Json(body): Json<BulkDeleteRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if state.drives.processor.is_running() {
+        return crate::json_error(
+            StatusCode::CONFLICT,
+            "processing in progress — please wait until it finishes",
+        );
+    }
+    if state.drives.importing.load(Ordering::SeqCst) {
+        return crate::json_error(
+            StatusCode::CONFLICT,
+            "drive data import in progress — please wait until it finishes",
+        );
+    }
+    if body.ids.is_empty() {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({"deleted": 0, "drives": 0})),
+        );
+    }
+
+    // Resolve every id to (drive_key, file_list) in one summary pass —
+    // `with_route_summaries` rebuilds the grouper exactly once, not once
+    // per id.
+    let (files, drive_keys, not_found): (Vec<String>, Vec<String>, Vec<String>) = match state
+        .drives
+        .store
+        .with_route_summaries(|summaries| {
+            let mut files = std::collections::HashSet::new();
+            let mut keys = std::collections::HashSet::new();
+            let mut missing = Vec::new();
+            for id in &body.ids {
+                let resolved = grouper::find_drive_files(summaries, id);
+                let key = grouper::find_drive_start_time(summaries, id);
+                match (resolved, key) {
+                    (Some((_, fs)), Some(k)) => {
+                        for f in fs {
+                            files.insert(f);
+                        }
+                        keys.insert(k);
+                    }
+                    _ => missing.push(id.clone()),
+                }
+            }
+            (
+                files.into_iter().collect(),
+                keys.into_iter().collect(),
+                missing,
+            )
+        }) {
+        Ok(v) => v,
+        Err(e) => return crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+
+    if !not_found.is_empty() && files.is_empty() {
+        return crate::json_error(
+            StatusCode::NOT_FOUND,
+            &format!("no matching drives for ids: {}", not_found.join(", ")),
+        );
+    }
+
+    match state
+        .drives
+        .store
+        .delete_routes_by_files(&files, &drive_keys)
+    {
+        Ok(deleted_routes) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "deleted": deleted_routes,
+                "drives": body.ids.len() - not_found.len(),
+                "not_found": not_found,
+            })),
+        ),
+        Err(e) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+/// PUT /api/drives/{id}/tags — set tags for a drive.
+///
+/// `id` from the URL is either the numeric grouper index (what the
+/// drives-list response stamps onto `DriveSummary.id`) or the
+/// `%Y-%m-%dT%H:%M:%S` start_time string (the same form
+/// `/api/drives/{id}` accepts). Either way, the grouper joins tags
+/// onto drives strictly by start_time string, so we MUST resolve the
+/// URL id to that canonical key before writing — otherwise the row
+/// lands under a key like `"3"` that the list endpoint never reads
+/// back, and the tag silently disappears from the UI even though the
+/// PUT returned 200.
 pub async fn set_drive_tags(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(body): Json<SetTagsRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    match state.drives.store.set_drive_tags(&id, &body.tags) {
+    let key = match state
+        .drives
+        .store
+        .with_route_summaries(|summaries| grouper::find_drive_start_time(summaries, &id))
+    {
+        Ok(Some(k)) => k,
+        Ok(None) => {
+            return crate::json_error(
+                StatusCode::NOT_FOUND,
+                &format!("drive not found for id='{}'", id),
+            )
+        }
+        Err(e) => return crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+
+    match state.drives.store.set_drive_tags(&key, &body.tags) {
         Ok(()) => crate::json_ok(),
         Err(e) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
@@ -822,4 +991,286 @@ pub async fn set_drive_tags(
 #[derive(Deserialize)]
 pub struct SetTagsRequest {
     pub tags: Vec<String>,
+}
+
+/// GET /api/drives/{id}/temperature-series
+///
+/// Time-series of interior + exterior cabin temperature across the
+/// drive, sourced from `telemetry_samples` (BLE sampler at 60s cadence)
+/// for the union of clip windows that make up the drive. The frontend
+/// renders this as a two-line chart on the DriveDetail Climate section,
+/// one line per temperature source on a shared time axis.
+///
+/// Response shape:
+/// ```json
+/// {
+///   "points": [
+///     { "ts": 1716471234000, "interiorC": 22.3, "exteriorC": 14.1 },
+///     ...
+///   ]
+/// }
+/// ```
+/// `interiorC` / `exteriorC` are omitted when the underlying sample had
+/// NULL in that column — the frontend treats gaps as "no data" rather
+/// than dropping to zero.
+pub async fn temperature_series(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let files = match state
+        .drives
+        .store
+        .with_route_summaries(|summaries| grouper::find_drive_files(summaries, &id))
+    {
+        Ok(Some((_idx, f))) => f,
+        Ok(None) => {
+            return crate::json_error(
+                StatusCode::NOT_FOUND,
+                &format!("drive not found for id='{}'", id),
+            )
+        }
+        Err(e) => return crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+
+    // Derive the drive's wall-clock window from the min/max of its
+    // clip windows. Files without parseable timestamps (event folders,
+    // manual imports) are silently skipped — they wouldn't contribute
+    // telemetry rows anyway since the sampler keys by clock time.
+    let mut start_ts: Option<i64> = None;
+    let mut end_ts: Option<i64> = None;
+    for f in &files {
+        if let Some((s, e)) = aggregate_telemetry::window_for_route_file(f) {
+            start_ts = Some(start_ts.map_or(s, |cur| cur.min(s)));
+            end_ts = Some(end_ts.map_or(e, |cur| cur.max(e)));
+        }
+    }
+    let (start_ts, end_ts) = match (start_ts, end_ts) {
+        (Some(s), Some(e)) => (s, e),
+        _ => return (StatusCode::OK, Json(serde_json::json!({ "points": [] }))),
+    };
+
+    let result = state.drives.store.with_locked_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT ts, interior_temp_c, exterior_temp_c \
+             FROM telemetry_samples \
+             WHERE ts BETWEEN ?1 AND ?2 \
+               AND (interior_temp_c IS NOT NULL OR exterior_temp_c IS NOT NULL) \
+             ORDER BY ts ASC",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![start_ts, end_ts],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, Option<f64>>(1)?,
+                    r.get::<_, Option<f64>>(2)?,
+                ))
+            },
+        )?;
+        let mut out: Vec<serde_json::Value> = Vec::new();
+        for row in rows {
+            let (ts, interior, exterior) = row?;
+            let mut obj = serde_json::Map::new();
+            // Ship ts in milliseconds — JS Date and recharts work in ms,
+            // saves the frontend a multiply per row.
+            obj.insert("ts".to_string(), serde_json::json!(ts * 1000));
+            if let Some(v) = interior {
+                obj.insert("interiorC".to_string(), serde_json::json!(v));
+            }
+            if let Some(v) = exterior {
+                obj.insert("exteriorC".to_string(), serde_json::json!(v));
+            }
+            out.push(serde_json::Value::Object(obj));
+        }
+        Ok::<_, anyhow::Error>(out)
+    });
+
+    match result {
+        Ok(points) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "points": points })),
+        ),
+        Err(e) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+/// GET /api/drives/{id}/battery-series
+///
+/// Time-series of battery percent across the drive, sourced from
+/// the same `telemetry_samples` table the temperature series uses.
+/// The BLE sampler polls `state charge` every 60s in Active mode,
+/// so a typical 30-min drive has ~30 samples — enough to draw a
+/// smooth line on a playback chart without needing to interpolate
+/// between start/end the way the older code did.
+///
+/// Response shape mirrors `temperature_series`:
+/// ```json
+/// {
+///   "points": [
+///     { "ts": 1716471234000, "batteryPct": 73.0 },
+///     ...
+///   ]
+/// }
+/// ```
+/// `batteryPct` is omitted only when a row in the window has NULL
+/// in that column — which is fine for the chart, gaps just don't
+/// draw.
+pub async fn battery_series(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let files = match state
+        .drives
+        .store
+        .with_route_summaries(|summaries| grouper::find_drive_files(summaries, &id))
+    {
+        Ok(Some((_idx, f))) => f,
+        Ok(None) => {
+            return crate::json_error(
+                StatusCode::NOT_FOUND,
+                &format!("drive not found for id='{}'", id),
+            )
+        }
+        Err(e) => return crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+
+    // Same window-derivation as temperature_series — min/max of the
+    // clip-file timestamps that make up this drive.
+    let mut start_ts: Option<i64> = None;
+    let mut end_ts: Option<i64> = None;
+    for f in &files {
+        if let Some((s, e)) = aggregate_telemetry::window_for_route_file(f) {
+            start_ts = Some(start_ts.map_or(s, |cur| cur.min(s)));
+            end_ts = Some(end_ts.map_or(e, |cur| cur.max(e)));
+        }
+    }
+    let (start_ts, end_ts) = match (start_ts, end_ts) {
+        (Some(s), Some(e)) => (s, e),
+        _ => return (StatusCode::OK, Json(serde_json::json!({ "points": [] }))),
+    };
+
+    let result = state.drives.store.with_locked_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT ts, battery_pct \
+             FROM telemetry_samples \
+             WHERE ts BETWEEN ?1 AND ?2 \
+               AND battery_pct IS NOT NULL \
+             ORDER BY ts ASC",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![start_ts, end_ts],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<f64>>(1)?)),
+        )?;
+        let mut out: Vec<serde_json::Value> = Vec::new();
+        for row in rows {
+            let (ts, battery) = row?;
+            let mut obj = serde_json::Map::new();
+            obj.insert("ts".to_string(), serde_json::json!(ts * 1000));
+            if let Some(v) = battery {
+                obj.insert("batteryPct".to_string(), serde_json::json!(v));
+            }
+            out.push(serde_json::Value::Object(obj));
+        }
+        Ok::<_, anyhow::Error>(out)
+    });
+
+    match result {
+        Ok(points) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "points": points })),
+        ),
+        Err(e) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+#[derive(Deserialize, Default)]
+pub struct TireHistoryQuery {
+    /// Window size in days. Clamped to [1, 365] to keep the down-sample
+    /// query bounded. Defaults to 30 to match the dashboard card spec.
+    #[serde(default)]
+    pub days: Option<u32>,
+}
+
+/// GET /api/telemetry/tire-history
+///
+/// Per-tire pressure samples for the last `days` days (default 30).
+/// Rendered as the Dashboard's TirePressureCard.
+///
+/// No down-sampling: TPMS sensors only broadcast while the car is
+/// driving, so even with the 5-minute sampler cadence
+/// (`TIRES_INTERVAL` in the telemetry crate) a typical 30-day window
+/// stays well under a thousand points — small enough to ship raw and
+/// render smoothly in recharts.
+///
+/// Response shape:
+/// ```json
+/// {
+///   "points": [
+///     { "ts": 1716471234000, "fl": 41.7, "fr": 41.5, "rl": 42.4, "rr": 41.3 },
+///     ...
+///   ],
+///   "days": 30
+/// }
+/// ```
+pub async fn tire_history(
+    State(state): State<AppState>,
+    Query(q): Query<TireHistoryQuery>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let days = q.days.unwrap_or(30).clamp(1, 365);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let cutoff = now - (days as i64) * 86_400;
+
+    let result = state.drives.store.with_locked_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT ts, tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi \
+             FROM telemetry_samples \
+             WHERE ts >= ?1 \
+               AND (tire_fl_psi IS NOT NULL OR tire_fr_psi IS NOT NULL \
+                    OR tire_rl_psi IS NOT NULL OR tire_rr_psi IS NOT NULL) \
+             ORDER BY ts ASC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![cutoff], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, Option<f64>>(1)?,
+                r.get::<_, Option<f64>>(2)?,
+                r.get::<_, Option<f64>>(3)?,
+                r.get::<_, Option<f64>>(4)?,
+            ))
+        })?;
+        let mut out: Vec<serde_json::Value> = Vec::new();
+        for row in rows {
+            let (ts, fl, fr, rl, rr) = row?;
+            let mut obj = serde_json::Map::new();
+            obj.insert("ts".to_string(), serde_json::json!(ts * 1000));
+            if let Some(v) = fl {
+                obj.insert("fl".to_string(), serde_json::json!(v));
+            }
+            if let Some(v) = fr {
+                obj.insert("fr".to_string(), serde_json::json!(v));
+            }
+            if let Some(v) = rl {
+                obj.insert("rl".to_string(), serde_json::json!(v));
+            }
+            if let Some(v) = rr {
+                obj.insert("rr".to_string(), serde_json::json!(v));
+            }
+            out.push(serde_json::Value::Object(obj));
+        }
+        Ok::<_, anyhow::Error>(out)
+    });
+
+    match result {
+        Ok(points) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "points": points,
+                "days": days,
+            })),
+        ),
+        Err(e) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
 }

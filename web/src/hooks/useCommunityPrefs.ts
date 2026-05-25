@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from "react"
 
-export type CommunityMode = "both" | "wraps-only" | "chimes-only" | "none"
+type CommunityMode = "both" | "wraps-only" | "chimes-only" | "none"
 
 export interface CommunityPrefs {
   wrapsEnabled: boolean
@@ -69,19 +69,4 @@ export function useCommunityPrefs(): CommunityPrefs {
     loading,
     refresh,
   }
-}
-
-// Helper for callers that update prefs and want to broadcast the change
-// so the sidebar / nav / Community page all re-fetch. The fetch is kept
-// here so the consumer doesn't need to know the storage backend.
-export async function setCommunityPref(
-  key: "community_wraps_enabled" | "community_chimes_enabled",
-  enabled: boolean,
-): Promise<void> {
-  await fetch("/api/config/preference", {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ key, value: enabled ? "enabled" : "disabled" }),
-  })
-  window.dispatchEvent(new CustomEvent("community-prefs-changed"))
 }

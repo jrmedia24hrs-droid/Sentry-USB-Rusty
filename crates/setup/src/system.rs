@@ -46,34 +46,6 @@ pub async fn configure_hostname(env: &SetupEnv, emitter: &SetupEmitter) -> Resul
     Ok(true)
 }
 
-/// Configure dwc2 USB gadget overlay in config.txt and cmdline.txt.
-pub async fn configure_dwc2(env: &SetupEnv, emitter: &SetupEmitter) -> Result<()> {
-    emitter.progress("Configuring USB gadget (dwc2) overlay...");
-
-    if let Some(config_path) = &env.piconfig_path {
-        let config = std::fs::read_to_string(config_path).unwrap_or_default();
-        if !config.contains("dtoverlay=dwc2") {
-            let addition = format!(
-                "\n[{}]\ndtoverlay=dwc2\n",
-                env.pi_model.config_section()
-            );
-            std::fs::write(config_path, format!("{}{}", config, addition))?;
-            info!("Added dwc2 overlay to {}", config_path);
-        }
-    }
-
-    if let Some(cmdline_path) = &env.cmdline_path {
-        let cmdline = std::fs::read_to_string(cmdline_path).unwrap_or_default();
-        if !cmdline.contains("modules-load=dwc2") {
-            let new = cmdline.trim().to_string() + " modules-load=dwc2";
-            std::fs::write(cmdline_path, format!("{}\n", new))?;
-            info!("Added modules-load=dwc2 to cmdline.txt");
-        }
-    }
-
-    Ok(())
-}
-
 /// Set up Avahi mDNS service for local network discovery.
 ///
 /// Idempotent: if the service file is already present and matches, do
@@ -375,44 +347,6 @@ fn sed_delete_line_matching<F: Fn(&str) -> bool>(path: &str, pred: F) -> Result<
         out.push('\n');
     }
     std::fs::write(path, out)?;
-    Ok(())
-}
-
-/// Install the sentryusb systemd service.
-///
-/// `binary_path` is accepted for backward compatibility with older callers
-/// but is no longer used directly — the multi-binary scheme stages
-/// per-CPU variants under /opt/sentryusb/ and lets the picker script
-/// (sentryusb-pick-binary) symlink the right one to sentryusb-current
-/// at every service start.
-pub fn install_systemd_service(_binary_path: &str) -> Result<()> {
-    let service = r#"[Unit]
-Description=SentryUSB web server
-After=network.target
-
-[Service]
-Type=simple
-Conflicts=nginx.service
-ExecStartPre=-/usr/bin/systemctl stop nginx
-# Pick the best per-CPU binary for this Pi at every start. The script
-# atomically updates the sentryusb-current symlink; ExecStart launches
-# whatever it resolved to. Runs as a no-op cost on each start (~50ms).
-ExecStartPre=/usr/local/bin/sentryusb-pick-binary
-ExecStart=/opt/sentryusb/sentryusb-current --port 80
-Restart=always
-RestartSec=3
-Environment=RUST_LOG=info
-# Cap glibc malloc arenas to 2. Default on multicore ARM is 8× nproc
-# arenas, each holding a fragmented heap fork that the kernel never
-# reclaims. Steady-state RSS on Pi-class hardware drops ~40-50% with
-# this cap, with no measurable throughput impact for our workload.
-Environment=MALLOC_ARENA_MAX=2
-
-[Install]
-WantedBy=multi-user.target
-"#;
-
-    std::fs::write("/etc/systemd/system/sentryusb.service", service)?;
     Ok(())
 }
 

@@ -27,12 +27,6 @@ export async function setDriveTags(id: string | number, tags: string[]): Promise
   if (!res.ok) throw new Error(`set tags ${id}: ${res.status}`)
 }
 
-export async function fetchTags(): Promise<string[]> {
-  const res = await fetch("/api/drives/tags")
-  if (!res.ok) throw new Error(`tags: ${res.status}`)
-  return res.json()
-}
-
 export async function triggerProcessNew(): Promise<void> {
   const res = await fetch("/api/drives/process", { method: "POST" })
   if (!res.ok) {
@@ -69,8 +63,27 @@ export async function deleteAllDrives(): Promise<void> {
   }
 }
 
-export async function fetchProcessingStatus(): Promise<{ running: boolean; importing: boolean }> {
-  const res = await fetch("/api/drives/status")
-  if (!res.ok) throw new Error(`status: ${res.status}`)
+export interface BulkDeleteResult {
+  /** Number of underlying clip rows removed from the `routes` table. */
+  deleted: number
+  /** Number of drives that were resolved + deleted (excludes not_found). */
+  drives: number
+  /** Drive ids the backend could not resolve back to clip files. */
+  not_found: string[]
+}
+
+export async function bulkDeleteDrives(
+  ids: Array<string | number>,
+): Promise<BulkDeleteResult> {
+  const res = await fetch("/api/drives/bulk-delete", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ids: ids.map(String) }),
+  })
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}))
+    throw new Error(body.error || `bulk-delete: ${res.status}`)
+  }
   return res.json()
 }
+

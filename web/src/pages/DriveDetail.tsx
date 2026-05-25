@@ -3,7 +3,6 @@ import { Link, useParams } from "react-router-dom"
 import {
   ArrowLeft,
   BatteryFull,
-  Camera,
   Clock,
   Disc,
   Gauge,
@@ -20,7 +19,7 @@ import {
   formatDistance,
   formatDuration,
   formatHvacRuntime,
-  formatMiles,
+  formatOdometer,
   formatPercent,
   formatPsi,
   formatSpeed,
@@ -30,18 +29,22 @@ import type { DriveDetail as DriveDetailType } from "@/types/drives"
 import { DriveMap } from "@/components/drives/DriveMap"
 import { DriveScrubber } from "@/components/drives/DriveScrubber"
 import { DualPinBlock } from "@/components/drives/DualPinBlock"
-import { FsdEngagementStripe } from "@/components/drives/FsdEngagementStripe"
 import { SectionHeading, StatTile } from "@/components/drives/StatTile"
 import { TagPopover } from "@/components/drives/TagPopover"
+import type { TemperaturePoint } from "@/components/drives/TemperatureChart"
+import type { BatteryPoint } from "@/components/drives/DriveMap"
 
 const DriveChart = lazy(() => import("@/components/drives/DriveChart"))
+const TemperatureChart = lazy(
+  () => import("@/components/drives/TemperatureChart"),
+)
 
 export default function DriveDetail() {
   const { id } = useParams<{ id: string }>()
   const { drive, loading, error, saveTags } = useDriveDetail(id)
 
   return (
-    <div className="mx-auto w-full max-w-3xl px-4 py-6 sm:px-6 sm:py-8">
+    <div className="mx-auto w-full max-w-6xl px-4 py-6 sm:px-6 sm:py-8">
       <Link
         to="/drives"
         className="mb-4 inline-flex items-center gap-2 text-sm text-slate-400 hover:text-slate-200"
@@ -76,20 +79,65 @@ interface DriveDetailContentProps {
 
 function DriveDetailContent({ drive, onSaveTags }: DriveDetailContentProps) {
   const { setTotal } = useScrubberActions()
-  const metric = false
+  // Distance/speed/temperature unit, sourced from setup config
+  // (DRIVE_MAP_UNIT). Default to imperial — same default as the wizard
+  // and as Drives.tsx so the first paint never shows an unintended
+  // unit. The pattern mirrors Drives.tsx / Dashboard.tsx.
+  const [metric, setMetric] = useState(false)
+  useEffect(() => {
+    let cancelled = false
+    fetch("/api/setup/config")
+      .then((r) => r.json())
+      .then((cfg) => {
+        if (cancelled) return
+        const entry = cfg?.DRIVE_MAP_UNIT
+        if (!entry) return
+        const val =
+          typeof entry === "object" ? (entry.active ? entry.value : null) : entry
+        if (val !== null && val !== undefined) setMetric(val === "km")
+      })
+      .catch(() => {
+        /* non-critical — fall back to default unit */
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [])
   const [showFsdEvents, setShowFsdEvents] = useState(true)
   const hasFsdEvents = (drive.fsdEvents ?? []).length > 0
+
+  // Per-sample battery time-series for the playback info card on the
+  // map. Sourced from /api/drives/{id}/battery-series — the BLE
+  // sampler polls every 60s, so a typical drive has dozens of samples.
+  // DriveMap looks up the most recent sample at or before the current
+  // scrubber's wall-clock time on every tick; that's a step function,
+  // not interpolation, because battery moves in discrete 1% increments.
+  // Empty array (or skipped fetch) → card omits the battery row.
+  const [batterySeries, setBatterySeries] = useState<BatteryPoint[]>([])
+  useEffect(() => {
+    let cancelled = false
+    fetch(`/api/drives/${drive.id}/battery-series`)
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
+      .then((data: { points?: BatteryPoint[] }) => {
+        if (cancelled) return
+        setBatterySeries(Array.isArray(data.points) ? data.points : [])
+      })
+      .catch(() => {
+        if (!cancelled) setBatterySeries([])
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [drive.id])
 
   useEffect(() => {
     setTotal(drive.points.length)
   }, [drive.points.length, setTotal])
 
   const title = drive.endLocation ?? "Drive"
-  const sourceBadge = drive.source === "tessie" ? "Tessie" : "USB"
-  const sourceClass =
-    drive.source === "tessie"
-      ? "bg-violet-500/15 text-violet-200 ring-violet-400/30"
-      : "bg-emerald-500/15 text-emerald-200 ring-emerald-400/30"
+  // Only the "imported from Tessie" badge is informative — drives from
+  // the USB are the default and don't need a redundant label.
+  const showTessieBadge = drive.source === "tessie"
 
   const speedSeries = useMemo(() => {
     return drive.points.map((p, i) => ({
@@ -108,11 +156,11 @@ function DriveDetailContent({ drive, onSaveTags }: DriveDetailContentProps) {
         <h1 className="text-2xl font-semibold text-slate-100 sm:text-3xl">
           Drive to {title}
         </h1>
-        <span
-          className={`mt-1 inline-flex shrink-0 items-center rounded-full px-2 py-0.5 text-xs font-medium ring-1 ring-inset ${sourceClass}`}
-        >
-          {sourceBadge}
-        </span>
+        {showTessieBadge && (
+          <span className="mt-1 inline-flex shrink-0 items-center rounded-full bg-violet-500/15 px-2 py-0.5 text-xs font-medium text-violet-200 ring-1 ring-inset ring-violet-400/30">
+            Tessie
+          </span>
+        )}
       </div>
 
       {hasFsdEvents && (
@@ -129,7 +177,7 @@ function DriveDetailContent({ drive, onSaveTags }: DriveDetailContentProps) {
             aria-pressed={showFsdEvents}
           >
             <Sparkles className="h-3.5 w-3.5" />
-            FSD events {showFsdEvents ? "on" : "off"}
+            Toggle FSD Markers
           </button>
         </div>
       )}
@@ -142,6 +190,9 @@ function DriveDetailContent({ drive, onSaveTags }: DriveDetailContentProps) {
             fsdEvents={drive.fsdEvents}
             showEvents={showFsdEvents}
             source={drive.source}
+            startTime={drive.startTime}
+            metric={metric}
+            batterySeries={batterySeries}
           />
           {/* Drive tag chip floats over the bottom-left of the map.
               Click to open the popover; when no tags, shows just a
@@ -150,10 +201,13 @@ function DriveDetailContent({ drive, onSaveTags }: DriveDetailContentProps) {
             <TagPopover tags={drive.tags ?? []} onChange={onSaveTags} />
           </div>
         </div>
-        <DriveScrubber points={drive.points} startTime={drive.startTime} />
-        {drive.fsdStates && drive.fsdStates.length > 0 && (
-          <FsdEngagementStripe fsdStates={drive.fsdStates} />
-        )}
+        {/* DriveScrubber now renders the FSD engagement overlay on its
+            own track — the standalone FsdEngagementStripe is retired. */}
+        <DriveScrubber
+          points={drive.points}
+          startTime={drive.startTime}
+          fsdStates={drive.fsdStates}
+        />
       </div>
 
       <div className="mt-6">
@@ -202,11 +256,10 @@ function DriveDetailContent({ drive, onSaveTags }: DriveDetailContentProps) {
         speedUnit={speedUnit}
       />
       <AssistedSection drive={drive} metric={metric} />
-      <OdometerSection drive={drive} />
+      <OdometerSection drive={drive} metric={metric} />
       <BatterySection drive={drive} />
       <ClimateSection drive={drive} metric={metric} />
       <TirePressureSection drive={drive} />
-      <DashcamSection drive={drive} />
     </>
   )
 }
@@ -265,68 +318,90 @@ interface AssistedSectionProps {
 }
 
 function AssistedSection({ drive, metric }: AssistedSectionProps) {
-  const hasAny =
+  // Each assist system contributes a pair of tiles (% and distance) and
+  // only shows up when it was actually engaged during the drive. Drives
+  // that used only FSD don't waste rows on Autopilot/TACC zeroes.
+  const showFsd =
     drive.fsdPercent > 0 ||
-    drive.autosteerPercent > 0 ||
-    drive.taccPercent > 0 ||
+    drive.fsdDistanceMi > 0 ||
     drive.fsdDisengagements > 0 ||
     drive.fsdAccelPushes > 0
-  if (!hasAny) return null
+  const showAutopilot = drive.autosteerPercent > 0 || drive.autosteerDistanceMi > 0
+  const showTacc = drive.taccPercent > 0 || drive.taccDistanceMi > 0
+  if (!showFsd && !showAutopilot && !showTacc) return null
   return (
     <>
       <SectionHeading>Assisted driving</SectionHeading>
       <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
-        <StatTile
-          label="FSD"
-          value={`${formatPercent(drive.fsdPercent)}%`}
-          icon={<Sparkles className="h-4 w-4" />}
-          info="Time + distance share with Full Self-Driving (Supervised) engaged."
-        />
-        <StatTile
-          label="FSD distance"
-          value={formatDistance(drive.fsdDistanceMi, drive.fsdDistanceKm, metric)}
-          icon={<Gauge className="h-4 w-4" />}
-        />
-        <StatTile
-          label="Disengagements"
-          value={String(drive.fsdDisengagements)}
-          icon={<Disc className="h-4 w-4" />}
-          info="Number of times FSD handed back control (excluding parks within 2s)."
-        />
-        <StatTile
-          label="Accel pushes"
-          value={String(drive.fsdAccelPushes)}
-          icon={<Gauge className="h-4 w-4" />}
-          info="Number of accelerator presses while FSD was engaged."
-        />
-        <StatTile
-          label="Autopilot"
-          value={`${formatPercent(drive.autosteerPercent)}%`}
-          icon={<Sparkles className="h-4 w-4" />}
-          info="Autosteer share (lane-keeping without FSD)."
-        />
-        <StatTile
-          label="Autopilot distance"
-          value={formatDistance(drive.autosteerDistanceMi, drive.autosteerDistanceKm, metric)}
-          icon={<Gauge className="h-4 w-4" />}
-        />
-        <StatTile
-          label="TACC"
-          value={`${formatPercent(drive.taccPercent)}%`}
-          icon={<Sparkles className="h-4 w-4" />}
-          info="Traffic-Aware Cruise Control share (speed regulation only)."
-        />
-        <StatTile
-          label="TACC distance"
-          value={formatDistance(drive.taccDistanceMi, drive.taccDistanceKm, metric)}
-          icon={<Gauge className="h-4 w-4" />}
-        />
+        {showFsd && (
+          <>
+            <StatTile
+              label="FSD"
+              value={`${formatPercent(drive.fsdPercent)}%`}
+              icon={<Sparkles className="h-4 w-4" />}
+              info="Time + distance share with Full Self-Driving (Supervised) engaged."
+            />
+            <StatTile
+              label="FSD distance"
+              value={formatDistance(drive.fsdDistanceMi, drive.fsdDistanceKm, metric)}
+              icon={<Gauge className="h-4 w-4" />}
+            />
+            <StatTile
+              label="Disengagements"
+              value={String(drive.fsdDisengagements)}
+              icon={<Disc className="h-4 w-4" />}
+              info="Number of times FSD handed back control (excluding parks within 2s)."
+            />
+            <StatTile
+              label="Accel pushes"
+              value={String(drive.fsdAccelPushes)}
+              icon={<Gauge className="h-4 w-4" />}
+              info="Number of accelerator presses while FSD was engaged."
+            />
+          </>
+        )}
+        {showAutopilot && (
+          <>
+            <StatTile
+              label="Autopilot"
+              value={`${formatPercent(drive.autosteerPercent)}%`}
+              icon={<Sparkles className="h-4 w-4" />}
+              info="Autosteer share (lane-keeping without FSD)."
+            />
+            <StatTile
+              label="Autopilot distance"
+              value={formatDistance(drive.autosteerDistanceMi, drive.autosteerDistanceKm, metric)}
+              icon={<Gauge className="h-4 w-4" />}
+            />
+          </>
+        )}
+        {showTacc && (
+          <>
+            <StatTile
+              label="TACC"
+              value={`${formatPercent(drive.taccPercent)}%`}
+              icon={<Sparkles className="h-4 w-4" />}
+              info="Traffic-Aware Cruise Control share (speed regulation only)."
+            />
+            <StatTile
+              label="TACC distance"
+              value={formatDistance(drive.taccDistanceMi, drive.taccDistanceKm, metric)}
+              icon={<Gauge className="h-4 w-4" />}
+            />
+          </>
+        )}
       </div>
     </>
   )
 }
 
-function OdometerSection({ drive }: { drive: DriveDetailType }) {
+function OdometerSection({
+  drive,
+  metric,
+}: {
+  drive: DriveDetailType
+  metric: boolean
+}) {
   if (drive.odometerMiStart === undefined && drive.odometerMiEnd === undefined) return null
   return (
     <>
@@ -334,17 +409,29 @@ function OdometerSection({ drive }: { drive: DriveDetailType }) {
       <div className="grid grid-cols-2 gap-4 sm:grid-cols-3">
         <StatTile
           label="Start"
-          value={drive.odometerMiStart !== undefined ? formatMiles(drive.odometerMiStart) : "—"}
+          value={
+            drive.odometerMiStart !== undefined
+              ? formatOdometer(drive.odometerMiStart, metric)
+              : "—"
+          }
           icon={<MapPin className="h-4 w-4" />}
         />
         <StatTile
           label="End"
-          value={drive.odometerMiEnd !== undefined ? formatMiles(drive.odometerMiEnd) : "—"}
+          value={
+            drive.odometerMiEnd !== undefined
+              ? formatOdometer(drive.odometerMiEnd, metric)
+              : "—"
+          }
           icon={<MapPin className="h-4 w-4" />}
         />
         <StatTile
           label="Driven"
-          value={drive.odometerMiDriven !== undefined ? formatMiles(drive.odometerMiDriven) : "—"}
+          value={
+            drive.odometerMiDriven !== undefined
+              ? formatOdometer(drive.odometerMiDriven, metric)
+              : "—"
+          }
           icon={<Gauge className="h-4 w-4" />}
         />
       </div>
@@ -389,7 +476,38 @@ function ClimateSection({ drive, metric }: ClimateSectionProps) {
     drive.interiorTempMaxC !== undefined ||
     drive.exteriorTempAvgC !== undefined ||
     drive.hvacRuntimeS !== undefined
+
+  // Per-sample temperature series for the chart. Fetched only when
+  // the section will actually render, so drives without climate data
+  // never trigger the request. The endpoint is cheap (one indexed
+  // SELECT bounded by the drive's clip window) but skipping the
+  // round-trip when there's nothing to show keeps the network panel
+  // clean.
+  const [tempPoints, setTempPoints] = useState<TemperaturePoint[] | null>(null)
+  useEffect(() => {
+    if (!anyClimate) return
+    let cancelled = false
+    fetch(`/api/drives/${drive.id}/temperature-series`)
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
+      .then((data: { points?: TemperaturePoint[] }) => {
+        if (cancelled) return
+        setTempPoints(Array.isArray(data.points) ? data.points : [])
+      })
+      .catch(() => {
+        if (!cancelled) setTempPoints([])
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [drive.id, anyClimate])
+
   if (!anyClimate) return null
+
+  // Decide whether the chart has enough material to render. A single
+  // sample produces a degenerate flat line that's worse than just the
+  // min/max/avg tiles above it.
+  const chartReady = tempPoints !== null && tempPoints.length >= 2
+
   return (
     <>
       <SectionHeading>Climate</SectionHeading>
@@ -411,10 +529,26 @@ function ClimateSection({ drive, metric }: ClimateSectionProps) {
         />
         <StatTile
           label="HVAC runtime"
-          value={drive.hvacRuntimeS !== undefined ? formatHvacRuntime(drive.hvacRuntimeS) : "—"}
+          value={
+            drive.hvacRuntimeS !== undefined
+              ? formatHvacRuntime(drive.hvacRuntimeS, drive.durationMs)
+              : "—"
+          }
           icon={<Wind className="h-4 w-4" />}
         />
       </div>
+      {chartReady && (
+        <div className="mt-4 rounded-2xl border border-white/[0.06] bg-white/[0.02] p-3">
+          <Suspense fallback={<ChartFallback />}>
+            <TemperatureChart
+              points={tempPoints!}
+              metric={metric}
+              drivePoints={drive.points}
+              startTime={drive.startTime}
+            />
+          </Suspense>
+        </div>
+      )}
     </>
   )
 }
@@ -439,18 +573,3 @@ function TirePressureSection({ drive }: { drive: DriveDetailType }) {
   )
 }
 
-function DashcamSection({ drive }: { drive: DriveDetailType }) {
-  if (!drive.clipCount) return null
-  return (
-    <>
-      <SectionHeading>Dashcam</SectionHeading>
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
-        <StatTile
-          label="Clips"
-          value={String(drive.clipCount)}
-          icon={<Camera className="h-4 w-4" />}
-        />
-      </div>
-    </>
-  )
-}

@@ -606,6 +606,54 @@ impl DriveStore {
         Ok(())
     }
 
+    /// Bulk-delete the specified clip files from `routes` and
+    /// `processed_files`, and prune any matching `drive_tags` rows.
+    /// `drive_keys` lists the start_time strings used as `drive_tags`
+    /// keys so the tag rows tied to the removed drives are cleaned up
+    /// at the same time.
+    ///
+    /// All deletes run in a single transaction so a partial failure
+    /// can't leave routes deleted but processed_files stale (which
+    /// would silently prevent reprocessing). Returns the number of
+    /// routes actually removed — useful for surfacing "deleted 42
+    /// drives (61 clips)" in the UI.
+    pub fn delete_routes_by_files(
+        &self,
+        files: &[String],
+        drive_keys: &[String],
+    ) -> Result<usize> {
+        if files.is_empty() && drive_keys.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let mut deleted: usize = 0;
+        if !files.is_empty() {
+            let mut del_routes =
+                tx.prepare("DELETE FROM routes WHERE file = ?1")?;
+            let mut del_processed =
+                tx.prepare("DELETE FROM processed_files WHERE file = ?1")?;
+            for f in files {
+                let n = normalize_path(f);
+                deleted += del_routes.execute(params![n])?;
+                del_processed.execute(params![n])?;
+            }
+        }
+        if !drive_keys.is_empty() {
+            let mut del_tags =
+                tx.prepare("DELETE FROM drive_tags WHERE drive_key = ?1")?;
+            for k in drive_keys {
+                del_tags.execute(params![k])?;
+            }
+        }
+        tx.commit()?;
+        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
+        drop(conn);
+        self.drive_cache_dirty.store(true, Ordering::Release);
+        self.refresh_counts()?;
+        Ok(deleted)
+    }
+
     /// Regenerate the canonical `/backingfiles/drive-data.json` mirror for
     /// `post-archive-process.sh`. Idempotent; safe alongside reads.
     pub fn export_json_for_sync(&self) -> Result<()> {
@@ -1791,6 +1839,104 @@ mod tests {
             .unwrap();
         let tags = store.get_drive_tags("drive1").unwrap();
         assert_eq!(tags, vec!["Commute".to_string(), "Work".to_string()]);
+    }
+
+    /// End-to-end contract for the `drive_tags` join key.
+    ///
+    /// Regression test for the v2.9.x "Add tag" bug: the PUT handler used
+    /// to pass the raw URL id (typically the numeric DriveSummary.id, e.g.
+    /// `"0"`) straight into `set_drive_tags`, but the grouper joins tags
+    /// onto drives using the `%Y-%m-%dT%H:%M:%S` start_time string. The
+    /// row was written but never matched on read, so the tag silently
+    /// vanished from the UI even though the request returned 200.
+    ///
+    /// This test:
+    ///   1. Pins down the contract: rows keyed by start_time DO surface.
+    ///   2. Pins down the failure mode: rows keyed by the numeric idx do
+    ///      NOT surface — so future refactors of the handler can't
+    ///      regress this without breaking the test.
+    ///   3. Exercises `find_drive_start_time` as the bridge the handler
+    ///      uses to translate numeric ids into the canonical key.
+    #[test]
+    fn drive_tags_join_on_start_time_string_not_numeric_id() {
+        use crate::grouper;
+        let store = DriveStore::open_memory().unwrap();
+        let pts: Vec<GpsPoint> = vec![[37.7749, -122.4194], [37.7750, -122.4195]];
+        store
+            .add_route(
+                "2025-01-15_12-30-45-front.mp4",
+                "2025-01-15",
+                &pts,
+                &[4, 4],
+                &[0, 0],
+                &[10.0, 10.0],
+                &[0.0, 0.0],
+                0,
+                2,
+                &[GearRun { gear: 4, frames: 2 }],
+            )
+            .unwrap();
+
+        // Sanity: grouper sees one drive whose start_time is the
+        // parsed-from-filename `%Y-%m-%dT%H:%M:%S` form.
+        let (drive_id, drive_start_time) = store
+            .with_route_summaries(|s| {
+                let drives = grouper::group_summaries_fast(s, &std::collections::HashMap::new());
+                (drives[0].id, drives[0].start_time.clone())
+            })
+            .unwrap();
+        assert_eq!(drive_id, 0);
+        assert_eq!(drive_start_time, "2025-01-15T12:30:45");
+
+        // The resolver must translate the numeric URL id into the
+        // start_time the grouper joins on.
+        let resolved = store
+            .with_route_summaries(|s| grouper::find_drive_start_time(s, "0"))
+            .unwrap();
+        assert_eq!(resolved.as_deref(), Some("2025-01-15T12:30:45"));
+        // And accept the start_time form too (single_drive does).
+        let resolved_st = store
+            .with_route_summaries(|s| grouper::find_drive_start_time(s, "2025-01-15T12:30:45"))
+            .unwrap();
+        assert_eq!(resolved_st.as_deref(), Some("2025-01-15T12:30:45"));
+        // Bogus id resolves to None — handler returns 404.
+        let bogus = store
+            .with_route_summaries(|s| grouper::find_drive_start_time(s, "999"))
+            .unwrap();
+        assert!(bogus.is_none());
+
+        // Negative control: storing under the raw numeric id (the old
+        // broken path) MUST NOT surface the tag on the drive.
+        store
+            .set_drive_tags("0", &["BugCanary".to_string()])
+            .unwrap();
+        let tags_after_bad = store.get_all_drive_tags().unwrap();
+        let drive_after_bad = store
+            .with_route_summaries(|s| {
+                grouper::group_summaries_fast(s, &tags_after_bad)[0]
+                    .tags
+                    .clone()
+            })
+            .unwrap();
+        assert!(
+            drive_after_bad.is_empty(),
+            "numeric-keyed tag rows must not surface — got {:?}",
+            drive_after_bad,
+        );
+
+        // Positive: storing under the resolved start_time key DOES surface.
+        store
+            .set_drive_tags(&resolved.unwrap(), &["Work".to_string()])
+            .unwrap();
+        let tags_after_good = store.get_all_drive_tags().unwrap();
+        let drive_after_good = store
+            .with_route_summaries(|s| {
+                grouper::group_summaries_fast(s, &tags_after_good)[0]
+                    .tags
+                    .clone()
+            })
+            .unwrap();
+        assert_eq!(drive_after_good, vec!["Work".to_string()]);
     }
 
     #[test]

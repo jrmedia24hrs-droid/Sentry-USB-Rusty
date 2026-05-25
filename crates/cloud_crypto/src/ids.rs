@@ -33,12 +33,6 @@ pub fn derive_pi_local_wrap_key(serial: &[u8]) -> Result<[u8; 32], CredentialsEr
     Ok(kdf::derive_32(serial, PI_LOCAL_WRAP_SALT, PI_LOCAL_WRAP_INFO)?)
 }
 
-pub const PI_KEY_SALT: &[u8] = b"sentrycloud-pi-key-v1";
-
-pub fn derive_pi_key(master_dek: &[u8; 32], pi_id: &str) -> Result<[u8; 32], CredentialsError> {
-    Ok(kdf::derive_32(master_dek, PI_KEY_SALT, pi_id.as_bytes())?)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,24 +1,29 @@
-import { useEffect, useState } from "react"
+import { useEffect, useState, lazy, Suspense } from "react"
 import { BrowserRouter, Routes, Route } from "react-router-dom"
 import { Loader2 } from "lucide-react"
 import { AppShell } from "@/components/layout/AppShell"
-import Dashboard from "@/pages/Dashboard"
-import Viewer from "@/pages/Viewer"
-import Files from "@/pages/Files"
-import Logs from "@/pages/Logs"
-import Settings from "@/pages/Settings"
-import Drives from "@/pages/Drives"
-import DriveDetail from "@/pages/DriveDetail"
-import Support from "@/pages/Support"
-import Terminal from "@/pages/Terminal"
-import FSDAnalytics from "@/pages/FSDAnalytics"
-import Community from "@/pages/Community"
-import Notifications from "@/pages/Notifications"
-import Snapshots from "@/pages/Snapshots"
-import Login from "@/pages/Login"
 import { SetupWizard } from "@/components/setup/SetupWizard"
 import { SetupProgress } from "@/components/setup/SetupProgress"
 import { AuthProvider, useAuth } from "@/hooks/useAuth"
+
+// Lazy routes — each page becomes its own JS chunk. Visiting the
+// Dashboard no longer pulls in xterm (Terminal), leaflet (Viewer), or
+// recharts (FSDAnalytics) on first paint. The Login screen is also
+// lazy so unauthenticated users don't pay for the shell.
+const Dashboard = lazy(() => import("@/pages/Dashboard"))
+const Viewer = lazy(() => import("@/pages/Viewer"))
+const Files = lazy(() => import("@/pages/Files"))
+const Logs = lazy(() => import("@/pages/Logs"))
+const Settings = lazy(() => import("@/pages/Settings"))
+const Drives = lazy(() => import("@/pages/Drives"))
+const DriveDetail = lazy(() => import("@/pages/DriveDetail"))
+const Support = lazy(() => import("@/pages/Support"))
+const Terminal = lazy(() => import("@/pages/Terminal"))
+const FSDAnalytics = lazy(() => import("@/pages/FSDAnalytics"))
+const Community = lazy(() => import("@/pages/Community"))
+const Notifications = lazy(() => import("@/pages/Notifications"))
+const Snapshots = lazy(() => import("@/pages/Snapshots"))
+const Login = lazy(() => import("@/pages/Login"))
 
 type AppState = "loading" | "setup" | "configuring" | "finalizing" | "ready"
 
@@ -174,28 +179,42 @@ function AppContent() {
   }
 
   if (authState === "unauthenticated") {
-    return <Login onLogin={login} />
+    return (
+      <Suspense fallback={<RouteFallback />}>
+        <Login onLogin={login} />
+      </Suspense>
+    )
   }
 
   return (
     <BrowserRouter>
-      <Routes>
-        <Route element={<AppShell />}>
-          <Route path="/" element={<Dashboard />} />
-          <Route path="/viewer" element={<Viewer />} />
-          <Route path="/files" element={<Files />} />
-          <Route path="/logs" element={<Logs />} />
-          <Route path="/drives" element={<Drives />} />
-          <Route path="/drives/:id" element={<DriveDetail />} />
-          <Route path="/fsd" element={<FSDAnalytics />} />
-          <Route path="/support" element={<Support />} />
-          <Route path="/terminal" element={<Terminal />} />
-          <Route path="/community" element={<Community />} />
-          <Route path="/notifications" element={<Notifications />} />
-          <Route path="/snapshots" element={<Snapshots />} />
-          <Route path="/settings" element={<Settings />} />
-        </Route>
-      </Routes>
+      <Suspense fallback={<RouteFallback />}>
+        <Routes>
+          <Route element={<AppShell />}>
+            <Route path="/" element={<Dashboard />} />
+            <Route path="/viewer" element={<Viewer />} />
+            <Route path="/files" element={<Files />} />
+            <Route path="/logs" element={<Logs />} />
+            <Route path="/drives" element={<Drives />} />
+            <Route path="/drives/:id" element={<DriveDetail />} />
+            <Route path="/fsd" element={<FSDAnalytics />} />
+            <Route path="/support" element={<Support />} />
+            <Route path="/terminal" element={<Terminal />} />
+            <Route path="/community" element={<Community />} />
+            <Route path="/notifications" element={<Notifications />} />
+            <Route path="/snapshots" element={<Snapshots />} />
+            <Route path="/settings" element={<Settings />} />
+          </Route>
+        </Routes>
+      </Suspense>
     </BrowserRouter>
+  )
+}
+
+function RouteFallback() {
+  return (
+    <div className="flex h-screen items-center justify-center bg-slate-950">
+      <Loader2 className="h-6 w-6 animate-spin text-blue-400" />
+    </div>
   )
 }

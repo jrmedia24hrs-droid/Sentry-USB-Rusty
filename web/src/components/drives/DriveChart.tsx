@@ -1,4 +1,4 @@
-import { useMemo } from "react"
+import { useMemo, useRef } from "react"
 import {
   Area,
   AreaChart,
@@ -16,6 +16,15 @@ interface DriveChartProps {
   startTime: string
 }
 
+// Chart layout constants — must match the AreaChart's `margin` prop
+// and YAxis `width` below. We compute the click→index mapping in
+// pixel space ourselves because Recharts 3.x's `onClick` handler does
+// not reliably populate `activeTooltipIndex` (the event fires before
+// the chart's redux store settles, so the field is frequently
+// undefined no matter where you click).
+const YAXIS_WIDTH = 36
+const RIGHT_MARGIN = 16
+
 export default function DriveChart({
   series,
   valueLabel,
@@ -24,19 +33,39 @@ export default function DriveChart({
 }: DriveChartProps) {
   const { setIndex } = useScrubberActions()
   const baseMs = useMemo(() => new Date(startTime).getTime(), [startTime])
+  const containerRef = useRef<HTMLDivElement>(null)
+
+  // Click anywhere in the chart → seek to that fractional position
+  // along the time axis. Maps the click's X relative to the plot area
+  // (container minus Y-axis + right margin) to a data-point index.
+  const handleClick = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (series.length < 2) return
+    const container = containerRef.current
+    if (!container) return
+    const rect = container.getBoundingClientRect()
+    const plotLeft = YAXIS_WIDTH
+    const plotRight = rect.width - RIGHT_MARGIN
+    const plotWidth = plotRight - plotLeft
+    if (plotWidth <= 0) return
+    const x = e.clientX - rect.left
+    const clamped = Math.max(plotLeft, Math.min(plotRight, x))
+    const frac = (clamped - plotLeft) / plotWidth
+    const idx = Math.round(frac * (series.length - 1))
+    const safe = Math.max(0, Math.min(series.length - 1, idx))
+    setIndex(series[safe].index)
+  }
 
   return (
-    <div className="h-56 w-full" aria-label={`${valueLabel} chart`}>
-      <ResponsiveContainer>
+    <div
+      ref={containerRef}
+      className="h-56 w-full cursor-crosshair select-none"
+      onClick={handleClick}
+      aria-label={`${valueLabel} chart`}
+    >
+      <ResponsiveContainer minHeight={0} minWidth={0}>
         <AreaChart
           data={series}
-          margin={{ top: 10, right: 16, bottom: 16, left: 4 }}
-          onMouseMove={(s) => {
-            const idx = s?.activeTooltipIndex
-            if (typeof idx === "number" && idx >= 0 && idx < series.length) {
-              setIndex(series[idx].index)
-            }
-          }}
+          margin={{ top: 10, right: RIGHT_MARGIN, bottom: 16, left: 4 }}
         >
           <defs>
             <linearGradient id="speedFill" x1="0" y1="0" x2="0" y2="1">

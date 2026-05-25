@@ -70,9 +70,16 @@ type Tab = "browse" | "upload"
 export default function CommunityWraps({ adminPasscode, onAdminPasscodeChange }: { adminPasscode: string | null; onAdminPasscodeChange: (v: string | null) => void }) {
   const [tab, setTab] = useState<Tab>("browse")
 
-  // Godot 3D engine state — mounted at page level so it starts loading immediately
+  // Godot 3D engine state — the renderer is conditionally mounted
+  // (see below). Reset readiness whenever the renderer unmounts so a
+  // re-mount on a later Upload visit doesn't see a stale "ready" flag.
   const godotReadyRef = useRef(false)
   const godotRef = useRef<GodotRendererHandle>(null)
+  useEffect(() => {
+    if (tab !== "upload") {
+      godotReadyRef.current = false
+    }
+  }, [tab])
 
   return (
     <div className="space-y-6">
@@ -101,14 +108,21 @@ export default function CommunityWraps({ adminPasscode, onAdminPasscodeChange }:
 
       </div>
 
-      {/* Hidden Godot renderer — starts loading 283MB .pck immediately */}
-      <GodotRenderer
-        ref={godotRef}
-        onReady={() => { godotReadyRef.current = true }}
-        onCapture={() => {}}
-        onError={() => {}}
-        onCarLoaded={() => {}}
-      />
+      {/* Hidden Godot renderer — only mounted on the Upload tab.
+          The .pck is large (283 MB) and only the Upload flow needs
+          the 3D preview, so Browse-only visitors don't pay the
+          download. The renderer is hidden 1×1 even when mounted; it
+          publishes godot_ready via postMessage which the Upload tab
+          waits on before invoking capture. */}
+      {tab === "upload" && (
+        <GodotRenderer
+          ref={godotRef}
+          onReady={() => { godotReadyRef.current = true }}
+          onCapture={() => {}}
+          onError={() => {}}
+          onCarLoaded={() => {}}
+        />
+      )}
 
       {tab === "browse" ? (
         <BrowseTab adminPasscode={adminPasscode} onAdminExit={() => onAdminPasscodeChange(null)} />
@@ -352,6 +366,7 @@ function BrowseTab({ adminPasscode, onAdminExit }: { adminPasscode: string | nul
                       alt={wrap.name}
                       className="h-full w-full object-cover transition-transform group-hover:scale-105"
                       loading="lazy"
+                      decoding="async"
                     />
                   </div>
                   <div className="p-2">

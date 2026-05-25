@@ -1,7 +1,7 @@
 import type { ReactNode } from "react"
 import { cn } from "@/lib/utils"
 
-export type BannerKind = "error" | "warn" | "info" | "update"
+type BannerKind = "error" | "warn" | "info" | "update"
 
 const HALO_BY_KIND: Record<BannerKind, string> = {
   error: "halo-red",
@@ -27,7 +27,7 @@ export interface BannerItem {
   action?: ReactNode
 }
 
-export function Banner({ kind, icon, title, sub, action }: Omit<BannerItem, "id">) {
+function Banner({ kind, icon, title, sub, action }: Omit<BannerItem, "id">) {
   return (
     <div className={cn("banner", `banner--${kind}`)}>
       <span className={cn("banner-icon", HALO_BY_KIND[kind])}>{icon}</span>

@@ -16,6 +16,7 @@
 //!     BLE off in settings stops sampling within ~15 s without a
 //!     daemon restart.
 
+mod clock_sync;
 mod config;
 mod db;
 mod lock;
@@ -80,6 +81,28 @@ const FAST_RETRY_INTERVAL: Duration = Duration::from_secs(3);
 /// retry per sub-sampler before giving up — enough to catch a real
 /// reconnection window without burning power on a truly dead link.
 const MAX_FAST_RETRIES: u32 = 3;
+
+/// How often to do a `state climate` + `state charge` refresh while
+/// in Quiet mode but the car is provably awake (recent clip writes
+/// → Sentry recording or charging). The default Quiet flow only
+/// runs body-controller-state, which doesn't carry battery/temps/
+/// HVAC — so without this refresh, parked-with-Sentry would show
+/// frozen values for as long as the session lasts. 3 min is the
+/// sweet spot: fresh enough that the dashboard cards feel alive,
+/// rare enough that we add minimal BLE load (~2 calls every 3 min,
+/// vs Active mode's 4 calls every 15 s). Safe because the car is
+/// already awake — we're not adding any wake-up drain.
+const PARKED_AWAKE_REFRESH_INTERVAL: Duration = Duration::from_secs(180);
+
+/// How often to poll `state tire-pressure` while in Quiet mode but
+/// the car is awake. Much rarer than the climate/charge refresh
+/// because TPMS readings genuinely don't change while parked —
+/// 30 min is enough to feed the TPMS dashboard card with periodic
+/// fresh data and to confirm the sensors are still reporting.
+/// Without this, TPMS would only ever update during/right after a
+/// drive (Active mode polls tires every 5 min), and users who
+/// rarely drive would see indefinitely stale numbers.
+const PARKED_AWAKE_TPMS_INTERVAL: Duration = Duration::from_secs(1800);
 
 /// How many consecutive state polls must show shift_state = Park
 /// before we drop into the sleep-safe Quiet mode. 3 polls @ 15s =
@@ -209,6 +232,15 @@ async fn main() -> Result<()> {
 
     info!("sentryusb-tesla-telemetry starting");
 
+    // Brief startup wait for the system clock to come up — either via
+    // RTC (immediate) or NTP (seconds, if WiFi is reachable). Just
+    // long enough to dodge the very first cold-boot tick; the
+    // BLE-based clock sync (see clock_sync.rs) handles everything
+    // else once the first state response lands. Was 5 min when we
+    // depended entirely on NTP; now 30s is plenty because the car
+    // itself becomes our backup time source via BLE.
+    wait_for_clock_sync(Duration::from_secs(30)).await;
+
     let conn = db::open()?;
     let mut held_radio = false;
     // Counts consecutive state polls showing shift_state = Park.
@@ -228,6 +260,18 @@ async fn main() -> Result<()> {
     // fresh start-of-drive snapshot), with charge deferred 30s so
     // it doesn't stack with climate.
     let mut schedule = Schedule::new(Instant::now());
+    // Last time we did a parked-awake state refresh (climate +
+    // charge while in Quiet mode but the car is recording dashcam
+    // clips). Lets battery/temps stay reasonably fresh during
+    // Sentry sessions and charging without dropping the radio-lock
+    // dance the deep-sleep Quiet path relies on.
+    let mut last_parked_awake_refresh: Option<Instant> = None;
+    // Separate (much rarer) timer for TPMS — TPMS readings don't
+    // change while parked, so we poll them every 30 min in Quiet
+    // rather than every 3 min like climate/charge. Bundled into
+    // the same tick's Sample row when both timers happen to fire
+    // together.
+    let mut last_parked_awake_tpms_refresh: Option<Instant> = None;
 
     // SIGTERM handler — release the radio on shutdown so the iOS
     // GATT daemon can come back up cleanly.
@@ -236,6 +280,15 @@ async fn main() -> Result<()> {
     )?;
     let mut sigint = tokio::signal::unix::signal(
         tokio::signal::unix::SignalKind::interrupt(),
+    )?;
+    // SIGUSR1 = "do a full state poll now" — fired by the
+    // /api/system/ble-force-poll endpoint when the user clicks
+    // the "Poll now" button. Forces the next-due time of every
+    // sub-sampler to "now" and resets the parked-awake refresh
+    // timer, so the next tick runs everything regardless of the
+    // current phase.
+    let mut sigusr1 = tokio::signal::unix::signal(
+        tokio::signal::unix::SignalKind::user_defined1(),
     )?;
 
     loop {
@@ -250,12 +303,29 @@ async fn main() -> Result<()> {
                 if held_radio { release_radio().await; }
                 return Ok(());
             }
+            _ = sigusr1.recv() => {
+                info!("SIGUSR1 received — forcing a full state poll on next tick");
+                let now = Instant::now();
+                schedule = Schedule::new(now);
+                last_parked_awake_refresh = None;
+                last_parked_awake_tpms_refresh = None;
+                // Reset parked_polls so the phase machine flips to
+                // Active even if we'd been in parked-confirmed
+                // Quiet — otherwise the force-poll would only fire
+                // a body_controller call. The next Park observation
+                // will tick the counter back up.
+                parked_polls = 0;
+                // Loop continues immediately — next tick runs at
+                // the top of the loop without sleeping.
+            }
             sleep = tick(
                 &conn,
                 &mut held_radio,
                 &mut parked_polls,
                 &mut last_user_presence,
                 &mut schedule,
+                &mut last_parked_awake_refresh,
+                &mut last_parked_awake_tpms_refresh,
             ) => {
                 tokio::time::sleep(sleep).await;
             }
@@ -291,6 +361,8 @@ async fn tick(
     parked_polls: &mut u32,
     last_user_presence: &mut Option<bool>,
     schedule: &mut Schedule,
+    last_parked_awake_refresh: &mut Option<Instant>,
+    last_parked_awake_tpms_refresh: &mut Option<Instant>,
 ) -> Duration {
     let cfg = match BleConfig::load() {
         Ok(c) => c,
@@ -406,6 +478,11 @@ async fn tick(
             if presence_now == Some(true) {
                 match sample::sample_drive(&cfg.vin, &cfg.adapter).await {
                     Ok(d) => {
+                        // Self-correct the Pi's clock if it's
+                        // significantly off — uses Tesla's
+                        // GPS-derived timestamp from the response.
+                        // No-op when local clock is already close.
+                        try_sync_clock(d.meta);
                         let shift_changed_to_drive = d
                             .shift_state
                             .map_or(false, |s| !s.is_park() && s != sample::ShiftState::Unknown);
@@ -434,6 +511,86 @@ async fn tick(
                     }
                     Err(e) => {
                         warn!("state drive probe in quiet+present failed: {e}");
+                    }
+                }
+            }
+
+            // Parked-awake state refresh: when the car is parked
+            // (Quiet mode) but actively recording dashcam clips
+            // (observation == Awake), do a periodic climate +
+            // charge poll so battery/temps don't go indefinitely
+            // stale during Sentry sessions or AC charging. Safe
+            // because the car is already awake — we add no
+            // wake-up drain. Only fires every 3 min to keep BLE
+            // load minimal.
+            //
+            // Skipped when car_truly_asleep (let it sleep) or
+            // when the user is in the car (the drive probe above
+            // already covers that path and a state transition is
+            // imminent).
+            if observation == CarState::Awake && presence_now != Some(true) {
+                // Two independent timers in this branch:
+                //   * `refresh_due`   — climate + charge every 3 min
+                //   * `tpms_due`      — tire pressure every 30 min
+                // Either firing opens this poll cycle; both can fire
+                // in the same tick and get bundled into one Sample.
+                let refresh_due = last_parked_awake_refresh
+                    .map(|t| t.elapsed() >= PARKED_AWAKE_REFRESH_INTERVAL)
+                    .unwrap_or(true);
+                let tpms_due = last_parked_awake_tpms_refresh
+                    .map(|t| t.elapsed() >= PARKED_AWAKE_TPMS_INTERVAL)
+                    .unwrap_or(true);
+
+                if refresh_due || tpms_due {
+                    let mut refresh = Sample {
+                        ts: sample::now_secs(),
+                        source: "state".into(),
+                        ..Sample::default()
+                    };
+                    let mut any_ok = false;
+
+                    if refresh_due {
+                        match sample::sample_climate(&cfg.vin, &cfg.adapter).await {
+                            Ok(c) => {
+                                try_sync_clock(c.meta);
+                                refresh.interior_temp_c = c.interior_temp_c;
+                                refresh.exterior_temp_c = c.exterior_temp_c;
+                                refresh.hvac_on = c.hvac_on;
+                                any_ok = true;
+                            }
+                            Err(e) => warn!("parked-awake climate refresh failed: {e}"),
+                        }
+                        match sample::sample_charge(&cfg.vin, &cfg.adapter).await {
+                            Ok(c) => {
+                                try_sync_clock(c.meta);
+                                refresh.battery_pct = c.battery_pct;
+                                any_ok = true;
+                            }
+                            Err(e) => warn!("parked-awake charge refresh failed: {e}"),
+                        }
+                        *last_parked_awake_refresh = Some(Instant::now());
+                    }
+
+                    if tpms_due {
+                        // TPMS rarely changes while parked, but
+                        // periodic checks confirm sensors still
+                        // report and feed the dashboard's TPMS card.
+                        match sample::sample_tires(&cfg.vin, &cfg.adapter).await {
+                            Ok(t) => {
+                                try_sync_clock(t.meta);
+                                refresh.tire_fl_psi = t.tire_fl_psi;
+                                refresh.tire_fr_psi = t.tire_fr_psi;
+                                refresh.tire_rl_psi = t.tire_rl_psi;
+                                refresh.tire_rr_psi = t.tire_rr_psi;
+                                any_ok = true;
+                            }
+                            Err(e) => warn!("parked-awake tires refresh failed: {e}"),
+                        }
+                        *last_parked_awake_tpms_refresh = Some(Instant::now());
+                    }
+
+                    if any_ok {
+                        persist(conn, refresh);
                     }
                 }
             }
@@ -505,6 +662,7 @@ async fn tick(
         if schedule.drive_due(tick_now) {
             let success = match sample::sample_drive(&cfg.vin, &cfg.adapter).await {
                 Ok(d) => {
+                    try_sync_clock(d.meta);
                     sample.odometer_mi = d.odometer_mi;
                     sample.location_name = d.location_name;
                     shift_state_observed = d.shift_state;
@@ -525,6 +683,7 @@ async fn tick(
         if schedule.climate_due(tick_now) {
             let success = match sample::sample_climate(&cfg.vin, &cfg.adapter).await {
                 Ok(c) => {
+                    try_sync_clock(c.meta);
                     sample.interior_temp_c = c.interior_temp_c;
                     sample.exterior_temp_c = c.exterior_temp_c;
                     sample.hvac_on = c.hvac_on;
@@ -543,6 +702,7 @@ async fn tick(
         if schedule.charge_due(tick_now) {
             let success = match sample::sample_charge(&cfg.vin, &cfg.adapter).await {
                 Ok(c) => {
+                    try_sync_clock(c.meta);
                     sample.battery_pct = c.battery_pct;
                     true
                 }
@@ -559,6 +719,7 @@ async fn tick(
         if schedule.tires_due(tick_now) {
             let success = match sample::sample_tires(&cfg.vin, &cfg.adapter).await {
                 Ok(t) => {
+                    try_sync_clock(t.meta);
                     sample.tire_fl_psi = t.tire_fl_psi;
                     sample.tire_fr_psi = t.tire_fr_psi;
                     sample.tire_rl_psi = t.tire_rl_psi;
@@ -627,6 +788,91 @@ async fn tick(
             // tick itself enforces the actual cadence).
             Duration::from_millis(100)
         }
+    }
+}
+
+/// Block until the system clock looks plausibly correct, or `timeout`
+/// elapses. "Plausible" = year >= 2025 (anything later than the time
+/// this code was written) OR systemd-timesyncd has set its
+/// "synchronized" marker file. Either condition is sufficient — RTC
+/// users will satisfy the first check immediately on boot.
+///
+/// Why this matters: without an RTC battery, the Pi's clock can be
+/// years off after a cold boot until WiFi reaches an NTP server.
+/// Samples written with bad timestamps are unrecoverable — they fall
+/// outside any real drive window when the aggregator runs later.
+/// So we just don't sample until the clock is sane. Best-effort:
+/// times out after 5 min so we don't block forever in pathological
+/// no-WiFi setups.
+async fn wait_for_clock_sync(timeout: Duration) {
+    if clock_is_sane() {
+        debug!("clock looks sane on startup; no wait needed");
+        return;
+    }
+    info!(
+        "system clock is not synced yet — pausing sampler until \
+         NTP catches up (max {}s). Install an RTC battery on the \
+         Pi's BAT pin to avoid this on subsequent boots.",
+        timeout.as_secs()
+    );
+    let deadline = std::time::Instant::now() + timeout;
+    let mut last_log = std::time::Instant::now();
+    let log_every = Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        if clock_is_sane() {
+            info!("system clock is now synced; resuming sampler");
+            return;
+        }
+        if last_log.elapsed() >= log_every {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            info!(
+                "still waiting for clock sync ({}s remaining)",
+                remaining.as_secs()
+            );
+            last_log = std::time::Instant::now();
+        }
+    }
+    warn!(
+        "clock sync timeout reached — starting sampler anyway. \
+         Telemetry written before NTP eventually syncs may not \
+         match drives correctly."
+    );
+}
+
+/// "Is the system clock plausibly correct?" — two signals, either
+/// one is enough:
+///   1. systemd-timesyncd has set its synchronized marker
+///   2. The year is >= 2025 (anything in or after the year this
+///      code was written; rules out the typical 1970 / 2000 / 2014
+///      fallback values that show up on a Pi without RTC)
+fn clock_is_sane() -> bool {
+    // systemd-timesyncd marker — touched the moment a successful NTP
+    // exchange happens, persists across reboots if the rootfs is
+    // writable.
+    if std::path::Path::new("/run/systemd/timesync/synchronized").exists() {
+        return true;
+    }
+    // Year sanity check — a Pi with an RTC battery will pass this
+    // immediately on boot even before NTP runs.
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // 2025-01-01 00:00:00 UTC = 1735689600.
+    secs > 1_735_689_600
+}
+
+/// Helper: feed a successful response's metadata into the clock-sync
+/// machinery. No-op if the response didn't include a vehicle
+/// timestamp (e.g. body-controller-state) or if our clock is already
+/// within tolerance. Called from every success branch in tick() so
+/// any working sub-sample can fix the clock.
+fn try_sync_clock(meta: sample::ResponseMeta) {
+    if let (Some(vehicle_ts_ms), Some(started)) =
+        (meta.vehicle_ts_ms, meta.request_started_at)
+    {
+        clock_sync::maybe_set_clock_from_vehicle(vehicle_ts_ms, started);
     }
 }
 

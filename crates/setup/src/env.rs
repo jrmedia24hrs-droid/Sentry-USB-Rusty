@@ -173,35 +173,6 @@ impl SetupEnv {
     }
 }
 
-/// Mobile push credentials loaded from the JSON file the API server
-/// manages. Returned as `(device_id, device_secret)`.
-///
-/// The JSON file is the single source of truth for these values to avoid
-/// conf-file write races (the bash version was `envsetup.sh:142-150`).
-/// Returns `None` if the file doesn't exist, can't be parsed, or either
-/// field is missing.
-pub fn mobile_push_credentials() -> Option<(String, String)> {
-    let json = std::fs::read_to_string("/root/.sentryusb/notification-credentials.json").ok()?;
-    let device_id = extract_json_string(&json, "device_id")?;
-    let device_secret = extract_json_string(&json, "device_secret")?;
-    Some((device_id, device_secret))
-}
-
-/// Minimal JSON string-value extractor. Matches the bash `sed` pattern
-/// used by envsetup.sh so behavior is identical across ports — we don't
-/// need full serde here because the credentials file is a flat object
-/// written by our own API.
-fn extract_json_string(json: &str, key: &str) -> Option<String> {
-    let needle = format!("\"{}\"", key);
-    let start = json.find(&needle)?;
-    let after = &json[start + needle.len()..];
-    let colon = after.find(':')?;
-    let rest = &after[colon + 1..];
-    let quote = rest.find('"')?;
-    let value_start = quote + 1;
-    let value_end = rest[value_start..].find('"')?;
-    Some(rest[value_start..value_start + value_end].to_string())
-}
 
 /// Copy legacy config keys to their current names, matching the table in
 /// bash `envsetup.sh:62-94`. New-name wins: if the user has already set

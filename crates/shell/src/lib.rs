@@ -42,33 +42,6 @@ pub async fn run_with_timeout(timeout: Duration, name: &str, args: &[&str]) -> R
     }
 }
 
-/// Executes a command and returns both stdout and stderr (for cases where
-/// stderr contains useful info even on success).
-pub async fn run_with_stderr(name: &str, args: &[&str]) -> Result<(String, String)> {
-    let result = tokio::time::timeout(DEFAULT_TIMEOUT, async {
-        Command::new(name).args(args).output().await
-    })
-    .await;
-
-    match result {
-        Err(_) => bail!("command timed out after {:?}", DEFAULT_TIMEOUT),
-        Ok(Err(e)) => bail!("failed to execute command: {}", e),
-        Ok(Ok(output)) => {
-            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-            if output.status.success() {
-                Ok((stdout, stderr))
-            } else {
-                bail!(
-                    "command failed (exit {}): {}",
-                    output.status.code().unwrap_or(-1),
-                    clean_stderr(&stderr)
-                )
-            }
-        }
-    }
-}
-
 /// Strips noisy tool output (e.g. curl progress) from an error message.
 pub fn clean_stderr(msg: &str) -> String {
     let mut result = String::with_capacity(msg.len());

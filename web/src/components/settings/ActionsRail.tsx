@@ -29,7 +29,7 @@ export interface ActionChipProps {
   errorMessage?: string
 }
 
-export function ActionChip({
+function ActionChip({
   icon: Icon,
   label,
   variant = "default",

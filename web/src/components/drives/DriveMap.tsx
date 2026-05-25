@@ -11,6 +11,26 @@ interface DriveMapProps {
   fsdEvents?: FsdEvent[]
   showEvents?: boolean
   source?: string
+  // ISO start_time of the drive — needed to convert each point's
+  // relative-ms field into an absolute clock time for the playback
+  // info card. Without it the card would show offsets, not times.
+  startTime?: string
+  // True when the user's DRIVE_MAP_UNIT === "km". Controls the speed
+  // unit displayed in the playback card.
+  metric?: boolean
+  // Per-sample battery time-series from
+  // GET /api/drives/{id}/battery-series. The BLE telemetry sampler
+  // polls every 60s in Active mode, so a 30-min drive has ~30 samples.
+  // For each scrubber tick we look up the most recent sample at or
+  // before the current point's wall-clock time — battery changes in
+  // discrete steps, not smoothly, so step-lookup beats interpolation.
+  // Omit the prop (or pass an empty array) to skip the battery row.
+  batterySeries?: BatteryPoint[]
+}
+
+export interface BatteryPoint {
+  ts: number      // unix ms
+  batteryPct?: number
 }
 
 const TILES = {
@@ -19,6 +39,12 @@ const TILES = {
   satellite:
     "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
 } as const
+
+// CartoDB "labels only" overlay — transparent tiles with street + place
+// names, drawn on top of the satellite base so the user can actually
+// read the map. Dark/streets already include labels in their base tile.
+const SATELLITE_LABELS_URL =
+  "https://{s}.basemaps.cartocdn.com/rastertiles/voyager_only_labels/{z}/{x}/{y}{r}.png"
 
 type Style = keyof typeof TILES
 
@@ -70,10 +96,123 @@ function fsdEventIcon(kind: "disengagement" | "accel_push") {
   })
 }
 
-export function DriveMap({ points, fsdStates, fsdEvents, showEvents = true, source }: DriveMapProps) {
+// SVG markup for the steering-wheel glyph in the playback info card.
+// Three spokes (top, lower-left, lower-right) sketch a Tesla-yoke look
+// in a 24-viewBox stroke-only icon — colour comes from CSS currentColor.
+const WHEEL_SVG =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="14" height="14">' +
+  '<circle cx="12" cy="12" r="9"/>' +
+  '<circle cx="12" cy="12" r="2"/>' +
+  '<line x1="12" y1="3" x2="12" y2="10"/>' +
+  '<line x1="4.5" y1="16.5" x2="10" y2="13"/>' +
+  '<line x1="19.5" y1="16.5" x2="14" y2="13"/>' +
+  "</svg>"
+
+const MPS_TO_MPH = 2.23694
+const MPS_TO_KPH = 3.6
+
+// Inline-SVG battery icon. Outer rectangle with a small terminal nub
+// on the right; the inner fill rect's width is set inline at call
+// time from the current battery percentage so the visual gauge tracks
+// the playback. `fill="currentColor"` so the CSS pill colour controls
+// the whole glyph.
+function batterySVG(pct: number): string {
+  // Inner fill spans x=3..x=18 (15 units wide max) and is proportional
+  // to pct. clamp so out-of-range readings can't blow past the bounds.
+  const fillW = Math.max(0, Math.min(15, (pct / 100) * 15))
+  return (
+    '<svg viewBox="0 0 22 12" width="18" height="10" fill="none" stroke="currentColor" stroke-width="1.2">' +
+    '<rect x="1" y="1" width="18" height="10" rx="2"/>' +
+    `<rect x="3" y="3" width="${fillW.toFixed(2)}" height="6" rx="1" fill="currentColor" stroke="none"/>` +
+    '<rect x="20" y="4" width="2" height="4" rx="0.5" fill="currentColor" stroke="none"/>' +
+    "</svg>"
+  )
+}
+
+// Build the HTML body of the playback tooltip for the given scrubber
+// index. Returns a string so Leaflet's `tooltip.setContent` can swap
+// it on every tick without paying React-reconciliation cost.
+function renderPlaybackHTML(
+  pt: [number, number, number, number] | undefined,
+  fsd: number | undefined,
+  baseMs: number,
+  metric: boolean,
+  battery: number | undefined,
+): string {
+  if (!pt) return ""
+  const speedMps = pt[3] ?? 0
+  const speed = Math.round(metric ? speedMps * MPS_TO_KPH : speedMps * MPS_TO_MPH)
+  const unit = metric ? "km/h" : "mph"
+  const time = Number.isFinite(baseMs)
+    ? new Date(baseMs + pt[2]).toLocaleTimeString([], {
+        hour: "numeric",
+        minute: "2-digit",
+        second: "2-digit",
+      })
+    : ""
+  const isFsd = (fsd ?? 0) > 0
+  const wheelClass = isFsd
+    ? "playback-info__wheel playback-info__wheel--fsd"
+    : "playback-info__wheel"
+  const wheelTitle = isFsd ? "FSD engaged" : "Manual driving"
+  const batteryHtml =
+    battery !== undefined && Number.isFinite(battery)
+      ? `<span class="playback-info__battery" aria-label="Battery ${Math.round(battery)}%">` +
+        `${batterySVG(battery)}${Math.round(battery)}%</span>`
+      : ""
+  return (
+    `<div class="playback-info__time">${time}</div>` +
+    `<div class="playback-info__row">` +
+    `<span class="playback-info__speed">${speed} ${unit}</span>` +
+    `<span class="${wheelClass}" title="${wheelTitle}" aria-label="${wheelTitle}">${WHEEL_SVG}</span>` +
+    batteryHtml +
+    `</div>`
+  )
+}
+
+// Step-lookup of the most recent battery sample at or before
+// `currentMs`. Battery changes in 1% steps and the sampler runs
+// at 60s cadence — linear interpolation would invent values
+// between samples, so we use the latest sample as the canonical
+// reading at the scrubber's wall-clock time. Falls back to the
+// first sample when the scrubber is before any sample (so the card
+// always shows something once the series has loaded). Returns
+// undefined when the series is empty or the value is NULL.
+function lookupBatteryAt(
+  series: BatteryPoint[] | undefined,
+  currentMs: number,
+): number | undefined {
+  if (!series || series.length === 0) return undefined
+  // Series is ASC-ordered by ts (the backend's ORDER BY ts ASC).
+  // Walk backwards to find the latest sample with ts <= currentMs.
+  // A binary search would be theoretically nicer; for ~30 samples
+  // on a typical drive the linear scan is cheaper than the branch.
+  for (let i = series.length - 1; i >= 0; i--) {
+    if (series[i].ts <= currentMs) return series[i].batteryPct
+  }
+  // currentMs is before every sample (e.g. scrubber at frame 0,
+  // first sample arrived a few seconds in). Show the earliest
+  // reading rather than nothing — battery doesn't jump in 60s.
+  return series[0].batteryPct
+}
+
+export function DriveMap({
+  points,
+  fsdStates,
+  fsdEvents,
+  showEvents = true,
+  source,
+  startTime,
+  metric = false,
+  batterySeries,
+}: DriveMapProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const mapRef = useRef<L.Map | null>(null)
   const tileRef = useRef<L.TileLayer | null>(null)
+  // Transparent labels layer drawn on top of satellite imagery so place
+  // and street names remain readable. Only attached in the "satellite"
+  // style; the dark/streets base tiles already include labels.
+  const labelsRef = useRef<L.TileLayer | null>(null)
   const pulseRef = useRef<L.Marker | null>(null)
   const eventsLayerRef = useRef<L.LayerGroup | null>(null)
   const [style, setStyle] = useState<Style>("dark")
@@ -139,12 +278,41 @@ export function DriveMap({ points, fsdStates, fsdEvents, showEvents = true, sour
     // canvas-rendered polylines.
     L.marker(latLngs[0], { icon: startMarkerIcon(), interactive: false }).addTo(map)
     L.marker(latLngs[latLngs.length - 1], { icon: endMarkerIcon(), interactive: false }).addTo(map)
+    // The pulse marker MUST be interactive so the bound tooltip can
+    // open via openTooltip() — Leaflet refuses to open tooltips on
+    // non-interactive markers. We still set keyboard:false so it
+    // doesn't capture tab focus.
     pulseRef.current = L.marker(latLngs[0], {
       icon: pulseMarkerIcon(),
-      interactive: false,
+      interactive: true,
       keyboard: false,
       zIndexOffset: 1000,
     }).addTo(map)
+
+    // Playback info card — permanent tooltip floating next to the
+    // pulse marker. Bound once here, content swapped on each scrubber
+    // tick by the dedicated effect below. Position "right" so the
+    // card sits beside the pulse rather than covering it; Leaflet
+    // auto-flips when it would go off the map edge.
+    const baseMs = startTime ? new Date(startTime).getTime() : NaN
+    const firstPointMs = Number.isFinite(baseMs) ? baseMs + points[0][2] : NaN
+    const initialBattery = lookupBatteryAt(batterySeries, firstPointMs)
+    const initialHtml = renderPlaybackHTML(
+      points[0],
+      fsdStates?.[0],
+      baseMs,
+      metric,
+      initialBattery,
+    )
+    pulseRef.current
+      .bindTooltip(initialHtml, {
+        permanent: true,
+        direction: "right",
+        offset: [10, 0],
+        className: "playback-info-tooltip",
+        opacity: 1,
+      })
+      .openTooltip()
 
     eventsLayerRef.current = L.layerGroup().addTo(map)
     map.fitBounds(L.latLngBounds(latLngs), { padding: [24, 24], maxZoom: 16 })
@@ -153,6 +321,7 @@ export function DriveMap({ points, fsdStates, fsdEvents, showEvents = true, sour
       map.remove()
       mapRef.current = null
       tileRef.current = null
+      labelsRef.current = null
       pulseRef.current = null
       eventsLayerRef.current = null
     }
@@ -163,6 +332,19 @@ export function DriveMap({ points, fsdStates, fsdEvents, showEvents = true, sour
     if (!map || !tileRef.current) return
     map.removeLayer(tileRef.current)
     tileRef.current = L.tileLayer(TILES[style], { maxZoom: 19 }).addTo(map)
+    // Manage the satellite labels overlay: attach on switch-to-satellite,
+    // remove on switch-away. Pane "shadowPane" keeps it above the
+    // base tiles but below polylines and markers.
+    if (labelsRef.current) {
+      map.removeLayer(labelsRef.current)
+      labelsRef.current = null
+    }
+    if (style === "satellite") {
+      labelsRef.current = L.tileLayer(SATELLITE_LABELS_URL, {
+        maxZoom: 19,
+        pane: "shadowPane",
+      }).addTo(map)
+    }
   }, [style])
 
   useEffect(() => {
@@ -187,7 +369,25 @@ export function DriveMap({ points, fsdStates, fsdEvents, showEvents = true, sour
     if (!pulse || points.length === 0) return
     const i = Math.min(points.length - 1, Math.max(0, currentIndex))
     pulse.setLatLng(L.latLng(points[i][0], points[i][1]))
-  }, [currentIndex, points])
+    // Refresh the playback info card to match the new position.
+    // setContent on an attached Leaflet tooltip patches its innerHTML
+    // in place — no React render, no marker rebind, no map redraw.
+    const tooltip = pulse.getTooltip()
+    if (tooltip) {
+      const baseMs = startTime ? new Date(startTime).getTime() : NaN
+      const pointMs = Number.isFinite(baseMs) ? baseMs + points[i][2] : NaN
+      const battery = lookupBatteryAt(batterySeries, pointMs)
+      tooltip.setContent(
+        renderPlaybackHTML(
+          points[i],
+          fsdStates?.[i],
+          baseMs,
+          metric,
+          battery,
+        ),
+      )
+    }
+  }, [currentIndex, points, fsdStates, startTime, metric, batterySeries])
 
   const cycleStyle = () => {
     setStyle((s) => (s === "dark" ? "streets" : s === "streets" ? "satellite" : "dark"))
