@@ -8,6 +8,41 @@ use rust_embed::{Embed, EmbeddedFile};
 #[folder = "static/"]
 struct StaticFiles;
 
+/// Hand-rolled MIME table. The full `mime_guess` crate ships a
+/// thousands-entry generated database we don't need — we serve a
+/// closed set of extensions out of the embedded SPA bundle plus its
+/// pre-compressed siblings. Fallback is `application/octet-stream`,
+/// which is the same default `mime_guess::first_or_octet_stream()`
+/// would have returned.
+fn mime_for(path: &str) -> &'static str {
+    // For the pre-compressed siblings the MIME of the *original*
+    // resource is what we advertise; Content-Encoding handles the
+    // wrapping. `foo.js.br` → `application/javascript`.
+    let stem = path
+        .strip_suffix(".br")
+        .or_else(|| path.strip_suffix(".gz"))
+        .unwrap_or(path);
+    let ext = stem.rsplit('.').next().unwrap_or("");
+    match ext {
+        "html" | "htm" => "text/html; charset=utf-8",
+        "js" | "mjs" => "application/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "json" | "map" => "application/json; charset=utf-8",
+        "svg" => "image/svg+xml",
+        "woff2" => "font/woff2",
+        "woff" => "font/woff",
+        "ttf" => "font/ttf",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "ico" => "image/x-icon",
+        "gif" => "image/gif",
+        "txt" => "text/plain; charset=utf-8",
+        "wasm" => "application/wasm",
+        _ => "application/octet-stream",
+    }
+}
+
 /// SPA fallback handler: serve static files or index.html for client-side
 /// routing. Sets caching headers so repeat page loads don't re-download the
 /// JS bundle from a car parked outside on flaky WiFi:
@@ -90,10 +125,9 @@ fn serve_embedded(
         }
     }
 
-    let mime = mime_guess::from_path(path).first_or_octet_stream();
     let mut resp = Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, mime.as_ref())
+        .header(header::CONTENT_TYPE, mime_for(path))
         .header(header::CACHE_CONTROL, cache_control)
         .header(header::ETAG, &etag);
     if let Some(enc) = encoding {
