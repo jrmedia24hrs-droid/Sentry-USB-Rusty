@@ -147,18 +147,19 @@ jobs:
         # the target-cpu override and inherit whatever rustc's default is
         # (no per-CPU tuning for armv6; one binary covers Pi Zero W and Pi 1).
         #
-        # `-fuse-ld=mold` swaps GNU `ld` for the mold linker — drop-in
-        # compatible, ~5-10× faster link step. Output binary is
-        # byte-identical to a GNU-ld link; runtime unchanged. Save
+        # `mold -run` wraps the build so mold intercepts every linker
+        # invocation in the subprocess tree — including the cross-
+        # compiler's `aarch64-linux-gnu-gcc -> ld` call. `-fuse-ld=mold`
+        # on RUSTFLAGS doesn't work here because cross-compilers don't
+        # find `ld.mold` in their search paths. Output binary is
+        # byte-identical to a GNU-ld link; runtime unchanged. Saves
         # ~30-60 s per CI run across the matrix.
         run: |
-          RUSTFLAGS="-C link-arg=-fuse-ld=mold"
           if [ -n "${{ matrix.cpu }}" ]; then
-              RUSTFLAGS="$RUSTFLAGS -C target-cpu=${{ matrix.cpu }}"
+              export RUSTFLAGS="-C target-cpu=${{ matrix.cpu }}"
           fi
-          export RUSTFLAGS
-          cargo build --release --target ${{ matrix.target }} -p sentryusb
-          cargo build --release --target ${{ matrix.target }} -p sentryusb-tesla-telemetry
+          mold -run cargo build --release --target ${{ matrix.target }} -p sentryusb
+          mold -run cargo build --release --target ${{ matrix.target }} -p sentryusb-tesla-telemetry
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
           CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: ${{ matrix.linker }}

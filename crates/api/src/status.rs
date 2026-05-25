@@ -56,7 +56,7 @@ struct CachedNetwork {
 /// value the UI also shows is always exact.
 ///
 /// /proc/net/wireless format:
-/// ```
+/// ```text
 /// Inter-| sta-|   Quality        |   Discarded packets               | Missed | WE
 ///  face | tus | link level noise |  nwid  crypt   frag  retry   misc | beacon | 22
 ///  wlan0: 0000   58.  -52.  -256        0      0      0      0    137        0
