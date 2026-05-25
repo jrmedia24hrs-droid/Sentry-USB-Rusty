@@ -65,7 +65,8 @@ pub async fn get_setup_status(State(_s): State<AppState>) -> (StatusCode, Json<s
 }
 
 /// GET /api/setup/config
-pub async fn get_setup_config(State(_s): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
+pub async fn get_setup_config(State(_s): State<AppState>) -> axum::response::Response {
+    use axum::response::IntoResponse;
     let config_path = sentryusb_config::find_config_path();
     match sentryusb_config::parse_file(config_path) {
         Ok((active, commented)) => {
@@ -82,9 +83,18 @@ pub async fn get_setup_config(State(_s): State<AppState>) -> (StatusCode, Json<s
                     "active": true,
                 }));
             }
-            (StatusCode::OK, Json(serde_json::Value::Object(merged)))
+            // Config only changes when the wizard / raw editor PUTs.
+            // A short 30s cache lets the Dashboard skip the round
+            // trip on quick navigations without hiding edits for
+            // long.
+            (
+                StatusCode::OK,
+                [(axum::http::header::CACHE_CONTROL, "private, max-age=30")],
+                Json(serde_json::Value::Object(merged)),
+            )
+                .into_response()
         }
-        Err(e) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to read config: {}", e)),
+        Err(e) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to read config: {}", e)).into_response(),
     }
 }
 

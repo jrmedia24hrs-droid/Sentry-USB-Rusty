@@ -336,7 +336,7 @@ pub async fn speedtest(State(_s): State<AppState>) -> impl IntoResponse {
 }
 
 /// GET /api/system/rtc-status
-pub async fn get_rtc_status(State(_s): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
+pub async fn get_rtc_status(State(_s): State<AppState>) -> impl IntoResponse {
     let rtc_exists = std::path::Path::new("/dev/rtc0").exists();
     let mut rtc_time = String::new();
     if rtc_exists {
@@ -344,10 +344,17 @@ pub async fn get_rtc_status(State(_s): State<AppState>) -> (StatusCode, Json<ser
             rtc_time = out.trim().to_string();
         }
     }
-    (StatusCode::OK, Json(serde_json::json!({
-        "available": rtc_exists,
-        "time": rtc_time,
-    })))
+    // RTC presence is a hardware fact that doesn't change at runtime.
+    // The Dashboard hits this on every load — let the browser short-
+    // circuit subsequent requests for 5 min and save a round trip.
+    (
+        StatusCode::OK,
+        [(axum::http::header::CACHE_CONTROL, "private, max-age=300")],
+        Json(serde_json::json!({
+            "available": rtc_exists,
+            "time": rtc_time,
+        })),
+    )
 }
 
 /// GET /api/system/clock-status
@@ -376,7 +383,7 @@ pub async fn get_rtc_status(State(_s): State<AppState>) -> (StatusCode, Json<ser
 /// ```
 pub async fn get_clock_status(
     State(_s): State<AppState>,
-) -> (StatusCode, Json<serde_json::Value>) {
+) -> impl IntoResponse {
     let ntp_synced =
         std::path::Path::new("/run/systemd/timesync/synchronized").exists();
     let secs = std::time::SystemTime::now()
@@ -388,8 +395,12 @@ pub async fn get_clock_status(
     let synced = ntp_synced || year_looks_recent;
     let has_rtc = std::path::Path::new("/dev/rtc0").exists();
 
+    // NTP sync state flips at most a handful of times per boot. A 10s
+    // cache cuts repeat polling without hiding state changes that
+    // matter to the BLE warning UI.
     (
         StatusCode::OK,
+        [(axum::http::header::CACHE_CONTROL, "private, max-age=10")],
         Json(serde_json::json!({
             "synced": synced,
             "has_rtc": has_rtc,
@@ -403,11 +414,17 @@ pub async fn get_clock_status(
 }
 
 /// GET /api/system/ssh-pubkey
-pub async fn get_ssh_pubkey(State(_s): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
+pub async fn get_ssh_pubkey(State(_s): State<AppState>) -> impl IntoResponse {
     let pub_key = std::fs::read_to_string("/root/.ssh/id_ed25519.pub")
         .or_else(|_| std::fs::read_to_string("/root/.ssh/id_rsa.pub"))
         .unwrap_or_default();
-    (StatusCode::OK, Json(serde_json::json!({"public_key": pub_key.trim()})))
+    // The pubkey only changes when generate_ssh_key runs; cache an
+    // hour and let users explicitly reload when they regenerate.
+    (
+        StatusCode::OK,
+        [(axum::http::header::CACHE_CONTROL, "private, max-age=3600")],
+        Json(serde_json::json!({"public_key": pub_key.trim()})),
+    )
 }
 
 /// POST /api/system/ssh-keygen
