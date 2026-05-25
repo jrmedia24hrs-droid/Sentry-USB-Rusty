@@ -187,12 +187,24 @@ pub async fn single_drive(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let tags = state.drives.store.get_all_drive_tags().unwrap_or_default();
 
-    let (idx, files) = match state
+    // Resolve the drive id to (idx, files) AND grab the canonical
+    // DriveSummary the list view emits, in a single summary pass. We
+    // overlay the summary's headline aggregates onto the full Drive so
+    // the detail page can't disagree with the list on FSD %, distance,
+    // etc. — the two are computed via different algorithms (point walk
+    // vs per-clip aggregate sum) and drift ~0.1–0.5 % otherwise.
+    let (idx, files, summary) = match state
         .drives
         .store
-        .with_route_summaries(|summaries| grouper::find_drive_files(summaries, &id))
-    {
-        Ok(Some((i, f))) => (i, f),
+        .with_route_summaries(|summaries| {
+            let resolved = grouper::find_drive_files(summaries, &id);
+            let summary =
+                resolved
+                    .as_ref()
+                    .and_then(|(i, _)| grouper::build_summary_for_idx(summaries, *i, &tags));
+            resolved.map(|(i, f)| (i, f, summary))
+        }) {
+        Ok(Some((i, f, s))) => (i, f, s),
         Ok(None) => {
             return crate::json_error(
                 StatusCode::NOT_FOUND,
@@ -214,10 +226,39 @@ pub async fn single_drive(
             grouper::build_single_drive_from_clips(routes, idx as i32, &tags),
         )
     }) {
-        Ok((_, Some(drive))) => (
-            StatusCode::OK,
-            Json(serde_json::to_value(drive).unwrap_or_default()),
-        ),
+        Ok((_, Some(mut drive))) => {
+            if let Some(s) = summary.as_ref() {
+                // Overlay the headline numbers from the canonical
+                // aggregate path. Per-point data (points, fsd_states,
+                // fsd_events) stays from build_drive_stats — those
+                // need the full BLOB walk.
+                drive.distance_mi = s.distance_mi;
+                drive.distance_km = s.distance_km;
+                drive.avg_speed_mph = s.avg_speed_mph;
+                drive.max_speed_mph = s.max_speed_mph;
+                drive.avg_speed_kmh = s.avg_speed_kmh;
+                drive.max_speed_kmh = s.max_speed_kmh;
+                drive.fsd_engaged_ms = s.fsd_engaged_ms;
+                drive.fsd_disengagements = s.fsd_disengagements;
+                drive.fsd_accel_pushes = s.fsd_accel_pushes;
+                drive.fsd_percent = s.fsd_percent;
+                drive.fsd_distance_km = s.fsd_distance_km;
+                drive.fsd_distance_mi = s.fsd_distance_mi;
+                drive.autosteer_engaged_ms = s.autosteer_engaged_ms;
+                drive.autosteer_percent = s.autosteer_percent;
+                drive.autosteer_distance_km = s.autosteer_distance_km;
+                drive.autosteer_distance_mi = s.autosteer_distance_mi;
+                drive.tacc_engaged_ms = s.tacc_engaged_ms;
+                drive.tacc_percent = s.tacc_percent;
+                drive.tacc_distance_km = s.tacc_distance_km;
+                drive.tacc_distance_mi = s.tacc_distance_mi;
+                drive.assisted_percent = s.assisted_percent;
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::to_value(drive).unwrap_or_default()),
+            )
+        }
         Ok((rows_fetched, None)) => crate::json_error(
             StatusCode::NOT_FOUND,
             &format!(

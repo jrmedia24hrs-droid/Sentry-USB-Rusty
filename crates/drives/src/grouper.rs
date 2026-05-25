@@ -214,6 +214,30 @@ pub fn find_drive_files(
     None
 }
 
+/// Build the same `DriveSummary` the Drives list would emit for the
+/// drive at `idx`, using the BLOB-free aggregate path. The single-drive
+/// API handler uses this to overlay the canonical headline percentages
+/// (FSD %, autopilot %, TACC %, distances) onto its full `Drive`
+/// response, so the number shown on the detail page matches the list
+/// down to the rounding digit. Without this overlay the two paths
+/// drift ~0.1–0.5 % because `build_drive_stats` walks the merged points
+/// with outlier filtering while `build_summary_from_aggregates` sums
+/// per-clip pre-computed columns — same data, different algorithm.
+///
+/// Returns `None` when `idx` is out of range.
+pub fn build_summary_for_idx(
+    summaries: &[RouteSummary],
+    idx: usize,
+    tags: &HashMap<String, Vec<String>>,
+) -> Option<DriveSummary> {
+    let groups = group_summary_clips(summaries);
+    let clips = groups.get(idx)?;
+    if clips.is_empty() {
+        return None;
+    }
+    Some(build_summary_from_aggregates(clips, idx, tags))
+}
+
 /// Resolve a drive id to the canonical start_time string used as the
 /// `drive_tags.drive_key` join key.
 ///
@@ -1164,7 +1188,15 @@ fn build_drive_stats(
         0.0
     };
 
-    // Build point data array: [lat, lng, timeMs, speedMps]
+    // Build point data array: [lat, lng, timeMs, speedMps].
+    //
+    // `timeMs` is **relative** to the drive's start_time (ms since the
+    // drive began). The frontend reconstructs absolute wall-clock time
+    // via `new Date(start_time) + timeMs`, which only works when the
+    // offset is relative — emitting Unix-ms here caused the scrubber
+    // and map info card to display garbage (off by the local timezone
+    // offset, because the doubled epoch wrapped around modulo 24h).
+    let drive_start_ms = start_time.and_utc().timestamp_millis() as f64;
     let mut point_data: Vec<[f64; 4]> = Vec::with_capacity(all_points.len());
     let mut gear_states: Vec<i32> = Vec::with_capacity(all_points.len());
     let mut fsd_states: Vec<i32> = Vec::with_capacity(all_points.len());
@@ -1190,7 +1222,7 @@ fn build_drive_stats(
         } else {
             0.0
         };
-        point_data.push([p.lat, p.lng, p.time_ms, round2(speed)]);
+        point_data.push([p.lat, p.lng, p.time_ms - drive_start_ms, round2(speed)]);
         gear_states.push(p.gear as i32);
         if p.gear != GEAR_PARK {
             has_gear_data = true;
