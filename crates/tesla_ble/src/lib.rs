@@ -2,8 +2,10 @@
 
 pub mod body_controller;
 pub mod gatt;
+pub mod keys;
 pub mod local_name;
 pub mod scan;
+pub mod session;
 pub mod transport;
 
 pub mod proto {

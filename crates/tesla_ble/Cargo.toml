@@ -18,6 +18,10 @@ path = "examples/scan.rs"
 name = "body_controller"
 path = "examples/body_controller.rs"
 
+[[example]]
+name = "session_info"
+path = "examples/session_info.rs"
+
 [dependencies]
 tokio = { workspace = true }
 anyhow = { workspace = true }
@@ -32,6 +36,11 @@ hex = "0.4"
 uuid = "1"
 rand = "0.8"
 
+# NIST P-256 ECDH for the session handshake.
+# `pem` reads the on-disk private key file Tesla pairing produced.
+p256 = { version = "0.13", features = ["ecdh", "pem", "pkcs8"] }
+pem = "3"
+
 [build-dependencies]
 prost-build = "0.13"
 # Vendored protoc so users don't need to apt install protobuf-compiler.
@@ -39,3 +48,4 @@ protoc-bin-vendored = "3"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tempfile = "3"
