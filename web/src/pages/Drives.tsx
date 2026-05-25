@@ -4,6 +4,7 @@ import { bulkDeleteDrives, setDriveTags } from "@/api/drives"
 import { cn } from "@/lib/utils"
 import { DriveRow } from "@/components/drives/DriveRow"
 import { DrivesActionsBar } from "@/components/drives/DrivesActionsBar"
+import { DrivesSummaryStrip } from "@/components/drives/DrivesSummaryStrip"
 import { DrivesToolbar } from "@/components/drives/DrivesToolbar"
 import { Pagination } from "@/components/drives/Pagination"
 import { useDrivesList } from "@/hooks/useDrivesList"
@@ -129,9 +130,18 @@ export default function Drives() {
 
   return (
     <div className="mx-auto w-full max-w-5xl px-4 py-6 sm:px-6 sm:py-8">
-      <div className="mb-4 flex flex-wrap items-center justify-between gap-3 sm:mb-6">
+      <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
         <h1 className="text-2xl font-semibold text-slate-100 sm:text-3xl">Drives</h1>
         <DrivesActionsBar onChanged={list.refresh} />
+      </div>
+
+      <div className="mb-4 sm:mb-6">
+        <DrivesSummaryStrip
+          stats={list.filteredStats}
+          range={list.range}
+          loading={list.loading}
+          metric={metric}
+        />
       </div>
 
       <DrivesToolbar
