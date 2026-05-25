@@ -157,9 +157,11 @@ pub fn maybe_set_clock_from_vehicle(
     // root so this works.
     let secs = corrected_target_ms / 1000;
     let ms_remainder = corrected_target_ms % 1000;
+    // `tv_nsec` is `i64` on x86_64 Linux but `i32` on aarch64 — use
+    // libc::c_long so this compiles cleanly on both.
     let ts = libc::timespec {
         tv_sec: secs as libc::time_t,
-        tv_nsec: (ms_remainder * 1_000_000) as i64,
+        tv_nsec: (ms_remainder * 1_000_000) as libc::c_long,
     };
     let rc = unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &ts) };
     if rc != 0 {
