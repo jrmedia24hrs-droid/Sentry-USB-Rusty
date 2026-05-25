@@ -114,9 +114,13 @@ interface TirePressureCardProps {
   // is now pure rendering.
   data: TireHistoryResponse
   days?: number
+  // When true, render only the chart (no glass-card frame, no
+  // header, no latest-chip strip). Used by CarStatusCard which
+  // owns the chrome and embeds the chart as its expanded view.
+  chartOnly?: boolean
 }
 
-export function TirePressureCard({ data, days = 30 }: TirePressureCardProps) {
+export function TirePressureCard({ data, days = 30, chartOnly = false }: TirePressureCardProps) {
 
   // Latest reading per tire for the header strip — rendered inline
   // beside the title so the card stays compact for the dashboard
@@ -141,29 +145,8 @@ export function TirePressureCard({ data, days = 30 }: TirePressureCardProps) {
     return out
   }, [data])
 
-  return (
-    <div className="glass-card p-4">
-      <div className="mb-3 flex flex-wrap items-center gap-3">
-        <span className="tile-icon halo-blue">
-          <Disc className="h-4 w-4" />
-        </span>
-        <div className="min-w-0">
-          <div className="text-sm font-semibold text-slate-100">
-            Tire pressure
-          </div>
-          <div className="text-[11px] uppercase tracking-wider text-slate-500">
-            Last {days} days
-          </div>
-        </div>
-        <div className="ml-auto flex flex-wrap gap-3 text-xs tabular-nums text-slate-300">
-          <LatestChip label="FL" value={latest.fl} color={TIRE_COLORS.fl} />
-          <LatestChip label="FR" value={latest.fr} color={TIRE_COLORS.fr} />
-          <LatestChip label="RL" value={latest.rl} color={TIRE_COLORS.rl} />
-          <LatestChip label="RR" value={latest.rr} color={TIRE_COLORS.rr} />
-        </div>
-      </div>
-
-      <div className="h-72 w-full" aria-label="Tire pressure chart">
+  const chart = (
+    <div className="h-72 w-full" aria-label="Tire pressure chart">
           <ResponsiveContainer minHeight={0} minWidth={0}>
             <LineChart
               data={data.points}
@@ -290,6 +273,36 @@ export function TirePressureCard({ data, days = 30 }: TirePressureCardProps) {
             </LineChart>
           </ResponsiveContainer>
       </div>
+  )
+
+  if (chartOnly) {
+    // Embedded use (e.g. inside CarStatusCard) — caller owns the
+    // surrounding chrome. Render just the chart.
+    return chart
+  }
+
+  return (
+    <div className="glass-card p-4">
+      <div className="mb-3 flex flex-wrap items-center gap-3">
+        <span className="tile-icon halo-blue">
+          <Disc className="h-4 w-4" />
+        </span>
+        <div className="min-w-0">
+          <div className="text-sm font-semibold text-slate-100">
+            Tire pressure
+          </div>
+          <div className="text-[11px] uppercase tracking-wider text-slate-500">
+            Last {days} days
+          </div>
+        </div>
+        <div className="ml-auto flex flex-wrap gap-3 text-xs tabular-nums text-slate-300">
+          <LatestChip label="FL" value={latest.fl} color={TIRE_COLORS.fl} />
+          <LatestChip label="FR" value={latest.fr} color={TIRE_COLORS.fr} />
+          <LatestChip label="RL" value={latest.rl} color={TIRE_COLORS.rl} />
+          <LatestChip label="RR" value={latest.rr} color={TIRE_COLORS.rr} />
+        </div>
+      </div>
+      {chart}
     </div>
   )
 }

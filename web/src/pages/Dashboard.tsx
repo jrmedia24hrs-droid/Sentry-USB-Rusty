@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, lazy, Suspense } from "react"
+import { useEffect, useRef, useState } from "react"
 import { Link } from "react-router-dom"
 import {
   Thermometer,
@@ -25,21 +25,15 @@ import type { PiStatus, DriveStats, StorageBreakdown } from "@/lib/api"
 import { wsClient } from "@/lib/ws"
 import { formatUptime, formatBytes, formatTemp } from "@/lib/utils"
 import { CloudStatusBar } from "@/components/CloudStatusBar"
+import {
+  CarStatusCard,
+  type CarStatusSample,
+} from "@/components/dashboard/CarStatusCard"
 import { StatusTile, Row, TileDivider } from "@/components/ui/StatusTile"
 import { BannerStack, type BannerItem } from "@/components/ui/Banner"
 import { Pill, LiveDot } from "@/components/ui/Pill"
 import type { Halo } from "@/components/ui/StatusTile"
 import type { TireHistoryResponse } from "@/components/dashboard/TirePressureCard"
-
-// Lazy so recharts (380 KB raw / 111 KB gz) stays out of the
-// Dashboard's initial dependency graph for users without tire
-// telemetry. Dashboard probes the tire-history endpoint first; only
-// when samples exist does the card mount and pull vendor-charts in.
-const TirePressureCard = lazy(() =>
-  import("@/components/dashboard/TirePressureCard").then((m) => ({
-    default: m.TirePressureCard,
-  })),
-)
 
 function getTempHalo(milliC: number): Halo {
   if (milliC <= 0) return "blue"
@@ -139,6 +133,14 @@ export default function Dashboard() {
   // The card stays unmounted until points.length > 0, so vendor-charts
   // never loads for users without Tesla BLE telemetry.
   const [tireHistory, setTireHistory] = useState<TireHistoryResponse | null>(null)
+  // Latest BLE-derived car-state snapshot for the CarStatusCard.
+  // Polled at 30s — the BLE sampler itself runs once a minute while
+  // parked + awake, so anything faster on the UI side is wasted.
+  const [carStatusSample, setCarStatusSample] = useState<CarStatusSample | null>(null)
+  // ISO end-time of the latest drive on record — used to derive the
+  // "Parked Xh Ym" duration. One-shot fetch on mount + a refresh
+  // when a drive-process WebSocket completion comes in.
+  const [latestDriveEnd, setLatestDriveEnd] = useState<string | null>(null)
 
   const archiveHistoryRef = useRef<ProgressSample[]>([])
   const processHistoryRef = useRef<ProgressSample[]>([])
@@ -243,6 +245,41 @@ export default function Dashboard() {
       .then((d: TireHistoryResponse) => { if (mounted) setTireHistory(d) })
       .catch(() => { if (mounted) setTireHistory({ points: [], days: 30 }) })
 
+    // Latest BLE sample drives the CarStatusCard's battery + temps +
+    // tire-health summary. Hide-on-error since this is purely an
+    // overview tile; the user can still pair BLE from Settings.
+    async function fetchCarStatusSample() {
+      try {
+        const res = await fetch("/api/system/ble-latest-sample")
+        if (!res.ok) return
+        const d = (await res.json()) as CarStatusSample
+        if (mounted) setCarStatusSample(d)
+      } catch {
+        /* non-critical */
+      }
+    }
+
+    // Most recent drive's end-time → used by CarStatusCard to render
+    // "Parked Xh Ym". The list endpoint is already cached server-side
+    // and returns drives newest-first, so we only need the first row.
+    async function fetchLatestDrive() {
+      try {
+        const res = await fetch("/api/drives")
+        if (!res.ok) return
+        const drives = (await res.json()) as Array<{ endTime?: string }>
+        if (!mounted) return
+        if (Array.isArray(drives) && drives.length > 0 && drives[0].endTime) {
+          setLatestDriveEnd(drives[0].endTime)
+        }
+      } catch {
+        /* non-critical */
+      }
+    }
+
+    fetchCarStatusSample()
+    fetchLatestDrive()
+    const carStatusInterval = setInterval(fetchCarStatusSample, 30_000)
+
     // Status drives the live-tile values (CPU, mem, temp). 2s is fast
     // enough that a glance still feels real-time and halves the
     // server hits vs the previous 1s cadence. The uptime tile uses a
@@ -279,6 +316,7 @@ export default function Dashboard() {
       clearInterval(statsInterval)
       clearInterval(storageInterval)
       clearInterval(uptimeInterval)
+      clearInterval(carStatusInterval)
       unsubscribe()
     }
   }, [])
@@ -399,20 +437,19 @@ export default function Dashboard() {
         {isAwayActive && <AwayModeTile />}
       </div>
 
-      {/* TirePressureCard mounts only when tire data exists — keeps
-          recharts (380 KB) out of the bundle for users without
-          telemetry. Suspense fallback is a slim skeleton so the
-          layout doesn't pop when the chart chunk arrives. */}
-      {tireHistory && tireHistory.points.length > 0 && (
-        <Suspense
-          fallback={
-            <div className="glass-card flex h-72 items-center justify-center p-4 text-sm text-slate-500">
-              Loading tire history…
-            </div>
-          }
-        >
-          <TirePressureCard data={tireHistory} />
-        </Suspense>
+      {/* Car status overview — top of dashboard. Shows last-known
+          battery / cabin temps / tire health as compact chips, with
+          the tire-pressure history chart hidden behind an expand
+          toggle on the Tires chip. The chart bundle (recharts ~380KB)
+          stays unloaded until the user expands it. The whole card is
+          only mounted once we have at least one telemetry sample. */}
+      {carStatusSample && carStatusSample.ts != null && (
+        <CarStatusCard
+          sample={carStatusSample}
+          latestDriveEnd={latestDriveEnd}
+          tireHistory={tireHistory ?? undefined}
+          useFahrenheit={useFahrenheit}
+        />
       )}
     </div>
   )

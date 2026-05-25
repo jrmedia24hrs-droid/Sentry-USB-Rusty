@@ -1,0 +1,258 @@
+import { Suspense, lazy, useEffect, useMemo, useState } from "react"
+import {
+  BatteryMedium,
+  Car,
+  ChevronDown,
+  ChevronUp,
+  Disc,
+  Thermometer,
+} from "lucide-react"
+import type { TireHistoryResponse } from "./TirePressureCard"
+
+// Lazy-load the chart only when the user expands the Tires chip —
+// recharts (380 KB) stays out of the dashboard's initial bundle for
+// users who only glance at the summary.
+const TirePressureCard = lazy(() =>
+  import("./TirePressureCard").then((m) => ({ default: m.TirePressureCard })),
+)
+
+export interface CarStatusSample {
+  ts: number | null
+  battery_pct?: number | null
+  interior_temp_c?: number | null
+  exterior_temp_c?: number | null
+  tire_fl_psi?: number | null
+  tire_fr_psi?: number | null
+  tire_rl_psi?: number | null
+  tire_rr_psi?: number | null
+}
+
+interface CarStatusCardProps {
+  sample: CarStatusSample | null
+  // ISO end-time of the most recent drive — used to derive
+  // "Parked Xh Ym". When the value is null the duration row is
+  // hidden (no drives recorded yet).
+  latestDriveEnd: string | null
+  // Tire history for the expandable chart. Pass undefined to hide
+  // the Tires chip's expand affordance entirely (e.g. no telemetry).
+  tireHistory?: TireHistoryResponse
+  useFahrenheit: boolean
+}
+
+type TireStatus =
+  | { kind: "optimal"; label: string; color: string }
+  | { kind: "check"; label: string; color: string }
+  | { kind: "unsafe"; label: string; color: string }
+  | { kind: "none"; label: string; color: string }
+
+function deriveTireStatus(sample: CarStatusSample | null): TireStatus {
+  if (!sample) return { kind: "none", label: "—", color: "text-slate-500" }
+  const values = [
+    sample.tire_fl_psi,
+    sample.tire_fr_psi,
+    sample.tire_rl_psi,
+    sample.tire_rr_psi,
+  ].filter((v): v is number => typeof v === "number")
+  if (values.length === 0) {
+    return { kind: "none", label: "—", color: "text-slate-500" }
+  }
+  // Mirrors the zone thresholds the chart uses: optimal 36–45,
+  // warning bands 28–36 and 45–50, unsafe outside that.
+  const anyUnsafe = values.some((v) => v < 28 || v > 50)
+  if (anyUnsafe) {
+    return { kind: "unsafe", label: "Unsafe", color: "text-rose-400" }
+  }
+  const anyWarn = values.some((v) => v < 36 || v > 45)
+  if (anyWarn) {
+    return { kind: "check", label: "Check tires", color: "text-amber-400" }
+  }
+  return { kind: "optimal", label: "Optimal", color: "text-emerald-400" }
+}
+
+function formatDuration(ms: number): string {
+  const totalMin = Math.max(0, Math.floor(ms / 60_000))
+  const d = Math.floor(totalMin / (60 * 24))
+  const h = Math.floor((totalMin - d * 60 * 24) / 60)
+  const m = totalMin - d * 24 * 60 - h * 60
+  if (d > 0) return `${d}d ${h}h`
+  if (h > 0) return `${h}h ${m}m`
+  return `${m}m`
+}
+
+function formatTemp(c: number | null | undefined, useFahrenheit: boolean): string {
+  if (c === null || c === undefined) return "—"
+  const value = useFahrenheit ? (c * 9) / 5 + 32 : c
+  const unit = useFahrenheit ? "°F" : "°C"
+  return `${Math.round(value)}${unit}`
+}
+
+/**
+ * Top-of-dashboard car-status overview. Replaces the old
+ * stand-alone tire-pressure card with a single tile that shows the
+ * last-known summary (parked duration, battery, cabin/ambient
+ * temps, tire-health verdict) and reveals the tire-pressure history
+ * chart inline when the user clicks the Tires chip.
+ *
+ * The chart bundle is lazy-loaded — clicking Tires is what pulls it
+ * in, so users who never expand it pay zero recharts cost.
+ */
+export function CarStatusCard({
+  sample,
+  latestDriveEnd,
+  tireHistory,
+  useFahrenheit,
+}: CarStatusCardProps) {
+  const [tiresOpen, setTiresOpen] = useState(false)
+  // Now tick — drives the parked-duration counter forward without
+  // needing to re-render the whole dashboard. 1-minute cadence
+  // matches the granularity of the displayed value ("5h 31m") so
+  // updates aren't wasted. Date.now() lives in the state initialiser
+  // and the interval body, never in render itself (React 19 rule).
+  const [nowMs, setNowMs] = useState(() => Date.now())
+  useEffect(() => {
+    const id = setInterval(() => setNowMs(Date.now()), 60_000)
+    return () => clearInterval(id)
+  }, [])
+
+  // Derived parked duration. We treat "latest drive ended in the
+  // past" as the parked-since timestamp; if there's no recorded
+  // drive yet we just show the state badge without a duration.
+  const parkedDuration = useMemo(() => {
+    if (!latestDriveEnd) return null
+    const t = new Date(latestDriveEnd).getTime()
+    if (!Number.isFinite(t)) return null
+    const delta = nowMs - t
+    if (delta < 60_000) return null
+    return formatDuration(delta)
+  }, [latestDriveEnd, nowMs])
+
+  const tireStatus = deriveTireStatus(sample)
+  const haveTireData =
+    !!tireHistory && tireHistory.points.length > 0 && tireStatus.kind !== "none"
+
+  return (
+    <div className="glass-card p-4">
+      {/* Top row — car state + duration */}
+      <div className="flex items-center gap-3">
+        <span className="tile-icon halo-accent">
+          <Car className="h-4 w-4" />
+        </span>
+        <div className="min-w-0">
+          <div className="text-sm font-semibold text-slate-100">Parked</div>
+          {parkedDuration && (
+            <div className="text-[11px] text-slate-500">{parkedDuration}</div>
+          )}
+        </div>
+      </div>
+
+      {/* Chip row — battery / interior / exterior / tires */}
+      <div className="mt-4 flex flex-wrap items-stretch gap-3">
+        <StatusChip
+          icon={<BatteryMedium className="h-3.5 w-3.5" />}
+          label="Battery"
+          value={
+            sample?.battery_pct !== undefined && sample?.battery_pct !== null
+              ? `${Math.round(sample.battery_pct)}%`
+              : "—"
+          }
+        />
+        <StatusChip
+          icon={<Thermometer className="h-3.5 w-3.5" />}
+          label="Interior"
+          value={formatTemp(sample?.interior_temp_c, useFahrenheit)}
+        />
+        <StatusChip
+          icon={<Thermometer className="h-3.5 w-3.5" />}
+          label="Exterior"
+          value={formatTemp(sample?.exterior_temp_c, useFahrenheit)}
+        />
+        <StatusChip
+          icon={<Disc className="h-3.5 w-3.5" />}
+          label="Tires"
+          value={tireStatus.label}
+          valueClass={tireStatus.color}
+          onClick={haveTireData ? () => setTiresOpen((o) => !o) : undefined}
+          trailing={
+            haveTireData ? (
+              tiresOpen ? (
+                <ChevronUp className="h-3.5 w-3.5 text-slate-500" />
+              ) : (
+                <ChevronDown className="h-3.5 w-3.5 text-slate-500" />
+              )
+            ) : null
+          }
+        />
+      </div>
+
+      {/* Expandable chart — only mounts when the user clicks Tires.
+          Lazy-loaded so users who don't expand never pull recharts. */}
+      {tiresOpen && haveTireData && tireHistory && (
+        <div className="mt-4 border-t border-white/[0.06] pt-4">
+          <div className="mb-2 text-[11px] uppercase tracking-wider text-slate-500">
+            Tire pressure · Last {tireHistory.days} days
+          </div>
+          <Suspense
+            fallback={
+              <div className="flex h-72 items-center justify-center text-sm text-slate-500">
+                Loading tire history…
+              </div>
+            }
+          >
+            <TirePressureCard data={tireHistory} chartOnly />
+          </Suspense>
+        </div>
+      )}
+    </div>
+  )
+}
+
+interface StatusChipProps {
+  icon: React.ReactNode
+  label: string
+  value: string
+  valueClass?: string
+  onClick?: () => void
+  trailing?: React.ReactNode
+}
+
+function StatusChip({
+  icon,
+  label,
+  value,
+  valueClass,
+  onClick,
+  trailing,
+}: StatusChipProps) {
+  const isButton = !!onClick
+  const Wrapper = (isButton ? "button" : "div") as "button" | "div"
+  return (
+    <Wrapper
+      {...(isButton ? { type: "button", onClick } : {})}
+      className={
+        "flex flex-1 min-w-[140px] items-center gap-2.5 rounded-xl border border-white/[0.06] bg-white/[0.025] px-3 py-2 text-left transition-colors " +
+        (isButton ? "hover:bg-white/[0.05] cursor-pointer" : "")
+      }
+    >
+      <span
+        className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-white/[0.04] ring-1 ring-inset ring-white/10 text-slate-300"
+        aria-hidden
+      >
+        {icon}
+      </span>
+      <div className="min-w-0 flex-1">
+        <div className="text-[9px] font-semibold uppercase tracking-wider text-slate-500">
+          {label}
+        </div>
+        <div
+          className={
+            "mt-0.5 text-sm font-semibold tabular-nums leading-tight " +
+            (valueClass ?? "text-slate-100")
+          }
+        >
+          {value}
+        </div>
+      </div>
+      {trailing}
+    </Wrapper>
+  )
+}
