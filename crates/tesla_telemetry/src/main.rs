@@ -93,6 +93,16 @@ const MAX_FAST_RETRIES: u32 = 3;
 /// already awake — we're not adding any wake-up drain.
 const PARKED_AWAKE_REFRESH_INTERVAL: Duration = Duration::from_secs(180);
 
+/// How often to poll `state tire-pressure` while in Quiet mode but
+/// the car is awake. Much rarer than the climate/charge refresh
+/// because TPMS readings genuinely don't change while parked —
+/// 30 min is enough to feed the TPMS dashboard card with periodic
+/// fresh data and to confirm the sensors are still reporting.
+/// Without this, TPMS would only ever update during/right after a
+/// drive (Active mode polls tires every 5 min), and users who
+/// rarely drive would see indefinitely stale numbers.
+const PARKED_AWAKE_TPMS_INTERVAL: Duration = Duration::from_secs(1800);
+
 /// How many consecutive state polls must show shift_state = Park
 /// before we drop into the sleep-safe Quiet mode. 3 polls @ 15s =
 /// 45 s of confirmed Park before we stop hammering the car. Keeps
@@ -259,6 +269,12 @@ async fn main() -> Result<()> {
     // Sentry sessions and charging without dropping the radio-lock
     // dance the deep-sleep Quiet path relies on.
     let mut last_parked_awake_refresh: Option<Instant> = None;
+    // Separate (much rarer) timer for TPMS — TPMS readings don't
+    // change while parked, so we poll them every 30 min in Quiet
+    // rather than every 3 min like climate/charge. Bundled into
+    // the same tick's Sample row when both timers happen to fire
+    // together.
+    let mut last_parked_awake_tpms_refresh: Option<Instant> = None;
 
     // SIGTERM handler — release the radio on shutdown so the iOS
     // GATT daemon can come back up cleanly.
@@ -295,6 +311,7 @@ async fn main() -> Result<()> {
                 let now = Instant::now();
                 schedule = Schedule::new(now);
                 last_parked_awake_refresh = None;
+                last_parked_awake_tpms_refresh = None;
                 // Reset parked_polls so the phase machine flips to
                 // Active even if we'd been in parked-confirmed
                 // Quiet — otherwise the force-poll would only fire
@@ -311,6 +328,7 @@ async fn main() -> Result<()> {
                 &mut last_user_presence,
                 &mut schedule,
                 &mut last_parked_awake_refresh,
+                &mut last_parked_awake_tpms_refresh,
             ) => {
                 tokio::time::sleep(sleep).await;
             }
@@ -347,6 +365,7 @@ async fn tick(
     last_user_presence: &mut Option<bool>,
     schedule: &mut Schedule,
     last_parked_awake_refresh: &mut Option<Instant>,
+    last_parked_awake_tpms_refresh: &mut Option<Instant>,
 ) -> Duration {
     let cfg = match BleConfig::load() {
         Ok(c) => c,
@@ -508,36 +527,66 @@ async fn tick(
             // already covers that path and a state transition is
             // imminent).
             if observation == CarState::Awake && presence_now != Some(true) {
-                let due = last_parked_awake_refresh
+                // Two independent timers in this branch:
+                //   * `refresh_due`   — climate + charge every 3 min
+                //   * `tpms_due`      — tire pressure every 30 min
+                // Either firing opens this poll cycle; both can fire
+                // in the same tick and get bundled into one Sample.
+                let refresh_due = last_parked_awake_refresh
                     .map(|t| t.elapsed() >= PARKED_AWAKE_REFRESH_INTERVAL)
                     .unwrap_or(true);
-                if due {
+                let tpms_due = last_parked_awake_tpms_refresh
+                    .map(|t| t.elapsed() >= PARKED_AWAKE_TPMS_INTERVAL)
+                    .unwrap_or(true);
+
+                if refresh_due || tpms_due {
                     let mut refresh = Sample {
                         ts: sample::now_secs(),
                         source: "state".into(),
                         ..Sample::default()
                     };
                     let mut any_ok = false;
-                    match sample::sample_climate(&cfg.vin, &cfg.adapter).await {
-                        Ok(c) => {
-                            refresh.interior_temp_c = c.interior_temp_c;
-                            refresh.exterior_temp_c = c.exterior_temp_c;
-                            refresh.hvac_on = c.hvac_on;
-                            any_ok = true;
+
+                    if refresh_due {
+                        match sample::sample_climate(&cfg.vin, &cfg.adapter).await {
+                            Ok(c) => {
+                                refresh.interior_temp_c = c.interior_temp_c;
+                                refresh.exterior_temp_c = c.exterior_temp_c;
+                                refresh.hvac_on = c.hvac_on;
+                                any_ok = true;
+                            }
+                            Err(e) => warn!("parked-awake climate refresh failed: {e}"),
                         }
-                        Err(e) => warn!("parked-awake climate refresh failed: {e}"),
-                    }
-                    match sample::sample_charge(&cfg.vin, &cfg.adapter).await {
-                        Ok(c) => {
-                            refresh.battery_pct = c.battery_pct;
-                            any_ok = true;
+                        match sample::sample_charge(&cfg.vin, &cfg.adapter).await {
+                            Ok(c) => {
+                                refresh.battery_pct = c.battery_pct;
+                                any_ok = true;
+                            }
+                            Err(e) => warn!("parked-awake charge refresh failed: {e}"),
                         }
-                        Err(e) => warn!("parked-awake charge refresh failed: {e}"),
+                        *last_parked_awake_refresh = Some(Instant::now());
                     }
+
+                    if tpms_due {
+                        // TPMS rarely changes while parked, but
+                        // periodic checks confirm sensors still
+                        // report and feed the dashboard's TPMS card.
+                        match sample::sample_tires(&cfg.vin, &cfg.adapter).await {
+                            Ok(t) => {
+                                refresh.tire_fl_psi = t.tire_fl_psi;
+                                refresh.tire_fr_psi = t.tire_fr_psi;
+                                refresh.tire_rl_psi = t.tire_rl_psi;
+                                refresh.tire_rr_psi = t.tire_rr_psi;
+                                any_ok = true;
+                            }
+                            Err(e) => warn!("parked-awake tires refresh failed: {e}"),
+                        }
+                        *last_parked_awake_tpms_refresh = Some(Instant::now());
+                    }
+
                     if any_ok {
                         persist(conn, refresh);
                     }
-                    *last_parked_awake_refresh = Some(Instant::now());
                 }
             }
 
