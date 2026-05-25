@@ -387,6 +387,21 @@ function install_ble_daemon () {
   # from loading at boot. Remove it so hci0 is available after reboot.
   rm -f /etc/modprobe.d/dietpi-disable_bluetooth.conf 2>/dev/null || true
 
+  # Radxa Zero 3W: the AIC8800 BT chip is on UART and needs hciattach to
+  # create hci0. Unlike BCM4345C0 (4C+, Pi 4) which auto-attaches via
+  # device-tree, the Zero 3W's DT has no bluetooth node — hciattach must
+  # run on every boot before sentryusb-ble can advertise.
+  if grep -qi "ZERO 3" /proc/device-tree/model 2>/dev/null; then
+    setup_progress "Radxa Zero 3W detected — installing AIC8800 BT UART attach service..."
+    mkdir -p /etc/systemd/system
+    printf '[Unit]\nDescription=Attach AIC8800 Bluetooth via UART\nBefore=bluetooth.service sentryusb-ble.service\nAfter=local-fs.target\n\n[Service]\nType=forking\nExecStart=/usr/bin/hciattach -s 1500000 /dev/ttyS1 any 1500000 flow nosleep\nRemainAfterExit=yes\nExecStop=/usr/bin/killall hciattach\n\n[Install]\nWantedBy=multi-user.target\n' > /etc/systemd/system/aic8800-bluetooth.service
+    systemctl daemon-reload
+    systemctl enable aic8800-bluetooth 2>/dev/null || true
+    systemctl start aic8800-bluetooth 2>/dev/null || true
+    sleep 3
+    setup_progress "AIC8800 BT UART attached"
+  fi
+
   chmod +x /root/bin/sentryusb-ble.py 2>/dev/null || true
 
   # Install D-Bus policy file so BlueZ can call GATT methods on our daemon.
