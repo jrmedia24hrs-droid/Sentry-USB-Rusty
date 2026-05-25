@@ -584,6 +584,22 @@ pub async fn ble_latest_sample(
                 )
                 .ok()
             };
+            // Latest body-controller poll ts (independent of the
+            // state envelope above). The UI uses this to tell
+            // "car is in Quiet mode, last state poll was X ago by
+            // design" apart from "data is genuinely stale because
+            // BLE is failing." If body-controller polls are landing
+            // recently but state polls aren't, the car is asleep —
+            // expected and not alarming.
+            let body_controller_ts: Option<i64> = conn
+                .query_row(
+                    "SELECT ts FROM telemetry_samples \
+                     WHERE source = 'body_controller' \
+                     ORDER BY ts DESC LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .ok();
             envelope.map(|(ts, source)| {
                 (
                     ts,
@@ -598,6 +614,7 @@ pub async fn ble_latest_sample(
                     latest_col_f64("tire_rr_psi"),
                     latest_col_f64("odometer_mi"),
                     latest_col_string("location_name"),
+                    body_controller_ts,
                 )
             })
         })
@@ -625,6 +642,7 @@ pub async fn ble_latest_sample(
             tire_rr_psi,
             odometer_mi,
             location_name,
+            body_controller_ts,
         )) => (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -641,6 +659,12 @@ pub async fn ble_latest_sample(
                 "odometer_mi": odometer_mi,
                 "location_name": location_name,
                 "source": source,
+                // Null if we've never seen a body-controller poll. The
+                // UI uses recent body-controller-but-stale-state to
+                // tell Quiet mode (car asleep, expected) apart from
+                // truly-stale (everything failing).
+                "body_controller_seconds_ago": body_controller_ts
+                    .map(|t| (now - t).max(0)),
             })),
         ),
         None => (

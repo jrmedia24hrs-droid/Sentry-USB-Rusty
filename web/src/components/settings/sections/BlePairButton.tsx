@@ -89,6 +89,12 @@ interface BleLatestSample {
   odometer_mi?: number | null
   location_name?: string | null
   source?: string
+  /** Age (seconds) of the most recent body-controller poll, or null
+   *  if the sampler has never done one. Body-controller polls run
+   *  on a 30-second cadence while the car is in Quiet mode (parked,
+   *  sleeping). Fresh body-controller + stale state = car is asleep
+   *  by design, not a failure mode. */
+  body_controller_seconds_ago?: number | null
 }
 
 /**
@@ -1224,7 +1230,11 @@ function TelemetryOutputPanel({
               <Row label="Rear right" value={fmtPsi(sample.tire_rr_psi)} />
             </>
           )}
-          {/* Keep-awake (archive cycle) — pause message regardless of source. */}
+          {/* Three mutually-exclusive context messages for the stale
+              case. Priority order matters because more than one
+              condition can be true at once (e.g. car is asleep AND
+              keep-awake is running an archive). */}
+          {/* 1. Keep-awake (archive cycle) holds the radio — pause. */}
           {isStale && radioOwner === "keep_awake" && (
             <p className="pt-1 text-[10px] text-amber-400/80">
               {archiving
@@ -1232,18 +1242,15 @@ function TelemetryOutputPanel({
                 : "Paused while another part of the Pi is using Bluetooth. Live readings will resume in a moment."}
             </p>
           )}
-          {/* Sample source determines tone:
-              * `body_controller` = car is asleep / Quiet-mode polling.
-                Stale data here is EXPECTED — the sampler is letting the
-                car sleep instead of waking it for fresh readings. Show
-                the gray informational note instead of the orange
-                "may have moved" warning, which implies something's wrong.
-              * `state` = full Active-mode poll. If THIS is stale, the
-                sampler should be polling more frequently — usually it
-                means the car was awake recently but isn't anymore, or
-                a transient BLE issue. The orange "may have moved"
-                phrasing is appropriate. */}
-          {sample.source === "body_controller" && radioOwner !== "keep_awake" && (
+          {/* 2. Car is asleep — body-controller polls are landing but
+              state polls aren't (by design — state polls would wake
+              the car). Fresh body-controller + stale state is the
+              telltale signature of Quiet mode. The orange "may have
+              moved or charged" warning would be misleading here:
+              a parked + asleep car isn't going anywhere. */}
+          {isStale && radioOwner !== "keep_awake"
+            && sample.body_controller_seconds_ago != null
+            && sample.body_controller_seconds_ago < 90 && (
             <p className="pt-1 text-[10px] text-slate-500">
               Your car is asleep, so these are the last known values from {ageLabel}.
               They won't update until your car wakes up (driving, door, or
@@ -1251,7 +1258,13 @@ function TelemetryOutputPanel({
               the car for a fresh reading immediately.
             </p>
           )}
-          {sample.source !== "body_controller" && isStale && radioOwner !== "keep_awake" && (
+          {/* 3. Genuinely-stale: state poll old AND body-controller poll
+              also old (or never happened). Something is actually
+              wrong — BLE radio issue, car out of range, etc. The
+              orange "may have moved" warning fits this case. */}
+          {isStale && radioOwner !== "keep_awake"
+            && (sample.body_controller_seconds_ago == null
+                || sample.body_controller_seconds_ago >= 90) && (
             <p className="pt-1 text-[10px] text-amber-400/70">
               These values are from {ageLabel} — your car may have moved or
               charged since. The Tesla app uses a different connection (LTE)
