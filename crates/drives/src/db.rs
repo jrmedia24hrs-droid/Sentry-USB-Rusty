@@ -606,6 +606,54 @@ impl DriveStore {
         Ok(())
     }
 
+    /// Bulk-delete the specified clip files from `routes` and
+    /// `processed_files`, and prune any matching `drive_tags` rows.
+    /// `drive_keys` lists the start_time strings used as `drive_tags`
+    /// keys so the tag rows tied to the removed drives are cleaned up
+    /// at the same time.
+    ///
+    /// All deletes run in a single transaction so a partial failure
+    /// can't leave routes deleted but processed_files stale (which
+    /// would silently prevent reprocessing). Returns the number of
+    /// routes actually removed — useful for surfacing "deleted 42
+    /// drives (61 clips)" in the UI.
+    pub fn delete_routes_by_files(
+        &self,
+        files: &[String],
+        drive_keys: &[String],
+    ) -> Result<usize> {
+        if files.is_empty() && drive_keys.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let mut deleted: usize = 0;
+        if !files.is_empty() {
+            let mut del_routes =
+                tx.prepare("DELETE FROM routes WHERE file = ?1")?;
+            let mut del_processed =
+                tx.prepare("DELETE FROM processed_files WHERE file = ?1")?;
+            for f in files {
+                let n = normalize_path(f);
+                deleted += del_routes.execute(params![n])?;
+                del_processed.execute(params![n])?;
+            }
+        }
+        if !drive_keys.is_empty() {
+            let mut del_tags =
+                tx.prepare("DELETE FROM drive_tags WHERE drive_key = ?1")?;
+            for k in drive_keys {
+                del_tags.execute(params![k])?;
+            }
+        }
+        tx.commit()?;
+        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
+        drop(conn);
+        self.drive_cache_dirty.store(true, Ordering::Release);
+        self.refresh_counts()?;
+        Ok(deleted)
+    }
+
     /// Regenerate the canonical `/backingfiles/drive-data.json` mirror for
     /// `post-archive-process.sh`. Idempotent; safe alongside reads.
     pub fn export_json_for_sync(&self) -> Result<()> {

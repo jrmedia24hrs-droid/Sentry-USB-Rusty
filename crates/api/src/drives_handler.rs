@@ -807,6 +807,109 @@ pub async fn delete_all_drives(
     }
 }
 
+#[derive(Deserialize)]
+pub struct BulkDeleteRequest {
+    pub ids: Vec<String>,
+}
+
+/// POST /api/drives/bulk-delete — remove the listed drives from the DB.
+///
+/// Body: `{ "ids": ["<numeric index>" or "<start_time>", ...] }`.
+/// Resolves each id through the grouper to the clip files that make up
+/// the drive, deduplicates across ids (a parent clip can never be
+/// shared between two drives, but the dedupe is a cheap guard against
+/// future grouper changes), then deletes the matching rows from
+/// `routes`, `processed_files`, and `drive_tags` in one transaction.
+///
+/// Mirrors the safety guards on `delete_all_drives`: refuses while
+/// processing, importing, or archiving is running so the in-flight
+/// jobs don't race against the deletion.
+pub async fn bulk_delete_drives(
+    State(state): State<AppState>,
+    Json(body): Json<BulkDeleteRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if state.drives.processor.is_running() {
+        return crate::json_error(
+            StatusCode::CONFLICT,
+            "processing in progress — please wait until it finishes",
+        );
+    }
+    if state.drives.importing.load(Ordering::SeqCst) {
+        return crate::json_error(
+            StatusCode::CONFLICT,
+            "drive data import in progress — please wait until it finishes",
+        );
+    }
+    if is_archiving() {
+        return crate::json_error(
+            StatusCode::CONFLICT,
+            "archive is currently running — please wait until it finishes",
+        );
+    }
+    if body.ids.is_empty() {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({"deleted": 0, "drives": 0})),
+        );
+    }
+
+    // Resolve every id to (drive_key, file_list) in one summary pass —
+    // `with_route_summaries` rebuilds the grouper exactly once, not once
+    // per id.
+    let (files, drive_keys, not_found): (Vec<String>, Vec<String>, Vec<String>) = match state
+        .drives
+        .store
+        .with_route_summaries(|summaries| {
+            let mut files = std::collections::HashSet::new();
+            let mut keys = std::collections::HashSet::new();
+            let mut missing = Vec::new();
+            for id in &body.ids {
+                let resolved = grouper::find_drive_files(summaries, id);
+                let key = grouper::find_drive_start_time(summaries, id);
+                match (resolved, key) {
+                    (Some((_, fs)), Some(k)) => {
+                        for f in fs {
+                            files.insert(f);
+                        }
+                        keys.insert(k);
+                    }
+                    _ => missing.push(id.clone()),
+                }
+            }
+            (
+                files.into_iter().collect(),
+                keys.into_iter().collect(),
+                missing,
+            )
+        }) {
+        Ok(v) => v,
+        Err(e) => return crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+
+    if !not_found.is_empty() && files.is_empty() {
+        return crate::json_error(
+            StatusCode::NOT_FOUND,
+            &format!("no matching drives for ids: {}", not_found.join(", ")),
+        );
+    }
+
+    match state
+        .drives
+        .store
+        .delete_routes_by_files(&files, &drive_keys)
+    {
+        Ok(deleted_routes) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "deleted": deleted_routes,
+                "drives": body.ids.len() - not_found.len(),
+                "not_found": not_found,
+            })),
+        ),
+        Err(e) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
 /// PUT /api/drives/{id}/tags — set tags for a drive.
 ///
 /// `id` from the URL is either the numeric grouper index (what the
