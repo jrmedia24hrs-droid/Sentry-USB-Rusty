@@ -74,10 +74,30 @@ jobs:
           # Cross-compilation requires the TARGET arch's libdbus
           # headers — host arch alone produces:
           #   pkg-config has not been configured to support cross-compilation
-          # So enable arm64 + armhf foreign architectures and install
-          # both the host and target variants. armv6 piggybacks on the
-          # armhf packages (same EABI, slightly different ABI subset but
-          # libdbus's C headers are bit-identical).
+          #
+          # Enabling foreign architectures alone isn't enough: Ubuntu
+          # serves arm64/armhf binary packages from ports.ubuntu.com,
+          # NOT from the default security/archive mirrors. So:
+          #   1. Restrict the default sources to [arch=amd64] (otherwise
+          #      apt tries to fetch arm64 from security.ubuntu.com 404)
+          #   2. Add ports.ubuntu.com as [arch=arm64,armhf] separately
+          #   3. Then dpkg --add-architecture + apt-get install
+          #
+          # armv6 piggybacks on the armhf package set (same EABI; the
+          # libdbus C headers are bit-identical between armhf and armel).
+          UBUNTU_CODENAME=$(lsb_release -cs)
+          sudo sed -i 's|^deb http|deb [arch=amd64,i386] http|' /etc/apt/sources.list
+          # Some runners use sources.list.d/ubuntu.sources (DEB822
+          # format) instead of the legacy sources.list. Match either.
+          if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+            sudo sed -i 's|^Architectures:.*|Architectures: amd64 i386|; t; /^Types:/a Architectures: amd64 i386' \
+              /etc/apt/sources.list.d/ubuntu.sources || true
+          fi
+          sudo tee /etc/apt/sources.list.d/ports.list >/dev/null <<EOF
+          deb [arch=arm64,armhf] http://ports.ubuntu.com/ubuntu-ports/ ${UBUNTU_CODENAME} main restricted universe multiverse
+          deb [arch=arm64,armhf] http://ports.ubuntu.com/ubuntu-ports/ ${UBUNTU_CODENAME}-updates main restricted universe multiverse
+          deb [arch=arm64,armhf] http://ports.ubuntu.com/ubuntu-ports/ ${UBUNTU_CODENAME}-security main restricted universe multiverse
+          EOF
           sudo dpkg --add-architecture arm64
           sudo dpkg --add-architecture armhf
           sudo apt-get update -qq
