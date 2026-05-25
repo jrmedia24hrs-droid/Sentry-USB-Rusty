@@ -30,6 +30,10 @@ path = "examples/derive_key.rs"
 name = "signed_request"
 path = "examples/signed_request.rs"
 
+[[example]]
+name = "persistent_session"
+path = "examples/persistent_session.rs"
+
 [dependencies]
 tokio = { workspace = true }
 anyhow = { workspace = true }

@@ -6,6 +6,7 @@ pub mod crypto;
 pub mod gatt;
 pub mod keys;
 pub mod local_name;
+pub mod manager;
 pub mod scan;
 pub mod session;
 pub mod state_query;
