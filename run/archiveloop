@@ -710,11 +710,10 @@ function soc_temperature () {
   local raw
   raw=$(cat "$zone" 2>/dev/null) || return 0
   [ -n "$raw" ] || return 0
-  local c="$((raw / 1000)).$((raw % 1000))"
   if [ "${TEMPERATURE_UNIT:-C}" = "F" ]; then
-    awk "BEGIN { printf \"%.1f°F\", $c * 9/5 + 32 }"
+    awk -v r="$raw" 'BEGIN { printf "%.1f°F", r/1000 * 9/5 + 32 }'
   else
-    echo "${c}°C"
+    awk -v r="$raw" 'BEGIN { printf "%.1f°C", r/1000 }'
   fi
 }
 
