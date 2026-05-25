@@ -29,14 +29,12 @@ export interface PiStatus {
   uptime: string
   drives_active: string
   wifi_ssid: string
-  wifi_freq: string
   wifi_strength: string
   wifi_ip: string
   ether_ip: string
   ether_speed: string
   fan_speed: string
   sbc_model?: string
-  device_suffix?: string
   /** Negative integer parsed from iwconfig "Signal level=-48 dBm". Present only on backends ≥ v2.7.4. */
   wifi_signal_dbm?: number
   wifi_rx_bps?: number

@@ -39,14 +39,12 @@ struct PiStatus {
     uptime: String,
     drives_active: String,
     wifi_ssid: String,
-    wifi_freq: String,
     wifi_strength: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     wifi_signal_dbm: Option<i32>,
     wifi_ip: String,
     ether_ip: String,
     ether_speed: String,
-    device_suffix: String,
     sbc_model: String,
     fan_speed: String,
     wifi_rx_bps: u64,
@@ -68,13 +66,11 @@ pub async fn get_status(
         uptime: String::new(),
         drives_active: "no".into(),
         wifi_ssid: String::new(),
-        wifi_freq: String::new(),
         wifi_strength: String::new(),
         wifi_signal_dbm: None,
         wifi_ip: String::new(),
         ether_ip: String::new(),
         ether_speed: String::new(),
-        device_suffix: String::new(),
         sbc_model: String::new(),
         fan_speed: String::new(),
         wifi_rx_bps: 0,
@@ -82,14 +78,6 @@ pub async fn get_status(
         ether_rx_bps: 0,
         ether_tx_bps: 0,
     };
-
-    // Device suffix from machine-id
-    if let Ok(mid) = std::fs::read_to_string("/etc/machine-id") {
-        let mid = mid.trim();
-        if mid.len() >= 4 {
-            s.device_suffix = mid[mid.len() - 4..].to_uppercase();
-        }
-    }
 
     // SBC model
     s.sbc_model = get_sbc_model();
@@ -160,20 +148,15 @@ pub async fn get_status(
     if !wifi_dev.is_empty() && iface_is_up(&wifi_dev) {
         // Bind arg arrays to lets so the temporaries outlive the join!.
         let ssid_args = ["-r", wifi_dev.as_str()];
-        let freq_args = ["-r", "-f", wifi_dev.as_str()];
         let iwc_args = [wifi_dev.as_str()];
         let ip_args = ["-4", "addr", "show", wifi_dev.as_str()];
-        let (ssid_r, freq_r, iwc_r, ip_r) = tokio::join!(
+        let (ssid_r, iwc_r, ip_r) = tokio::join!(
             sentryusb_shell::run("iwgetid", &ssid_args),
-            sentryusb_shell::run("iwgetid", &freq_args),
             sentryusb_shell::run("iwconfig", &iwc_args),
             sentryusb_shell::run("ip", &ip_args),
         );
         if let Ok(out) = ssid_r {
             s.wifi_ssid = out.trim().to_string();
-        }
-        if let Ok(out) = freq_r {
-            s.wifi_freq = out.trim().to_string();
         }
         if let Ok(out) = iwc_r {
             for line in out.lines() {
