@@ -1,4 +1,4 @@
-import { useMemo } from "react"
+import { useMemo, useRef } from "react"
 import {
   CartesianGrid,
   Legend,
@@ -10,6 +10,13 @@ import {
   YAxis,
 } from "recharts"
 import { useScrubberActions } from "@/hooks/useScrubberSync"
+
+// Layout constants must match the LineChart's `margin` + YAxis `width`
+// below. Click-to-seek is computed in pixel space because Recharts
+// 3.x's onClick fires before its internal redux store settles, so
+// `activeTooltipIndex` is unreliable.
+const YAXIS_WIDTH = 44
+const RIGHT_MARGIN = 16
 
 export interface TemperaturePoint {
   // Unix ms — backend (drives_handler::temperature_series) emits the
@@ -66,10 +73,11 @@ export default function TemperatureChart({
     [startTime],
   )
 
-  const canSeek = drivePoints && drivePoints.length > 0 && Number.isFinite(baseMs)
+  const canSeek = !!drivePoints && drivePoints.length > 0 && Number.isFinite(baseMs)
+  const containerRef = useRef<HTMLDivElement>(null)
 
   const seekToTs = (ts: number) => {
-    if (!canSeek || !drivePoints) return
+    if (!drivePoints || drivePoints.length === 0) return
     const targetRel = ts - baseMs
     // Binary search for nearest point by relative ms.
     let lo = 0
@@ -88,33 +96,43 @@ export default function TemperatureChart({
     setIndex(best)
   }
 
-  // Click-only seek (no hover-seek — hover just shows the tooltip).
-  // Bind both onClick and onMouseDown because recharts 3.x's onClick
-  // routes through tooltip state and sometimes drops activeTooltipIndex;
-  // mousedown fires first and is reliable.
-  const seekFromEvent = (s: { activeTooltipIndex?: number | string }) => {
-    if (!canSeek) return
-    const idx = s?.activeTooltipIndex
-    if (typeof idx === "number" && idx >= 0 && idx < converted.length) {
-      seekToTs(converted[idx].ts)
-    }
+  // Click anywhere in the chart → seek by mapping click X to a fraction
+  // of the time domain, then resolving that ts to the nearest drive
+  // point. The telemetry samples are sparse (60s cadence) so we map
+  // through the time axis rather than directly to a sample index.
+  const handleClick = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (!canSeek || converted.length < 2) return
+    const container = containerRef.current
+    if (!container) return
+    const rect = container.getBoundingClientRect()
+    const plotLeft = YAXIS_WIDTH
+    const plotRight = rect.width - RIGHT_MARGIN
+    const plotWidth = plotRight - plotLeft
+    if (plotWidth <= 0) return
+    const x = e.clientX - rect.left
+    const clamped = Math.max(plotLeft, Math.min(plotRight, x))
+    const frac = (clamped - plotLeft) / plotWidth
+    const tMin = converted[0].ts
+    const tMax = converted[converted.length - 1].ts
+    if (!(tMax > tMin)) return
+    seekToTs(tMin + (tMax - tMin) * frac)
   }
 
   const unit = metric ? "°C" : "°F"
 
   return (
     <div
+      ref={containerRef}
       className={
         canSeek ? "h-56 w-full cursor-crosshair select-none" : "h-56 w-full"
       }
+      onClick={canSeek ? handleClick : undefined}
       aria-label="Temperature chart"
     >
       <ResponsiveContainer minHeight={0} minWidth={0}>
         <LineChart
           data={converted}
-          margin={{ top: 10, right: 16, bottom: 24, left: 4 }}
-          onMouseDown={seekFromEvent}
-          onClick={seekFromEvent}
+          margin={{ top: 10, right: RIGHT_MARGIN, bottom: 24, left: 4 }}
         >
           <CartesianGrid stroke="#1e242f" strokeDasharray="3 3" vertical={false} />
           <XAxis
