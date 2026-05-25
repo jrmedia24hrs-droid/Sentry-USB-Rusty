@@ -862,9 +862,15 @@ pub struct BulkDeleteRequest {
 /// future grouper changes), then deletes the matching rows from
 /// `routes`, `processed_files`, and `drive_tags` in one transaction.
 ///
-/// Mirrors the safety guards on `delete_all_drives`: refuses while
-/// processing, importing, or archiving is running so the in-flight
-/// jobs don't race against the deletion.
+/// Guards against the two jobs that actually write to these tables:
+/// the clip processor (`processor.is_running()`) and a JSON import
+/// (`importing`). We deliberately do NOT block on `is_archiving()`:
+/// the archive script copies clip files between disks and doesn't
+/// touch the DB during the archiving phase; the post-archive
+/// reprocess that DOES write goes through `POST /api/drives/process`,
+/// which would trip the processor guard at that point. Blocking on
+/// archive here is what `delete_all_drives` does, but for a
+/// targeted per-drive delete it's just user-hostile latency.
 pub async fn bulk_delete_drives(
     State(state): State<AppState>,
     Json(body): Json<BulkDeleteRequest>,
@@ -879,12 +885,6 @@ pub async fn bulk_delete_drives(
         return crate::json_error(
             StatusCode::CONFLICT,
             "drive data import in progress — please wait until it finishes",
-        );
-    }
-    if is_archiving() {
-        return crate::json_error(
-            StatusCode::CONFLICT,
-            "archive is currently running — please wait until it finishes",
         );
     }
     if body.ids.is_empty() {
