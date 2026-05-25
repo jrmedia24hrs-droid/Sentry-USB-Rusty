@@ -156,7 +156,7 @@ export function TirePressureCard({ data, days = 30 }: TirePressureCardProps) {
       </div>
 
       <div className="h-72 w-full" aria-label="Tire pressure chart">
-          <ResponsiveContainer>
+          <ResponsiveContainer minHeight={0} minWidth={0}>
             <LineChart
               data={data.points}
               margin={{ top: 8, right: 20, bottom: 24, left: 0 }}

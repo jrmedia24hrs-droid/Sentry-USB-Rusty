@@ -25,27 +25,34 @@ export default function DriveChart({
   const { setIndex } = useScrubberActions()
   const baseMs = useMemo(() => new Date(startTime).getTime(), [startTime])
 
+  // Click → seek to the data point under the click. Hover only shows
+  // the tooltip (no longer drags the scrubber along; the previous
+  // mouse-move-seeks felt jumpy and made the click feel like a no-op
+  // because the scrubber had already arrived).
+  //
+  // Recharts 3.x's `onClick` populates activeTooltipIndex inconsistently
+  // depending on whether the click hit a data point's hit-zone — so we
+  // bind both `onClick` and `onMouseDown`. Mousedown fires before the
+  // browser's click event and is reliable across recharts' internal
+  // pointer-event routing.
+  const seekFromEvent = (s: { activeTooltipIndex?: number | string }) => {
+    const idx = s?.activeTooltipIndex
+    if (typeof idx === "number" && idx >= 0 && idx < series.length) {
+      setIndex(series[idx].index)
+    }
+  }
+
   return (
     <div
-      className="h-56 w-full cursor-crosshair"
+      className="h-56 w-full cursor-crosshair select-none"
       aria-label={`${valueLabel} chart`}
     >
-      <ResponsiveContainer>
+      <ResponsiveContainer minHeight={0} minWidth={0}>
         <AreaChart
           data={series}
           margin={{ top: 10, right: 16, bottom: 16, left: 4 }}
-          onMouseMove={(s) => {
-            const idx = s?.activeTooltipIndex
-            if (typeof idx === "number" && idx >= 0 && idx < series.length) {
-              setIndex(series[idx].index)
-            }
-          }}
-          onClick={(s) => {
-            const idx = s?.activeTooltipIndex
-            if (typeof idx === "number" && idx >= 0 && idx < series.length) {
-              setIndex(series[idx].index)
-            }
-          }}
+          onMouseDown={seekFromEvent}
+          onClick={seekFromEvent}
         >
           <defs>
             <linearGradient id="speedFill" x1="0" y1="0" x2="0" y2="1">

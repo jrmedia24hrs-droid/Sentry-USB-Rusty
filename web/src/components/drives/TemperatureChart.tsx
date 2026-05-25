@@ -88,30 +88,33 @@ export default function TemperatureChart({
     setIndex(best)
   }
 
+  // Click-only seek (no hover-seek — hover just shows the tooltip).
+  // Bind both onClick and onMouseDown because recharts 3.x's onClick
+  // routes through tooltip state and sometimes drops activeTooltipIndex;
+  // mousedown fires first and is reliable.
+  const seekFromEvent = (s: { activeTooltipIndex?: number | string }) => {
+    if (!canSeek) return
+    const idx = s?.activeTooltipIndex
+    if (typeof idx === "number" && idx >= 0 && idx < converted.length) {
+      seekToTs(converted[idx].ts)
+    }
+  }
+
   const unit = metric ? "°C" : "°F"
 
   return (
     <div
-      className={canSeek ? "h-56 w-full cursor-crosshair" : "h-56 w-full"}
+      className={
+        canSeek ? "h-56 w-full cursor-crosshair select-none" : "h-56 w-full"
+      }
       aria-label="Temperature chart"
     >
-      <ResponsiveContainer>
+      <ResponsiveContainer minHeight={0} minWidth={0}>
         <LineChart
           data={converted}
           margin={{ top: 10, right: 16, bottom: 24, left: 4 }}
-          onClick={(s) => {
-            const idx = s?.activeTooltipIndex
-            if (typeof idx === "number" && idx >= 0 && idx < converted.length) {
-              seekToTs(converted[idx].ts)
-            }
-          }}
-          onMouseMove={(s) => {
-            if (!canSeek) return
-            const idx = s?.activeTooltipIndex
-            if (typeof idx === "number" && idx >= 0 && idx < converted.length) {
-              seekToTs(converted[idx].ts)
-            }
-          }}
+          onMouseDown={seekFromEvent}
+          onClick={seekFromEvent}
         >
           <CartesianGrid stroke="#1e242f" strokeDasharray="3 3" vertical={false} />
           <XAxis
