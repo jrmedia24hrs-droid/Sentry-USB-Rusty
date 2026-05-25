@@ -16,6 +16,7 @@
 //!     BLE off in settings stops sampling within ~15 s without a
 //!     daemon restart.
 
+mod clock_sync;
 mod config;
 mod db;
 mod lock;
@@ -231,18 +232,14 @@ async fn main() -> Result<()> {
 
     info!("sentryusb-tesla-telemetry starting");
 
-    // Don't start polling until the system clock looks sane. Without
-    // an RTC battery (most stock Pi setups), the clock can be years
-    // off until systemd-timesyncd contacts an NTP server. Samples
-    // written with bogus timestamps would never match the drive
-    // window (which uses Tesla's correct clip-filename timestamps),
-    // so they'd be stranded in the DB.
-    //
-    // We wait up to 5 minutes for the clock to sync; after that we
-    // start sampling anyway and just accept the risk. The clock
-    // status is also surfaced via `/api/system/clock-status` so the
-    // settings UI can warn the user when sampling is paused.
-    wait_for_clock_sync(Duration::from_secs(300)).await;
+    // Brief startup wait for the system clock to come up — either via
+    // RTC (immediate) or NTP (seconds, if WiFi is reachable). Just
+    // long enough to dodge the very first cold-boot tick; the
+    // BLE-based clock sync (see clock_sync.rs) handles everything
+    // else once the first state response lands. Was 5 min when we
+    // depended entirely on NTP; now 30s is plenty because the car
+    // itself becomes our backup time source via BLE.
+    wait_for_clock_sync(Duration::from_secs(30)).await;
 
     let conn = db::open()?;
     let mut held_radio = false;
@@ -481,6 +478,11 @@ async fn tick(
             if presence_now == Some(true) {
                 match sample::sample_drive(&cfg.vin, &cfg.adapter).await {
                     Ok(d) => {
+                        // Self-correct the Pi's clock if it's
+                        // significantly off — uses Tesla's
+                        // GPS-derived timestamp from the response.
+                        // No-op when local clock is already close.
+                        try_sync_clock(d.meta);
                         let shift_changed_to_drive = d
                             .shift_state
                             .map_or(false, |s| !s.is_park() && s != sample::ShiftState::Unknown);
@@ -550,6 +552,7 @@ async fn tick(
                     if refresh_due {
                         match sample::sample_climate(&cfg.vin, &cfg.adapter).await {
                             Ok(c) => {
+                                try_sync_clock(c.meta);
                                 refresh.interior_temp_c = c.interior_temp_c;
                                 refresh.exterior_temp_c = c.exterior_temp_c;
                                 refresh.hvac_on = c.hvac_on;
@@ -559,6 +562,7 @@ async fn tick(
                         }
                         match sample::sample_charge(&cfg.vin, &cfg.adapter).await {
                             Ok(c) => {
+                                try_sync_clock(c.meta);
                                 refresh.battery_pct = c.battery_pct;
                                 any_ok = true;
                             }
@@ -573,6 +577,7 @@ async fn tick(
                         // report and feed the dashboard's TPMS card.
                         match sample::sample_tires(&cfg.vin, &cfg.adapter).await {
                             Ok(t) => {
+                                try_sync_clock(t.meta);
                                 refresh.tire_fl_psi = t.tire_fl_psi;
                                 refresh.tire_fr_psi = t.tire_fr_psi;
                                 refresh.tire_rl_psi = t.tire_rl_psi;
@@ -657,6 +662,7 @@ async fn tick(
         if schedule.drive_due(tick_now) {
             let success = match sample::sample_drive(&cfg.vin, &cfg.adapter).await {
                 Ok(d) => {
+                    try_sync_clock(d.meta);
                     sample.odometer_mi = d.odometer_mi;
                     sample.location_name = d.location_name;
                     shift_state_observed = d.shift_state;
@@ -677,6 +683,7 @@ async fn tick(
         if schedule.climate_due(tick_now) {
             let success = match sample::sample_climate(&cfg.vin, &cfg.adapter).await {
                 Ok(c) => {
+                    try_sync_clock(c.meta);
                     sample.interior_temp_c = c.interior_temp_c;
                     sample.exterior_temp_c = c.exterior_temp_c;
                     sample.hvac_on = c.hvac_on;
@@ -695,6 +702,7 @@ async fn tick(
         if schedule.charge_due(tick_now) {
             let success = match sample::sample_charge(&cfg.vin, &cfg.adapter).await {
                 Ok(c) => {
+                    try_sync_clock(c.meta);
                     sample.battery_pct = c.battery_pct;
                     true
                 }
@@ -711,6 +719,7 @@ async fn tick(
         if schedule.tires_due(tick_now) {
             let success = match sample::sample_tires(&cfg.vin, &cfg.adapter).await {
                 Ok(t) => {
+                    try_sync_clock(t.meta);
                     sample.tire_fl_psi = t.tire_fl_psi;
                     sample.tire_fr_psi = t.tire_fr_psi;
                     sample.tire_rl_psi = t.tire_rl_psi;
@@ -852,6 +861,19 @@ fn clock_is_sane() -> bool {
         .unwrap_or(0);
     // 2025-01-01 00:00:00 UTC = 1735689600.
     secs > 1_735_689_600
+}
+
+/// Helper: feed a successful response's metadata into the clock-sync
+/// machinery. No-op if the response didn't include a vehicle
+/// timestamp (e.g. body-controller-state) or if our clock is already
+/// within tolerance. Called from every success branch in tick() so
+/// any working sub-sample can fix the clock.
+fn try_sync_clock(meta: sample::ResponseMeta) {
+    if let (Some(vehicle_ts), Some(started)) =
+        (meta.vehicle_ts_secs, meta.request_started_at)
+    {
+        clock_sync::maybe_set_clock_from_vehicle(vehicle_ts, started);
+    }
 }
 
 fn persist(conn: &Connection, sample: Sample) {

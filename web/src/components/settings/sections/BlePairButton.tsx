@@ -828,26 +828,28 @@ export function BlePairButton() {
         )}
       </div>
 
-      {/* Clock-not-synced warning — only when there's no RTC
-          battery to back the clock up across reboots. RTC users
-          never see this. Once NTP catches up the polling effect
-          stops firing and this disappears on its own. */}
+      {/* Clock-not-synced info — only shown briefly during the
+          window between boot and the first successful BLE/NTP sync.
+          The telemetry sampler auto-corrects the Pi's clock from the
+          first Tesla state response (Tesla embeds a GPS-derived
+          timestamp), so this normally disappears within 30 seconds
+          of first BLE contact. */}
       {clockStatus?.show_warning && (
-        <div className="rounded-lg border border-amber-500/20 bg-amber-500/[0.05] p-3 text-xs">
+        <div className="rounded-lg border border-blue-500/20 bg-blue-500/[0.04] p-3 text-xs">
           <div className="flex items-start gap-2">
-            <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" />
+            <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-blue-400" />
             <div>
-              <p className="font-semibold text-amber-300">
-                Pi clock not synced — telemetry paused
+              <p className="font-semibold text-blue-300">
+                Setting Pi clock from car
               </p>
               <p className="mt-1 text-[11px] leading-relaxed text-slate-400">
-                Connect the Pi to WiFi briefly so it can set its clock from
-                the internet. After that the clock keeps running on its own
-                even when you drive away — you only need WiFi this once.
+                The Pi's clock isn't set yet. As soon as the car responds
+                to one BLE poll, the Pi will pick up the correct time from
+                Tesla's GPS clock — no WiFi or NTP needed.
                 <br />
                 <span className="text-slate-500">
-                  Tip: add a $5 coin-cell battery to the Pi's BAT pin to
-                  avoid this on future boots.
+                  Tip: a $5 coin-cell battery on the Pi's BAT pin keeps
+                  the clock set across reboots so this doesn't happen at all.
                 </span>
               </p>
             </div>

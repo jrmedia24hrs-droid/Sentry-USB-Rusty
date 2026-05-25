@@ -1751,6 +1751,7 @@ name = "sentryusb-tesla-telemetry"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "libc",
  "rusqlite",
  "sentryusb-config",
  "sentryusb-drives",

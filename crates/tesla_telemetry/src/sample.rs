@@ -75,6 +75,23 @@ impl ShiftState {
     }
 }
 
+/// Common fields every state response carries that downstream code
+/// might want regardless of which specific sub-sampler it was. The
+/// `vehicle_ts_secs` field is what the clock-sync feature uses to
+/// keep the Pi's wall clock honest — Tesla derives this from GPS
+/// time so it's always accurate.
+#[derive(Default, Clone, Copy)]
+pub struct ResponseMeta {
+    /// Tesla's wall-clock timestamp from the response body, parsed
+    /// from the RFC 3339 `timestamp` field. None when not present or
+    /// unparseable. Used by `clock_sync::maybe_set_clock_from_vehicle`.
+    pub vehicle_ts_secs: Option<i64>,
+    /// Monotonic Instant from just before we sent the BLE request.
+    /// Used to compute RTT for latency-compensating the clock
+    /// adjustment (we add half the RTT to the vehicle timestamp).
+    pub request_started_at: Option<std::time::Instant>,
+}
+
 /// Result of a successful `sample_drive` call. Drive is the
 /// highest-priority poll because it carries the three signals that
 /// must stay fresh during a drive:
@@ -85,6 +102,7 @@ pub struct DriveResult {
     pub location_name: Option<String>,
     pub odometer_mi: Option<f64>,
     pub shift_state: Option<ShiftState>,
+    pub meta: ResponseMeta,
 }
 
 /// Result of a successful `sample_climate` call. Slow-changing —
@@ -93,11 +111,13 @@ pub struct ClimateResult {
     pub interior_temp_c: Option<f64>,
     pub exterior_temp_c: Option<f64>,
     pub hvac_on: Option<bool>,
+    pub meta: ResponseMeta,
 }
 
 /// Result of a successful `sample_charge` call. Slow-changing.
 pub struct ChargeResult {
     pub battery_pct: Option<f64>,
+    pub meta: ResponseMeta,
 }
 
 /// Result of a successful `sample_tires` call. Very slow-changing —
@@ -107,6 +127,7 @@ pub struct TiresResult {
     pub tire_fr_psi: Option<f64>,
     pub tire_rl_psi: Option<f64>,
     pub tire_rr_psi: Option<f64>,
+    pub meta: ResponseMeta,
 }
 
 /// Result of a body-controller-state probe. Both fields are
@@ -165,6 +186,7 @@ pub struct Sample {
 /// `VehicleState` which tesla-control doesn't expose as a state
 /// category, so there's no point burning BLE air time on it.
 pub async fn sample_drive(vin: &str, adapter: &str) -> Result<DriveResult> {
+    let started = std::time::Instant::now();
     let (result, outcome) = run_state_timed(vin, adapter, "drive").await;
     info!("state-poll: drive={}", outcome.fmt_short());
     if let Some(err) = &outcome.error {
@@ -174,6 +196,7 @@ pub async fn sample_drive(vin: &str, adapter: &str) -> Result<DriveResult> {
         );
     }
     let drive = result?;
+    let meta = build_meta(&drive, started);
     Ok(DriveResult {
         // Reverse-geocoded address. Tesla emits it inside the
         // `locationState` object that's also returned by `state drive`
@@ -200,12 +223,14 @@ pub async fn sample_drive(vin: &str, adapter: &str) -> Result<DriveResult> {
         // Shift state for the phase machine. Not persisted — purely
         // a transient signal for "should the sampler back off?"
         shift_state: pick_shift_state(&drive),
+        meta,
     })
 }
 
 /// Slow-cadence sample: `state climate`. Polled every ~60s in
 /// Active mode. Returns the cabin/exterior temps + HVAC on/off.
 pub async fn sample_climate(vin: &str, adapter: &str) -> Result<ClimateResult> {
+    let started = std::time::Instant::now();
     let (result, outcome) = run_state_timed(vin, adapter, "climate").await;
     info!("state-poll: climate={}", outcome.fmt_short());
     if let Some(err) = &outcome.error {
@@ -215,6 +240,7 @@ pub async fn sample_climate(vin: &str, adapter: &str) -> Result<ClimateResult> {
         );
     }
     let climate = result?;
+    let meta = build_meta(&climate, started);
     Ok(ClimateResult {
         interior_temp_c: pick_f64(
             &climate,
@@ -228,6 +254,7 @@ pub async fn sample_climate(vin: &str, adapter: &str) -> Result<ClimateResult> {
             &climate,
             &["isClimateOn", "is_climate_on", "hvacAuto", "climateKeeperMode"],
         ),
+        meta,
     })
 }
 
@@ -241,6 +268,7 @@ pub async fn sample_climate(vin: &str, adapter: &str) -> Result<ClimateResult> {
 /// running, not how hot the pack is). We leave the column nullable
 /// in the schema for forward compatibility but don't waste a probe.
 pub async fn sample_charge(vin: &str, adapter: &str) -> Result<ChargeResult> {
+    let started = std::time::Instant::now();
     let (result, outcome) = run_state_timed(vin, adapter, "charge").await;
     info!("state-poll: charge={}", outcome.fmt_short());
     if let Some(err) = &outcome.error {
@@ -250,8 +278,10 @@ pub async fn sample_charge(vin: &str, adapter: &str) -> Result<ChargeResult> {
         );
     }
     let charge = result?;
+    let meta = build_meta(&charge, started);
     Ok(ChargeResult {
         battery_pct: pick_f64(&charge, &["batteryLevel", "battery_level", "batteryPct"]),
+        meta,
     })
 }
 
@@ -261,6 +291,7 @@ pub async fn sample_charge(vin: &str, adapter: &str) -> Result<ChargeResult> {
 /// noticeable freshness cost. Values converted from Tesla's native
 /// BAR to PSI to match what US vehicles display.
 pub async fn sample_tires(vin: &str, adapter: &str) -> Result<TiresResult> {
+    let started = std::time::Instant::now();
     let (result, outcome) = run_state_timed(vin, adapter, "tire-pressure").await;
     info!("state-poll: tires={}", outcome.fmt_short());
     if let Some(err) = &outcome.error {
@@ -270,6 +301,7 @@ pub async fn sample_tires(vin: &str, adapter: &str) -> Result<TiresResult> {
         );
     }
     let tires = result?;
+    let meta = build_meta(&tires, started);
     Ok(TiresResult {
         tire_fl_psi: pick_f64(&tires, &["tpmsPressureFl", "tpms_pressure_fl"])
             .map(bar_to_psi),
@@ -279,7 +311,24 @@ pub async fn sample_tires(vin: &str, adapter: &str) -> Result<TiresResult> {
             .map(bar_to_psi),
         tire_rr_psi: pick_f64(&tires, &["tpmsPressureRr", "tpms_pressure_rr"])
             .map(bar_to_psi),
+        meta,
     })
+}
+
+/// Pull Tesla's wall-clock timestamp out of a state response (every
+/// `state X` response has a `timestamp` field in the nested state
+/// object, e.g. `driveState.timestamp`, `climateState.timestamp`).
+/// Used by the clock-sync feature: a successful response gives us a
+/// GPS-accurate reference for setting the Pi's clock without needing
+/// NTP. Bundled with the request-started Instant so the caller can
+/// compute round-trip-time for latency compensation.
+fn build_meta(parsed: &Value, started: std::time::Instant) -> ResponseMeta {
+    let ts = pick_string(parsed, &["timestamp"])
+        .and_then(|s| crate::clock_sync::parse_rfc3339_secs(&s));
+    ResponseMeta {
+        vehicle_ts_secs: ts,
+        request_started_at: Some(started),
+    }
 }
 
 /// Cheap sample via `body-controller-state` — works on a sleeping

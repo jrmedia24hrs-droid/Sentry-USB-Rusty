@@ -361,16 +361,19 @@ pub async fn get_rtc_status(State(_s): State<AppState>) -> impl IntoResponse {
 ///
 /// Reports whether the Pi's system clock can be trusted for
 /// timestamping samples + matching them to drives later. Used by the
-/// BLE pair card to show a "clock not synced — sampling paused"
-/// warning ONLY when both:
+/// BLE pair card to show a short "clock not synced" hint ONLY when
+/// all of:
 ///   * The system clock looks bogus (year < 2025 = unset / Jan-1-2000
 ///     fallback / etc.)
-///   * No RTC battery is installed (with RTC, clock survives reboots
-///     and is fine the moment the kernel comes up)
+///   * No RTC battery is installed (with RTC, clock survives reboots)
+///   * No NTP sync has happened yet
 ///
-/// Users with an RTC battery never see the warning. Users without
-/// one only see it during the brief window between boot and NTP
-/// sync — which on home WiFi is typically seconds.
+/// Note: the telemetry sampler can now self-correct the system clock
+/// from any successful BLE state-poll response (Tesla embeds a
+/// GPS-derived timestamp in every state reply). So even without RTC
+/// or WiFi, the clock comes good as soon as the car responds once.
+/// The warning is now informational ("we're waiting on the first
+/// reading") rather than blocking.
 ///
 /// Response shape:
 /// ```json
@@ -378,7 +381,7 @@ pub async fn get_rtc_status(State(_s): State<AppState>) -> impl IntoResponse {
 ///   "synced": true,            // year >= 2025 OR systemd-timesyncd marker
 ///   "has_rtc": true,           // /dev/rtc0 exists
 ///   "ntp_synced": true,        // /run/systemd/timesync/synchronized exists
-///   "show_warning": false      // !synced && !has_rtc — what the UI should gate on
+///   "show_warning": false      // !synced && !has_rtc && !ntp_synced
 /// }
 /// ```
 pub async fn get_clock_status(
