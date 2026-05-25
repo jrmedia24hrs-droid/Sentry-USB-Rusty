@@ -2558,10 +2558,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "libc",
+ "prost-types",
  "rusqlite",
  "sentryusb-config",
  "sentryusb-drives",
  "sentryusb-shell",
+ "sentryusb-tesla-ble",
  "serde_json",
  "tempfile",
  "tokio",

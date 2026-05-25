@@ -21,6 +21,7 @@ mod config;
 mod db;
 mod lock;
 mod sample;
+mod sample_ble;
 mod usb_watch;
 
 use std::time::{Duration, Instant};
@@ -272,6 +273,12 @@ async fn main() -> Result<()> {
     // the same tick's Sample row when both timers happen to fire
     // together.
     let mut last_parked_awake_tpms_refresh: Option<Instant> = None;
+    // Long-lived BLE session for state queries. Lazy-spawned in
+    // tick() on the first state-poll cycle after BLE telemetry is
+    // enabled; reused for the rest of the process's lifetime so we
+    // avoid re-scanning + re-handshaking on every cycle. Dropped
+    // and recreated if VIN changes mid-run.
+    let mut ble_session: Option<sample_ble::SessionHandle> = None;
 
     // SIGTERM handler — release the radio on shutdown so the iOS
     // GATT daemon can come back up cleanly.
@@ -326,6 +333,7 @@ async fn main() -> Result<()> {
                 &mut schedule,
                 &mut last_parked_awake_refresh,
                 &mut last_parked_awake_tpms_refresh,
+                &mut ble_session,
             ) => {
                 tokio::time::sleep(sleep).await;
             }
@@ -363,6 +371,7 @@ async fn tick(
     schedule: &mut Schedule,
     last_parked_awake_refresh: &mut Option<Instant>,
     last_parked_awake_tpms_refresh: &mut Option<Instant>,
+    ble_session: &mut Option<sample_ble::SessionHandle>,
 ) -> Duration {
     let cfg = match BleConfig::load() {
         Ok(c) => c,
@@ -371,6 +380,20 @@ async fn tick(
             return DISABLED_POLL;
         }
     };
+
+    // Lazy-spawn (or recreate-on-VIN-change) the persistent BLE
+    // session. Cheap when the session already exists — just a VIN
+    // string compare. The first call does the heavy lifting (key
+    // load + scan + GATT connect + handshake) inside the first
+    // sample_*_ble call below.
+    if let Err(e) = sample_ble::ensure_session_for(ble_session, &cfg.vin) {
+        warn!("could not start PersistentSession (will retry next tick): {e:#}");
+        return Duration::from_secs(5);
+    }
+    let session = &ble_session
+        .as_ref()
+        .expect("ensure_session_for set it on success")
+        .session;
 
     if !cfg.enabled {
         if *held_radio {
@@ -436,7 +459,7 @@ async fn tick(
         if acquired {
             // Always probe body-controller first — it's the
             // canonical source of user_presence and is sleep-safe.
-            let presence_now = match sample::sample_body_controller(&cfg.vin, &cfg.adapter).await {
+            let presence_now = match sample_ble::sample_body_controller_ble(&cfg.vin).await {
                 Ok(bc) => {
                     let p = bc.user_presence;
                     persist(conn, bc.sample);
@@ -476,7 +499,7 @@ async fn tick(
             // scheduler kicks in on the next tick if we detect a
             // shift change.
             if presence_now == Some(true) {
-                match sample::sample_drive(&cfg.vin, &cfg.adapter).await {
+                match sample_ble::sample_drive_ble(session).await {
                     Ok(d) => {
                         // Self-correct the Pi's clock if it's
                         // significantly off — uses Tesla's
@@ -550,7 +573,7 @@ async fn tick(
                     let mut any_ok = false;
 
                     if refresh_due {
-                        match sample::sample_climate(&cfg.vin, &cfg.adapter).await {
+                        match sample_ble::sample_climate_ble(session).await {
                             Ok(c) => {
                                 try_sync_clock(c.meta);
                                 refresh.interior_temp_c = c.interior_temp_c;
@@ -560,7 +583,7 @@ async fn tick(
                             }
                             Err(e) => warn!("parked-awake climate refresh failed: {e}"),
                         }
-                        match sample::sample_charge(&cfg.vin, &cfg.adapter).await {
+                        match sample_ble::sample_charge_ble(session).await {
                             Ok(c) => {
                                 try_sync_clock(c.meta);
                                 refresh.battery_pct = c.battery_pct;
@@ -575,7 +598,7 @@ async fn tick(
                         // TPMS rarely changes while parked, but
                         // periodic checks confirm sensors still
                         // report and feed the dashboard's TPMS card.
-                        match sample::sample_tires(&cfg.vin, &cfg.adapter).await {
+                        match sample_ble::sample_tires_ble(session).await {
                             Ok(t) => {
                                 try_sync_clock(t.meta);
                                 refresh.tire_fl_psi = t.tire_fl_psi;
@@ -660,7 +683,7 @@ async fn tick(
         // Carries: shiftState (drive detection), locationName,
         // odometer. The "must stay fresh" signals.
         if schedule.drive_due(tick_now) {
-            let success = match sample::sample_drive(&cfg.vin, &cfg.adapter).await {
+            let success = match sample_ble::sample_drive_ble(session).await {
                 Ok(d) => {
                     try_sync_clock(d.meta);
                     sample.odometer_mi = d.odometer_mi;
@@ -681,7 +704,7 @@ async fn tick(
 
         // ── 2. CLIMATE (every 60s) ──
         if schedule.climate_due(tick_now) {
-            let success = match sample::sample_climate(&cfg.vin, &cfg.adapter).await {
+            let success = match sample_ble::sample_climate_ble(session).await {
                 Ok(c) => {
                     try_sync_clock(c.meta);
                     sample.interior_temp_c = c.interior_temp_c;
@@ -700,7 +723,7 @@ async fn tick(
 
         // ── 3. CHARGE (every 60s, offset 30s from climate) ──
         if schedule.charge_due(tick_now) {
-            let success = match sample::sample_charge(&cfg.vin, &cfg.adapter).await {
+            let success = match sample_ble::sample_charge_ble(session).await {
                 Ok(c) => {
                     try_sync_clock(c.meta);
                     sample.battery_pct = c.battery_pct;
@@ -717,7 +740,7 @@ async fn tick(
 
         // ── 4. TIRES (every 5 min) ──
         if schedule.tires_due(tick_now) {
-            let success = match sample::sample_tires(&cfg.vin, &cfg.adapter).await {
+            let success = match sample_ble::sample_tires_ble(session).await {
                 Ok(t) => {
                     try_sync_clock(t.meta);
                     sample.tire_fl_psi = t.tire_fl_psi;
