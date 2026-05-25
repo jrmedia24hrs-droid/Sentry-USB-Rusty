@@ -22,10 +22,18 @@ import {
 // Colour intent: red (unsafe top + bottom), amber (harsher ride near top
 // of safe), green (optimal), orange (reduced handling near bottom of safe).
 // Opacity is high enough that the zones read as blocks rather than tints.
+//
+// The top (>50) and bottom (<28) UNSAFE bands cap their y1/y2 at the
+// chart's visible domain (20..55) — NOT at the conceptual zone range
+// (15..60). Recharts computes `position: "center"` from the literal
+// y1/y2 you give it; if y2 extends above the chart's max the label
+// gets pushed off the top edge and looks like it's hugging the
+// border instead of centred in the visible red strip. The other three
+// bands already sit entirely inside the domain so they're unaffected.
 const ZONES = [
   {
     y1: 50,
-    y2: 60,
+    y2: 55,
     fill: "rgba(127, 29, 29, 0.55)",
     label: ">50 PSI • UNSAFE",
     labelColor: "#fca5a5",
@@ -52,7 +60,7 @@ const ZONES = [
     labelColor: "#fcd34d",
   },
   {
-    y1: 15,
+    y1: 20,
     y2: 28,
     fill: "rgba(127, 29, 29, 0.55)",
     label: "<28 PSI • UNSAFE",
