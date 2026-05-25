@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react"
+import { useEffect, useState, lazy, Suspense } from "react"
 import { useSearchParams } from "react-router-dom"
 import {
   RefreshCw,
@@ -7,23 +7,35 @@ import {
   Settings as SettingsIcon,
   Unplug,
   RotateCcw,
+  Loader2,
 } from "lucide-react"
 import { api } from "@/lib/api"
-import { SetupWizard } from "@/components/setup/SetupWizard"
 import { HeaderStrip } from "@/components/settings/HeaderStrip"
 import { ActionsRail, type ActionChipProps } from "@/components/settings/ActionsRail"
 import { TabBar } from "@/components/ui/TabBar"
-import { RawConfigEditor, type RawConfigEntry } from "@/components/settings/sections/RawConfigEditor"
-import { HealthCheckModal } from "@/components/settings/sections/HealthCheckModal"
-import { SpeedTestModal } from "@/components/settings/sections/SpeedTestModal"
-import { DeviceTab } from "@/pages/settings/DeviceTab"
-import { NetworkTab } from "@/pages/settings/NetworkTab"
-import { UpdatesTab } from "@/pages/settings/UpdatesTab"
-import { BackupsTab } from "@/pages/settings/BackupsTab"
-import { NotificationsTab } from "@/pages/settings/NotificationsTab"
-import { PrivacyTab } from "@/pages/settings/PrivacyTab"
-import { AboutTab } from "@/pages/settings/AboutTab"
+import type { RawConfigEntry } from "@/components/settings/sections/RawConfigEditor"
 import type { PiStatus } from "@/lib/api"
+
+// Lazy tab chunks — only the active tab pays for its bundle. Visiting
+// /settings without clicking a tab pulls just the shell + Device
+// (default). Each tab module exports a named component, so wrap with
+// `.then(m => ({ default: m.X }))` to satisfy React.lazy's
+// default-export contract.
+const DeviceTab = lazy(() => import("@/pages/settings/DeviceTab").then(m => ({ default: m.DeviceTab })))
+const NetworkTab = lazy(() => import("@/pages/settings/NetworkTab").then(m => ({ default: m.NetworkTab })))
+const UpdatesTab = lazy(() => import("@/pages/settings/UpdatesTab").then(m => ({ default: m.UpdatesTab })))
+const BackupsTab = lazy(() => import("@/pages/settings/BackupsTab").then(m => ({ default: m.BackupsTab })))
+const NotificationsTab = lazy(() => import("@/pages/settings/NotificationsTab").then(m => ({ default: m.NotificationsTab })))
+const PrivacyTab = lazy(() => import("@/pages/settings/PrivacyTab").then(m => ({ default: m.PrivacyTab })))
+const AboutTab = lazy(() => import("@/pages/settings/AboutTab").then(m => ({ default: m.AboutTab })))
+
+// Modals are only mounted while open — defer their bundles entirely
+// until the user opens them. SetupWizard alone pulls in several
+// step components + the BLE pairing flow.
+const SetupWizard = lazy(() => import("@/components/setup/SetupWizard").then(m => ({ default: m.SetupWizard })))
+const RawConfigEditor = lazy(() => import("@/components/settings/sections/RawConfigEditor").then(m => ({ default: m.RawConfigEditor })))
+const HealthCheckModal = lazy(() => import("@/components/settings/sections/HealthCheckModal").then(m => ({ default: m.HealthCheckModal })))
+const SpeedTestModal = lazy(() => import("@/components/settings/sections/SpeedTestModal").then(m => ({ default: m.SpeedTestModal })))
 
 const TABS = [
   "Device",
@@ -252,43 +264,66 @@ export default function Settings() {
 
       <TabBar tabs={TABS} active={activeTab} onSelect={setTab} scrollable={isMobile} />
 
-      {activeTab === "Device" && <DeviceTab />}
-      {activeTab === "Network" && <NetworkTab status={status} />}
-      {activeTab === "Updates" && <UpdatesTab />}
-      {activeTab === "Backups" && <BackupsTab onOpenRawConfig={handleOpenRawConfig} />}
-      {activeTab === "Notifications" && <NotificationsTab />}
-      {activeTab === "Privacy" && <PrivacyTab />}
-      {activeTab === "About" && (
-        <AboutTab
-          status={status}
-          sbc={sbc}
-          hostname={hostname}
-          uptimeSec={uptimeSec}
-          onOpenWizard={handleOpenWizard}
-        />
-      )}
+      <Suspense fallback={<TabFallback />}>
+        {activeTab === "Device" && <DeviceTab />}
+        {activeTab === "Network" && <NetworkTab status={status} />}
+        {activeTab === "Updates" && <UpdatesTab />}
+        {activeTab === "Backups" && <BackupsTab onOpenRawConfig={handleOpenRawConfig} />}
+        {activeTab === "Notifications" && <NotificationsTab />}
+        {activeTab === "Privacy" && <PrivacyTab />}
+        {activeTab === "About" && (
+          <AboutTab
+            status={status}
+            sbc={sbc}
+            hostname={hostname}
+            uptimeSec={uptimeSec}
+            onOpenWizard={handleOpenWizard}
+          />
+        )}
+      </Suspense>
 
-      {/* Modals */}
+      {/* Modals — each wrapped in its own Suspense so a slow chunk for
+          one doesn't block the rest of the page. */}
       {wizardOpen && (
-        <SetupWizard
-          initialData={wizardInitialData}
-          onClose={() => {
-            setWizardOpen(false)
-            setWizardInitialData(undefined)
-          }}
-        />
+        <Suspense fallback={null}>
+          <SetupWizard
+            initialData={wizardInitialData}
+            onClose={() => {
+              setWizardOpen(false)
+              setWizardInitialData(undefined)
+            }}
+          />
+        </Suspense>
       )}
       {rawConfigOpen && rawConfig && (
-        <RawConfigEditor
-          config={rawConfig}
-          onClose={() => {
-            setRawConfigOpen(false)
-            setRawConfig(null)
-          }}
-        />
+        <Suspense fallback={null}>
+          <RawConfigEditor
+            config={rawConfig}
+            onClose={() => {
+              setRawConfigOpen(false)
+              setRawConfig(null)
+            }}
+          />
+        </Suspense>
       )}
-      {healthOpen && <HealthCheckModal onClose={() => setHealthOpen(false)} />}
-      {speedOpen && <SpeedTestModal onClose={() => setSpeedOpen(false)} />}
+      {healthOpen && (
+        <Suspense fallback={null}>
+          <HealthCheckModal onClose={() => setHealthOpen(false)} />
+        </Suspense>
+      )}
+      {speedOpen && (
+        <Suspense fallback={null}>
+          <SpeedTestModal onClose={() => setSpeedOpen(false)} />
+        </Suspense>
+      )}
+    </div>
+  )
+}
+
+function TabFallback() {
+  return (
+    <div className="flex h-32 items-center justify-center">
+      <Loader2 className="h-5 w-5 animate-spin text-slate-500" />
     </div>
   )
 }
