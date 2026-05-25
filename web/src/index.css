@@ -369,8 +369,8 @@ code, pre, .font-mono {
   border: none;
 }
 .drive-pulse {
-  width: 9px;
-  height: 9px;
+  width: 18px;
+  height: 18px;
   display: flex;
   align-items: center;
   justify-content: center;
