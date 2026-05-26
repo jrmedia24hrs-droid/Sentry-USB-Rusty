@@ -16,6 +16,7 @@ import {
   Download,
   AlertTriangle,
   Wind,
+  Info,
 } from "lucide-react"
 import { api } from "@/lib/api"
 import { useKeepAwake } from "@/hooks/useKeepAwake"
@@ -694,6 +695,27 @@ function StorageTile({
         </span>
         <span className="text-[11px] text-slate-500">
           / {formatBytes(totalSpace)} · {usedPctStr} used
+        </span>
+        {/* Reassurance tooltip — high storage usage triggers panic
+            for new users ("96% used!"), but Sentry USB rotates
+            snapshots automatically as space gets tight. CSS-only
+            group-hover so we don't need React state for it.
+            Anchored right-0 so the 256px tooltip extends LEFT into
+            the card body rather than overflowing off the right
+            edge on narrow grid columns. */}
+        <span className="group relative inline-flex items-center self-center">
+          <Info
+            aria-label="About storage management"
+            className="h-3 w-3 cursor-help text-slate-600 transition-colors hover:text-slate-400"
+          />
+          <span className="pointer-events-none absolute right-0 top-full z-50 mt-2 w-64 rounded-xl border border-white/10 bg-slate-900 p-3 text-[11px] leading-relaxed text-slate-400 opacity-0 shadow-xl transition-opacity group-hover:pointer-events-auto group-hover:opacity-100">
+            <span className="absolute bottom-full right-3 block border-4 border-transparent border-b-slate-900" />
+            Sentry USB automatically manages your storage. Old
+            snapshots are deleted when space is needed — you don't
+            need to manually free up space. Low remaining space is
+            normal and expected, especially with dashcam footage
+            being continuously saved.
+          </span>
         </span>
       </div>
       {breakdown && segments.length > 0 ? (
