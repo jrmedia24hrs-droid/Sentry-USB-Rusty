@@ -237,33 +237,69 @@ impl Connection {
         }
 
         // Receive until we have a complete framed payload.
+        //
+        // `desyncs` counts how many times we've hit a too-large length
+        // prefix in this single round_trip. We recover inline (clear
+        // the polluting bytes, keep RX'ing for the real response)
+        // rather than bailing — the wall-clock `timeout` still bounds
+        // total wait time, and recovering in-flight lets a Tesla query
+        // succeed even when bluez handed us a partial-frame straggler
+        // right after our drain exited.
+        //
+        // Why this matters in practice: tester bundles showed
+        // sample_charge / sample_climate failing on EVERY tick (373
+        // and 377 failures vs 0 successes for charge in a 10h window)
+        // while sample_drive / sample_closures / sample_tires worked
+        // fine. The pattern was a single 100-150 byte stale
+        // notification landing in rx_buffer between drain end and
+        // Tesla's actual response — try_unframe read its first 2
+        // bytes as a length (always > 1024 since the bytes were
+        // mid-payload garbage), the old code bailed, and the whole
+        // query failed. With inline recovery, the buffer gets cleared
+        // and we wait for the next notification — which IS Tesla's
+        // real response — and the query succeeds.
+        //
+        // We do cap recovery at MAX_DESYNCS to avoid pathological
+        // spinning if the link is genuinely flooded with garbage; at
+        // that point the wall-clock timeout should fire anyway, but
+        // an explicit cap makes the failure mode "loud" instead of
+        // "silently maxed out at the timeout boundary."
+        const MAX_DESYNCS: u32 = 16;
+        let mut desyncs: u32 = 0;
         timeout(wait, async {
             loop {
                 let unframed = match try_unframe(&mut self.rx_buffer) {
                     Ok(v) => v,
                     Err(e) => {
                         // try_unframe fails when the length prefix says
-                        // something insane (> 1024). That's a hard sign
-                        // of buffer desync — bytes from one frame are
-                        // being interpreted as a length prefix of
-                        // another. Clear the buffer so the NEXT chunk
-                        // arriving has a chance of being a clean
-                        // length prefix, log the head bytes for
-                        // diagnostics, and bubble up so the caller
-                        // retries with a fresh round_trip (which will
-                        // run a full drain).
+                        // something insane (> 1024). Bytes from one
+                        // frame are being interpreted as a length
+                        // prefix of another — most often a stale
+                        // notification that snuck in after drain
+                        // exited. Clear the polluting bytes and KEEP
+                        // RX'ing within this same round_trip; Tesla's
+                        // real response is usually the next chunk to
+                        // arrive.
                         let head_hex = hex::encode(
                             &self.rx_buffer[..self.rx_buffer.len().min(64)],
                         );
                         warn!(
                             "framing desync: try_unframe rejected {} buffer bytes \
-                             (head: {}…) — clearing buffer and surfacing error so \
-                             caller retries clean",
+                             ({}); head: {}… — clearing buffer, continuing to RX \
+                             within the same round_trip",
                             self.rx_buffer.len(),
+                            e,
                             head_hex,
                         );
                         self.rx_buffer.clear();
-                        return Err(e);
+                        desyncs += 1;
+                        if desyncs > MAX_DESYNCS {
+                            return Err(e).context(format!(
+                                "exceeded {MAX_DESYNCS} framing desyncs in one round_trip — \
+                                 giving up so caller can re-handshake"
+                            ));
+                        }
+                        continue;
                     }
                 };
                 if let Some(payload) = unframed {
