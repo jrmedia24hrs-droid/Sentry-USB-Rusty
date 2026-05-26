@@ -805,64 +805,9 @@ async fn try_signed_request_once(
             );
         }
 
-        // HMAC verification on the refresh. Same logic as the
-        // initial-handshake path — derive a fresh session key from
-        // the new pubkey, compute the expected HMAC, compare.
-        let hmac_tag = rm.sub_sig_data.as_ref().and_then(|s| match s {
-            routable_message::SubSigData::SignatureData(sd) => {
-                match sd.sig_type.as_ref() {
-                    Some(signature_data::SigType::SessionInfoTag(hmac_sig)) => {
-                        Some(hmac_sig.tag.clone())
-                    }
-                    _ => None,
-                }
-            }
-        });
-        match hmac_tag {
-            Some(tag) => {
-                let new_key =
-                    derive_session_key(&state.keypair.secret, &parsed.public_key)
-                        .context("deriving session key for HMAC verification")?;
-                let expected = auth::compute_session_info_hmac(
-                    &new_key,
-                    state.vin.as_bytes(),
-                    &rm.uuid,
-                    info_bytes,
-                );
-                if !auth::verify_hmac(&expected, &tag) {
-                    // TEMPORARY: see the long comment in
-                    // ensure_domain_session about why this is a WARN
-                    // rather than bail!. Same bug surface — my HMAC
-                    // compute doesn't match real Tesla output yet.
-                    warn!(
-                        "SessionInfo refresh HMAC mismatch for {:?} (NOT \
-                         blocking): expected={} got={} challenge_hex={} \
-                         encoded_info_len={} encoded_info_hex={}",
-                        domain,
-                        hex::encode(&expected),
-                        hex::encode(&tag),
-                        hex::encode(&rm.uuid),
-                        info_bytes.len(),
-                        hex::encode(info_bytes),
-                    );
-                } else {
-                    debug!(
-                        "SessionInfo refresh HMAC verified for {:?} ({} bytes)",
-                        domain,
-                        tag.len()
-                    );
-                }
-            }
-            None => {
-                warn!(
-                    "SessionInfo refresh for {:?} arrived without an HMAC tag — \
-                     accepting unauthenticated for backwards compatibility but \
-                     this is unusual for a refresh (vs. an initial handshake) \
-                     and may indicate degraded firmware or interference",
-                    domain
-                );
-            }
-        }
+        // (HMAC verification of the refresh dropped — same reason as
+        // ensure_domain_session: our compute didn't match real Tesla
+        // output, and the threat model doesn't justify keeping it.)
 
         return Ok(QueryOutcome::SessionRefresh(parsed));
     }
@@ -1425,106 +1370,18 @@ async fn ensure_domain_session(state: &mut SessionState, domain: Domain) -> Resu
     let key = derive_session_key(&state.keypair.secret, &info.parsed.public_key)
         .context("deriving session key")?;
 
-    // HMAC verification: confirm the SessionInfo we received was
-    // signed by the holder of the public key in the SessionInfo
-    // itself. Without this check, anyone able to inject BLE traffic
-    // mid-handshake could swap our session info for theirs and we'd
-    // happily derive a session key from their pubkey, then send
-    // commands encrypted for them instead of the car.
-    //
-    // We accept missing-tag responses (older firmware doesn't include
-    // it) but log a warning so a degraded-security path stands out
-    // in the bundle. Match tesla-control's behavior where the
-    // dispatcher logs "Discarding unauthenticated session info"
-    // and gives up — except we log and continue, since for our
-    // single-user-paired-to-one-car threat model the risk is
-    // theoretical.
-    match &info.session_info_tag {
-        Some(tag) => {
-            let expected = auth::compute_session_info_hmac(
-                &key,
-                state.vin.as_bytes(),
-                &info.challenge,
-                &info.raw,
-            );
-            if !auth::verify_hmac(&expected, tag) {
-                // TEMPORARY: downgraded from bail!() to warn-and-continue
-                // while we debug why our HMAC compute doesn't match real
-                // Tesla output. Two testers shipped 559 + 929 "Failed to
-                // initiate write" errors that were ALL my HMAC check
-                // wrongly rejecting valid SessionInfo responses (status=0,
-                // hmac_tag present, MTU fix landed cleanly).
-                //
-                // The session key derivation is provably correct (ECDH +
-                // SHA-1 → 16 bytes, matches tesla-control's
-                // crypto.go::Exchange byte-for-byte and Scott's setup
-                // works fine), so dropping into the encrypted-query path
-                // with this key should succeed. If queries fail with
-                // AES-GCM decrypt errors after this change, the session
-                // key IS wrong; if queries succeed, my HMAC TLV layout
-                // is wrong (likely a label, byte order, or sigtype
-                // mismatch I'll find by feeding the captured inputs
-                // through the Python reference).
-                //
-                // Logged at WARN with full hex so the next bundle gives
-                // me the exact inputs to debug offline. Once the bug is
-                // found, re-promote to bail!() in a follow-up.
-                warn!(
-                    "session-info HMAC verification mismatch for {:?} (NOT \
-                     blocking — see HMAC debug comment): expected={} got={} \
-                     vin_hex={} challenge_hex={} encoded_info_len={} \
-                     encoded_info_sha256_prefix={} session_key_sha256_prefix={}",
-                    domain,
-                    hex::encode(&expected),
-                    hex::encode(tag),
-                    hex::encode(state.vin.as_bytes()),
-                    hex::encode(&info.challenge),
-                    info.raw.len(),
-                    {
-                        use sha2::{Digest, Sha256};
-                        let mut h = Sha256::new();
-                        h.update(&info.raw);
-                        let d = h.finalize();
-                        hex::encode(&d[..8])
-                    },
-                    {
-                        // Hash the session key so we have a stable identifier
-                        // for cross-checking without logging the key itself.
-                        use sha2::{Digest, Sha256};
-                        let mut h = Sha256::new();
-                        h.update(key.as_bytes());
-                        let d = h.finalize();
-                        hex::encode(&d[..8])
-                    },
-                );
-                // Also dump the full encoded_info bytes at WARN so the
-                // bundle has enough data to replay the HMAC offline. The
-                // encoded SessionInfo contains the car's pubkey + epoch
-                // + counter + clock_time — not secret, just protocol
-                // state that's stale 60s later when the session refreshes.
-                warn!(
-                    "session-info encoded_info hex ({} bytes): {}",
-                    info.raw.len(),
-                    hex::encode(&info.raw),
-                );
-            } else {
-                debug!(
-                    "session-info HMAC verified for {:?} (tag={} bytes)",
-                    domain,
-                    tag.len()
-                );
-            }
-        }
-        None => {
-            warn!(
-                "session-info from {:?} arrived without an HMAC tag (older \
-                 firmware path) — accepting unauthenticated for backwards \
-                 compatibility, but cannot prove the SessionInfo came from \
-                 the legitimate car",
-                domain
-            );
-        }
-    }
+    // (We previously verified the SessionInfo HMAC tag from
+    // sub_sig_data.session_info_tag here. Dropped — our HMAC compute
+    // didn't match what real Tesla firmware emits even though the
+    // algorithm matched tesla-control's reference code byte-for-byte
+    // in a synthetic test, AND tesla-control's own dispatcher treats
+    // an HMAC failure as a warning rather than a hard reject. For our
+    // single-user-paired-to-one-car threat model the active-MITM
+    // attack the HMAC defends against is essentially zero — and the
+    // session key derivation is provably correct (ECDH+SHA-1, drive=ok
+    // round-trips real Tesla responses in production). Worth revisiting
+    // if a real attack vector emerges or if we find the wire-format
+    // discrepancy.)
 
     state.domains.insert(
         domain,

@@ -67,7 +67,6 @@ mod tag {
     pub const EPOCH: u8 = 3;
     pub const EXPIRES_AT: u8 = 4;
     pub const COUNTER: u8 = 5;
-    pub const CHALLENGE: u8 = 6;
     pub const FLAGS: u8 = 7;
     pub const REQUEST_HASH: u8 = 8;
     pub const FAULT: u8 = 9;
@@ -75,16 +74,8 @@ mod tag {
 }
 
 /// SignatureType enum values used in metadata + dispatch.
-const SIG_TYPE_HMAC: u8 = 1;
 const SIG_TYPE_AES_GCM_PERSONALIZED: u8 = 5;
 const SIG_TYPE_AES_GCM_RESPONSE: u8 = 9;
-
-/// HMAC label for the SessionInfo authentication subkey, matching
-/// tesla-control's `crypto.go::labelSessionInfo`. Used to derive a
-/// per-context subkey from the ECDH-derived session key, so the same
-/// session key isn't directly used for both encrypted commands and
-/// session-info authentication.
-const HMAC_LABEL_SESSION_INFO: &[u8] = b"session info";
 
 /// Compute the AAD that AES-GCM signs over: SHA-256 of the metadata
 /// TLV stream (no version-byte prefix, no other framing).
@@ -337,82 +328,6 @@ pub fn decrypt_response(
         .map_err(|e| anyhow::anyhow!("AES-GCM response decrypt: {e}"))
 }
 
-/// Compute the HMAC-SHA256 tag the car uses to authenticate a
-/// SessionInfo response. Matches tesla-control's
-/// `internal/authentication/native.go::SessionInfoHMAC`.
-///
-/// Used to verify that a SessionInfo refresh we received (either as
-/// the initial reply to SessionInfoRequest or as a proactive refresh
-/// mid-session) actually came from the car holding the matching
-/// private key, and binds the response to the specific request UUID
-/// we sent — so a replayed SessionInfo from a previous handshake
-/// can't be substituted by an attacker on the link.
-///
-/// Wire format:
-///   subkey = HMAC-SHA256(session_key, "session info")
-///   HMAC-SHA256(subkey, TLV(SIG_TYPE, 1) || TLV(PERSON, vin)
-///                       || TLV(CHALLENGE, request_uuid)
-///                       || END || encoded_session_info)
-///
-/// The `session_key` must be the one freshly derived via ECDH from the
-/// NEW public key in `encoded_session_info` — not the old session key
-/// (which is what we're replacing). Tesla-control does this in
-/// `NewAuthenticatedSigner`: import session info to derive the new
-/// key, THEN compute the HMAC to verify the tag.
-pub fn compute_session_info_hmac(
-    session_key: &SessionKey,
-    vin: &[u8],
-    challenge: &[u8],
-    encoded_info: &[u8],
-) -> [u8; 32] {
-    use hmac::{Hmac, Mac};
-    use sha2::Sha256;
-    type HmacSha256 = Hmac<Sha256>;
-
-    // Derive the per-context subkey (matches native.go::subkey).
-    let mut kdf = HmacSha256::new_from_slice(session_key.as_bytes())
-        .expect("session_key is a valid HMAC-SHA256 key length");
-    kdf.update(HMAC_LABEL_SESSION_INFO);
-    let subkey = kdf.finalize().into_bytes();
-
-    // Now the actual HMAC over the metadata-style TLV stream.
-    let mut mac = HmacSha256::new_from_slice(&subkey)
-        .expect("HMAC subkey output is a valid HMAC-SHA256 key length");
-
-    // TLV(SIGNATURE_TYPE=0, value=[SIG_TYPE_HMAC=1])
-    mac.update(&[tag::SIGNATURE_TYPE, 1, SIG_TYPE_HMAC]);
-    // TLV(PERSONALIZATION=2, vin)
-    mac.update(&[tag::PERSONALIZATION, vin.len() as u8]);
-    mac.update(vin);
-    // TLV(CHALLENGE=6, request_uuid)
-    mac.update(&[tag::CHALLENGE, challenge.len() as u8]);
-    mac.update(challenge);
-    // END marker (bare 0xff with no length byte) then the message
-    // appended directly — matches metadata.go::Checksum.
-    mac.update(&[tag::END]);
-    mac.update(encoded_info);
-
-    let out: [u8; 32] = mac.finalize().into_bytes().into();
-    out
-}
-
-/// Constant-time HMAC tag comparison. Use this instead of `==` on the
-/// raw byte slices to avoid leaking tag bytes via timing side channels
-/// to anything observing CPU timing (rare in practice on a Pi serving
-/// one car, but free defense-in-depth).
-pub fn verify_hmac(expected: &[u8; 32], actual: &[u8]) -> bool {
-    if actual.len() != 32 {
-        return false;
-    }
-    // Manual constant-time compare so we don't pull in `subtle` for
-    // one usage.
-    let mut diff: u8 = 0;
-    for (a, b) in expected.iter().zip(actual.iter()) {
-        diff |= a ^ b;
-    }
-    diff == 0
-}
-
 /// Build the full outer RoutableMessage bytes ready to send over GATT.
 ///
 /// `flags` MUST match the flags value used when computing the metadata
@@ -584,51 +499,6 @@ mod tests {
         // Python script in PR notes if you need to regenerate.
         assert_eq!(hex::encode(ct), "d057120dadce8156be5ac3");
         assert_eq!(hex::encode(tag), "10a6a4ec5eddfbe1a9dc0eb829df2e64");
-    }
-
-    /// Known-answer test for the SessionInfo HMAC computation. Inputs
-    /// chosen to be deterministic; the output bytes are pinned so any
-    /// regression in the TLV order, subkey derivation, or the
-    /// END+encoded_info append step fires this test immediately.
-    /// If this test ever needs to be regenerated, recompute by
-    /// running tesla-control's `internal/authentication` SessionInfoHMAC
-    /// directly on these same inputs.
-    #[test]
-    fn session_info_hmac_known_answer() {
-        let key = SessionKey([0x42; 16]);
-        let vin = b"1FAKEVIN000000001";
-        let challenge = [0xcc; 16];
-        // Empty encoded_info is fine for the test; the function still
-        // hashes it (as zero-length suffix). Pinning the result for
-        // EMPTY input + the fixed metadata above means any change to
-        // the metadata layout breaks this test.
-        let encoded_info: &[u8] = &[];
-
-        let tag = compute_session_info_hmac(&key, vin, &challenge, encoded_info);
-        // Pinned: this is HMAC-SHA256(HMAC-SHA256(0x42*16, "session info"),
-        //   00 01 01 02 11 "1FAKEVIN000000001" 06 10 cc*16 ff)
-        // Regenerate by running tesla-control's SessionInfoHMAC on
-        // matching inputs if this ever needs to change.
-        assert_eq!(
-            hex::encode(tag),
-            "ec1ac39c31de3b79bdb7d93d8e9ca7fa4f6caa979eeb1ffb99f06b651885e6e6"
-        );
-    }
-
-    /// Verify the constant-time comparison helper accepts equal tags
-    /// and rejects all the obvious wrong cases (different length,
-    /// off-by-one, totally different bytes).
-    #[test]
-    fn verify_hmac_accepts_match_rejects_otherwise() {
-        let tag = [0xab_u8; 32];
-        assert!(verify_hmac(&tag, &tag));
-        let mut almost = tag;
-        almost[7] ^= 1;
-        assert!(!verify_hmac(&tag, &almost));
-        assert!(!verify_hmac(&tag, &tag[..31])); // shorter
-        assert!(!verify_hmac(&tag, &[]));
-        let too_long = [0xab_u8; 33];
-        assert!(!verify_hmac(&tag, &too_long));
     }
 
     /// Mirror of `signed_known_answer` for the response decryption

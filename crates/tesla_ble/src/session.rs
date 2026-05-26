@@ -52,16 +52,6 @@ pub struct SessionInfoResponse {
     /// Raw SessionInfo proto bytes — keep for cache-file compat.
     pub raw: Vec<u8>,
     pub parsed: SessionInfo,
-    /// The 16-byte request UUID we used as the challenge for this
-    /// exchange. Needed by the caller if it wants to verify the
-    /// SessionInfo HMAC tag (the car HMAC-signs over the challenge
-    /// + encoded_info, see auth::compute_session_info_hmac).
-    pub challenge: [u8; 16],
-    /// The HMAC tag the car attached in `sub_sig_data.SessionInfoTag`,
-    /// or None if the response didn't include one. Callers should
-    /// reject `None` for security-sensitive paths — an absent tag
-    /// means the SessionInfo isn't authenticated.
-    pub session_info_tag: Option<Vec<u8>>,
 }
 
 /// Send SessionInfoRequest to `domain` and decode the response.
@@ -76,12 +66,11 @@ pub async fn request_session_info(
     keypair: &KeyPair,
     domain: Domain,
 ) -> std::result::Result<SessionInfoResponse, SessionError> {
-    let (payload, challenge) = build_request(keypair, domain);
+    let payload = build_request(keypair, domain);
     debug!(
-        "session-info: TX {} bytes to {:?} (challenge={})",
+        "session-info: TX {} bytes to {:?}",
         payload.len(),
         domain,
-        hex::encode(challenge),
     );
     // Validator: must decode as a RoutableMessage. Same rationale
     // as the other round_trip callers; the session-info handshake
@@ -94,15 +83,10 @@ pub async fn request_session_info(
         .await
         .context("session-info round-trip")?;
     debug!("session-info: RX {} bytes", response.len());
-    parse_response(&response, domain, challenge)
+    parse_response(&response, domain)
 }
 
-/// Build a SessionInfoRequest payload AND return the request UUID we
-/// used as the challenge. The challenge is required by the caller for
-/// SessionInfo HMAC verification: the car binds its response to this
-/// specific UUID, and replaying an old SessionInfo from a previous
-/// handshake should fail HMAC verification.
-fn build_request(keypair: &KeyPair, domain: Domain) -> (Vec<u8>, [u8; 16]) {
+fn build_request(keypair: &KeyPair, domain: Domain) -> Vec<u8> {
     let from_uuid = random_uuid_bytes();
     let req_uuid = random_uuid_bytes();
     let msg = RoutableMessage {
@@ -123,37 +107,17 @@ fn build_request(keypair: &KeyPair, domain: Domain) -> (Vec<u8>, [u8; 16]) {
         uuid: req_uuid.to_vec(),
         ..Default::default()
     };
-    (msg.encode_to_vec(), req_uuid)
+    msg.encode_to_vec()
 }
 
 fn parse_response(
     bytes: &[u8],
     domain: Domain,
-    challenge: [u8; 16],
 ) -> std::result::Result<SessionInfoResponse, SessionError> {
-    use crate::proto::signatures::signature_data;
-
     debug!("session-info RX hex: {}", hex::encode(bytes));
     let routable = RoutableMessage::decode(bytes)
         .context("decode outer Routable")?;
     debug!("session-info RX decoded: {:#?}", routable);
-
-    // Pull out the HMAC tag from sub_sig_data.SessionInfoTag, if
-    // present. We don't reject here on missing-tag — that's a
-    // policy decision the caller (manager.rs) makes, since the
-    // initial pair-time bootstrap may need to accept untagged
-    // session info from older firmware before HMAC keys are
-    // established.
-    let session_info_tag = routable.sub_sig_data.as_ref().and_then(|s| match s {
-        crate::proto::universal_message::routable_message::SubSigData::SignatureData(sd) => {
-            match sd.sig_type.as_ref() {
-                Some(signature_data::SigType::SessionInfoTag(hmac_sig)) => {
-                    Some(hmac_sig.tag.clone())
-                }
-                _ => None,
-            }
-        }
-    });
 
     let raw = match routable.payload {
         Some(routable_message::Payload::SessionInfo(b)) => b,
@@ -184,35 +148,25 @@ fn parse_response(
     if parsed.status == SessionInfoStatus::KeyNotOnWhitelist as i32 {
         warn!(
             "session-info from {:?}: car returned KEY_NOT_ON_WHITELIST — \
-             our public key (sha256 prefix {}) is not paired with this VIN. \
+             our public key is not paired with this VIN. \
              User must re-pair from the SentryUSB UI and tap the card on the console.",
             domain,
-            // Show a short fingerprint of our pubkey so the user can
-            // cross-check against the pair output if needed.
-            "<see /root/.ble/key_public.pem>"
         );
         return Err(SessionError::KeyNotPaired);
     }
 
     info!(
-        "session-info from {:?}: counter={}, clock_time={}, pubkey={} bytes, \
-         status={}, hmac_tag={}",
+        "session-info from {:?}: counter={}, clock_time={}, pubkey={} bytes, status={}",
         domain,
         parsed.counter,
         parsed.clock_time,
         parsed.public_key.len(),
         parsed.status,
-        match &session_info_tag {
-            Some(t) => format!("{} bytes", t.len()),
-            None => "<missing>".to_string(),
-        },
     );
     Ok(SessionInfoResponse {
         domain,
         raw,
         parsed,
-        challenge,
-        session_info_tag,
     })
 }
 
