@@ -306,8 +306,10 @@ export default function Files() {
     setUploads(initial)
     setUploading(true)
 
-    // Upload all files in parallel
-    await Promise.all(fileArr.map((f, i) => uploadFileWithProgress(f, currentPath, i)))
+    // Upload files sequentially to avoid overwhelming low-RAM devices
+    for (let i = 0; i < fileArr.length; i++) {
+      await uploadFileWithProgress(fileArr[i], currentPath, i)
+    }
 
     // All uploads finished — auto-refresh
     fetchFiles(currentPath)
