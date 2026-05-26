@@ -117,6 +117,34 @@ else
 fi
 [ -f "${TELEMETRY_DST}" ] && chmod +x "${TELEMETRY_DST}"
 
+# ── Install sentryusb-ble-action ──
+# One-shot BLE action CLI invoked by run/awake_start to send
+# keep-awake commands (wake / sentry-mode / charge-port). Without
+# this binary present, users with BLE keep-awake enabled hit
+# "No such file or directory" errors on every nudge attempt.
+# Same env-override → files/ → release-download precedence as the
+# telemetry binary above so build-image.sh can inject a freshly
+# cross-compiled artifact in CI.
+#
+# Historical note: a tester hit this exact gap (Tesla BLE keep-awake
+# failed 3× with "No such file or directory") because pi-gen only
+# installed the telemetry binary, and update.rs's best-effort fetch
+# silently skipped this binary on a curl glitch. Baking it in here
+# means fresh images never depend on the OTA path getting it.
+BLE_ACTION_BINARY_URL="https://github.com/${REPO}/releases/latest/download/sentryusb-ble-action-${BINARY_SUFFIX}"
+BLE_ACTION_DST="${ROOTFS_DIR}/root/bin/sentryusb-ble-action"
+if [ -n "${SENTRYUSB_BLE_ACTION_BINARY:-}" ] && [ -f "${SENTRYUSB_BLE_ACTION_BINARY}" ]; then
+    cp "${SENTRYUSB_BLE_ACTION_BINARY}" "${BLE_ACTION_DST}"
+elif [ -f "files/sentryusb-ble-action" ]; then
+    cp "files/sentryusb-ble-action" "${BLE_ACTION_DST}"
+else
+    curl -fsSL "${BLE_ACTION_BINARY_URL}" -o "${BLE_ACTION_DST}" 2>/dev/null || {
+        echo "WARNING: Could not download sentryusb-ble-action from releases. Keep-awake BLE nudges will fall back to awake_start's self-heal fetch on first invocation."
+        rm -f "${BLE_ACTION_DST}"
+    }
+fi
+[ -f "${BLE_ACTION_DST}" ] && chmod +x "${BLE_ACTION_DST}"
+
 # ── Install BLE peripheral daemon ──
 BLE_SCRIPT="${ROOTFS_DIR}/root/bin/sentryusb-ble.py"
 if [ -f "files/sentryusb-ble.py" ]; then

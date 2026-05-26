@@ -142,6 +142,42 @@ else
     log "Tesla BLE: Mobile-app Bluetooth disabled. hci0 reserved for tesla-control."
   }
 
+  # Self-heal: if BLE keep-awake is enabled but sentryusb-ble-action
+  # is missing (typical cause: the in-app updater ran but its
+  # best-effort fetch of the binary silently failed, leaving the
+  # user with a new awake_start script that references a binary
+  # that isn't there), pull it down on demand from the latest
+  # release. Falls through gracefully on any failure — subsequent
+  # BLE calls will still log "No such file or directory" and retry,
+  # but the user will see the recovery attempt in the log first.
+  # One-shot per missing-binary event; healthy installs skip this
+  # whole block since `-x` succeeds on the existing binary.
+  if [[ -n "${TESLA_BLE_VIN:+x}" ]] && ble_is_enabled && [ ! -x /root/bin/sentryusb-ble-action ]; then
+    log "Tesla BLE: /root/bin/sentryusb-ble-action missing — attempting one-shot fetch from latest release."
+    _arch=$(uname -m 2>/dev/null || echo unknown)
+    case "$_arch" in
+      aarch64|arm64) _suffix="linux-arm64" ;;
+      armv7l)        _suffix="linux-armv7" ;;
+      armv6l)        _suffix="linux-armv6" ;;
+      *)             _suffix="" ;;
+    esac
+    if [ -n "$_suffix" ]; then
+      _url="https://github.com/Sentry-Six/Sentry-USB-Rusty/releases/latest/download/sentryusb-ble-action-${_suffix}"
+      mkdir -p /root/bin
+      if curl -fsSL --max-time 60 "$_url" -o /tmp/sentryusb-ble-action.fetch; then
+        chmod +x /tmp/sentryusb-ble-action.fetch
+        mv /tmp/sentryusb-ble-action.fetch /root/bin/sentryusb-ble-action
+        log "Tesla BLE: Successfully fetched sentryusb-ble-action from $_url"
+      else
+        log "Tesla BLE: Failed to fetch sentryusb-ble-action from $_url — keep-awake BLE calls will continue to fail. Re-run the in-app update or wget the binary manually."
+        rm -f /tmp/sentryusb-ble-action.fetch
+      fi
+    else
+      log "Tesla BLE: Unknown architecture '$_arch' — cannot auto-fetch sentryusb-ble-action. Install it manually."
+    fi
+    unset _arch _suffix _url
+  fi
+
   # If Tesla BLE is configured AND user hasn't disabled it in settings,
   # disable the GATT daemon once for the session.
   if [[ -n "${TESLA_BLE_VIN:+x}" ]] && ble_is_enabled; then
