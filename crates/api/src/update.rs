@@ -185,7 +185,7 @@ fn update_repo() -> String {
 ///      a76, CPU part 0xD08 → a72, else a53). Used when the picker hasn't
 ///      written the active-variant file yet (e.g., during the first
 ///      migration update from an old single-binary install).
-///   3. Architecture-family fallback via dpkg/uname for armv7/armv6/amd64
+///   3. Architecture-family fallback via dpkg/uname for armv7/amd64
 ///      — those targets don't have per-CPU variants.
 ///
 /// On Pi OS a 64-bit kernel can be paired with a 32-bit (armhf) userspace,
@@ -203,13 +203,18 @@ async fn detect_release_suffix() -> anyhow::Result<String> {
     }
 
     // Tier 3 first (cheap arch-family check) — gates whether we even
-    // need to do per-CPU detection. If we're on armv7/armv6/amd64,
-    // there's only one variant per family.
+    // need to do per-CPU detection. If we're on armv7/amd64, there's
+    // only one variant per family. armv6 (armel / Pi Zero W / Pi 1) is
+    // no longer supported and errors out here so the user sees a
+    // diagnosable failure instead of a 404 on the download.
     let family = if let Ok(out) = sentryusb_shell::run("dpkg", &["--print-architecture"]).await {
         match out.trim() {
             "arm64" => "aarch64",
             "armhf" => return Ok("linux-armv7".to_string()),
-            "armel" => return Ok("linux-armv6".to_string()),
+            "armel" => anyhow::bail!(
+                "armv6 (armel / Pi Zero W / Pi 1) is no longer supported — \
+                 SentryUSB requires Pi Zero 2 W or newer"
+            ),
             "amd64" => return Ok("linux-amd64".to_string()),
             other => anyhow::bail!("unsupported userspace architecture: {}", other),
         }
@@ -218,7 +223,10 @@ async fn detect_release_suffix() -> anyhow::Result<String> {
         match arch.trim() {
             "aarch64" => "aarch64",
             "armv7l" => return Ok("linux-armv7".to_string()),
-            "armv6l" => return Ok("linux-armv6".to_string()),
+            "armv6l" => anyhow::bail!(
+                "armv6 (Pi Zero W / Pi 1) is no longer supported — \
+                 SentryUSB requires Pi Zero 2 W or newer"
+            ),
             "x86_64" => return Ok("linux-amd64".to_string()),
             other => anyhow::bail!("unsupported architecture: {}", other),
         }

@@ -129,7 +129,7 @@ rm -rf crates/sentryusb/static && cp -r web/dist crates/sentryusb/static
 # Binaries (aarch64)
 cross build --release --target aarch64-unknown-linux-gnu -p sentryusb
 
-# Pi Zero W / ARMv7:
+# 32-bit (armhf — Pi 3 with 32-bit Pi OS):
 cross build --release --target armv7-unknown-linux-gnueabihf -p sentryusb
 ```
 
@@ -139,7 +139,7 @@ See [BUILD.md](BUILD.md) for details.
 
 ```bash
 ./build-image.sh                 # 64-bit image (Pi 3/4/5/Zero 2)
-./build-image.sh --32bit         # 32-bit image (Pi Zero W)
+./build-image.sh --32bit         # 32-bit image (armhf — Pi 3 with 32-bit Pi OS)
 ```
 
 The build-image script is for developers and CI; end users should use the curl-one-liner install above.

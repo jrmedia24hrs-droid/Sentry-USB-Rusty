@@ -53,12 +53,6 @@ jobs:
             linker: arm-linux-gnueabihf-gcc
             gcc: gcc-arm-linux-gnueabihf
             artifact_suffix: linux-armv7
-          - name: ARMv6 (Pi Zero W/1)
-            target: arm-unknown-linux-gnueabihf
-            cpu: ""
-            linker: arm-linux-gnueabihf-gcc
-            gcc: gcc-arm-linux-gnueabihf
-            artifact_suffix: linux-armv6
     steps:
       - uses: actions/checkout@v6
 
@@ -83,9 +77,6 @@ jobs:
           # sources.list.d/ubuntu.sources, with or without backports
           # pocket, etc.), so we wholesale-replace both files with
           # arch-scoped entries we control completely.
-          #
-          # armv6 piggybacks on the armhf package set (same EABI; the
-          # libdbus C headers are bit-identical between armhf and armel).
           UBUNTU_CODENAME=$(lsb_release -cs)
           echo "Ubuntu codename: $UBUNTU_CODENAME"
           # Wipe any existing sources so a stale [arch=] line on the
@@ -203,16 +194,14 @@ jobs:
       - name: Build release binaries (sentryusb + telemetry sampler)
         # RUSTFLAGS overrides the per-target rustflags in .cargo/config.toml
         # so each aarch64 matrix entry produces a binary tuned to its
-        # specific Cortex-A microarchitecture. armv6 has cpu="" → we skip
-        # the target-cpu override and inherit whatever rustc's default is
-        # (no per-CPU tuning for armv6; one binary covers Pi Zero W and Pi 1).
+        # specific Cortex-A microarchitecture.
         #
         # `mold -run` wraps the build so mold intercepts every linker
         # invocation in the subprocess tree (no GCC `-fuse-ld=mold` flag
         # needed — cross-compilers can't find `ld.mold` in their search
         # paths anyway). Used only for the aarch64 jobs because mold
         # 1.x on Ubuntu 22.04 doesn't support the 32-bit ARM
-        # `armelf_linux_eabi` emulation. armv7/armv6 keep GNU ld; the
+        # `armelf_linux_eabi` emulation. armv7 keeps GNU ld; the
         # aarch64 trio dominates total CI wallclock so the bulk of the
         # link-time win still lands.
         run: |
@@ -231,7 +220,6 @@ jobs:
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
           CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: ${{ matrix.linker }}
-          CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_LINKER: ${{ matrix.linker }}
 
       - name: Package binaries
         # Both artifacts use the same `artifact_suffix` so the in-app
