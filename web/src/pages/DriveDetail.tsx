@@ -139,12 +139,46 @@ function DriveDetailContent({ drive, onSaveTags }: DriveDetailContentProps) {
   // the USB are the default and don't need a redundant label.
   const showTessieBadge = drive.source === "tessie"
 
+  // Speed chart input — must be MONOTONIC in `time` for Recharts'
+  // type="monotone" Area, otherwise duplicate or backward-going X
+  // values trigger the cubic interpolator to draw little
+  // triangle/loop artifacts on the chart (one drive in ~10 has them
+  // — typically caused by two GPS samples at the same relative-ms
+  // stamp during slow / stopped sections, or by an NTP correction
+  // mid-drive nudging clocks backward by a few ms).
+  //
+  // We:
+  //  1) keep the original `index` so chart hover/click still maps
+  //     back to the right scrubber position,
+  //  2) filter out non-finite values that would NaN-poison the
+  //     interpolator,
+  //  3) sort by time, then collapse duplicate times to keep the
+  //     last value (most recent reading wins — matches what the
+  //     scrubber would land on).
   const speedSeries = useMemo(() => {
-    return drive.points.map((p, i) => ({
-      index: i,
-      time: p[2],
-      value: metric ? p[3] * 3.6 : p[3] * 2.23694,
-    }))
+    const raw = drive.points
+      .map((p, i) => ({
+        index: i,
+        time: p[2],
+        value: metric ? p[3] * 3.6 : p[3] * 2.23694,
+      }))
+      .filter(
+        (pt) => Number.isFinite(pt.time) && Number.isFinite(pt.value),
+      )
+    raw.sort((a, b) => a.time - b.time)
+    // De-dupe consecutive identical times — overwrites with the
+    // last sample so the chart line ends at the same point the
+    // scrubber would have shown.
+    const out: typeof raw = []
+    for (const pt of raw) {
+      const prev = out[out.length - 1]
+      if (prev && prev.time === pt.time) {
+        out[out.length - 1] = pt
+      } else {
+        out.push(pt)
+      }
+    }
+    return out
   }, [drive.points, metric])
 
   const speedUnit = metric ? "km/h" : "mph"
