@@ -43,7 +43,7 @@
 //!   underlying GATT connection stays up.
 //! * Other faults → returned to caller, no state changes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -186,7 +186,34 @@ struct SessionState {
     /// flappy their BLE link is over a drive — every drop logs the
     /// running total so a journalctl tail tells the whole story.
     lifetime_drops: u32,
+    /// Sliding window of the most recent successful-query latencies
+    /// (in milliseconds). Fed into a p50/p95/p99 summary emitted
+    /// alongside the periodic "held for X" status line — surfaces
+    /// link degradation BEFORE it manifests as a drop (e.g. p95
+    /// climbing from 350ms to 1200ms over a few minutes is an early
+    /// warning of a slot fight). Capped at SAMPLES_FOR_PERCENTILES
+    /// entries; older values fall off the front.
+    recent_latencies_ms: VecDeque<u128>,
 }
+
+/// How many successful queries to keep timing samples for. Picks the
+/// p50/p95/p99 window. 100 ≈ 5-10 min of normal Active-mode poll
+/// volume — enough to be statistically meaningful, small enough to
+/// react within minutes to a real degradation.
+const SAMPLES_FOR_PERCENTILES: usize = 100;
+
+/// Persistent disconnect log path. Each transport-error drop appends
+/// one structured line here so the bundle download includes a
+/// long-term drop history even after journald rotates. Written
+/// best-effort — if the path isn't writable (e.g. /mutable not
+/// mounted yet on early boot) we silently skip.
+const DISCONNECT_LOG_PATH: &str = "/mutable/sentryusb-ble-disconnects.log";
+
+/// Truncate the disconnect log once it grows past this. Keeps the
+/// most-recent half — exact same pattern as the per-minute diag log.
+/// 256 KB ≈ 2,500 disconnect lines, which is more history than a
+/// reasonable tester will ever accumulate.
+const DISCONNECT_LOG_ROTATE_AT_BYTES: u64 = 256 * 1024;
 
 /// Log a connection-status summary every this many successful
 /// queries. At Active-mode 15s cycles that's roughly every 6 minutes
@@ -220,6 +247,7 @@ impl PersistentSession {
             queries_since_connect: 0,
             last_successful_query_at: None,
             lifetime_drops: 0,
+            recent_latencies_ms: VecDeque::with_capacity(SAMPLES_FOR_PERCENTILES),
         };
         tokio::spawn(run_session_task(state, cmd_rx));
         Self { cmd_tx }
@@ -363,6 +391,10 @@ async fn run_session_task(
     mut cmd_rx: mpsc::Receiver<Command>,
 ) {
     while let Some(cmd) = cmd_rx.recv().await {
+        // Time every command from receive to result so the latency
+        // window in SessionState reflects user-visible round-trip
+        // (includes any SessionInfo refresh retry, scan, reconnect).
+        let started = Instant::now();
         match cmd {
             Command::Query {
                 domain,
@@ -375,6 +407,9 @@ async fn run_session_task(
                 )
                 .await;
                 handle_transport_error_if_any(&mut state, &result).await;
+                if result.is_ok() {
+                    note_successful_query(&mut state, started.elapsed().as_millis());
+                }
                 let _ = reply.send(result);
             }
             Command::SignedRequest {
@@ -387,11 +422,17 @@ async fn run_session_task(
                 )
                 .await;
                 handle_transport_error_if_any(&mut state, &result).await;
+                if result.is_ok() {
+                    note_successful_query(&mut state, started.elapsed().as_millis());
+                }
                 let _ = reply.send(result);
             }
             Command::BodyController { reply } => {
                 let result = handle_body_controller(&mut state).await;
                 handle_transport_error_if_any(&mut state, &result).await;
+                if result.is_ok() {
+                    note_successful_query(&mut state, started.elapsed().as_millis());
+                }
                 let _ = reply.send(result);
             }
             Command::Shutdown => break,
@@ -417,7 +458,10 @@ async fn signed_request_with_refresh_retry(
     domain: Domain,
     inner: Vec<u8>,
 ) -> Result<Vec<u8>> {
-    let result = match try_signed_request_once(state, domain, &inner).await {
+    // Note: success-bookkeeping (note_successful_query) is now done
+    // by the caller in run_session_task so the latency timer covers
+    // the full retry envelope, not just the final attempt.
+    match try_signed_request_once(state, domain, &inner).await {
         Ok(QueryOutcome::Plaintext(bytes)) => Ok(bytes),
         Ok(QueryOutcome::SessionRefresh(info)) => {
             apply_session_refresh(state, domain, info)?;
@@ -434,11 +478,7 @@ async fn signed_request_with_refresh_retry(
             }
         }
         Err(e) => Err(e),
-    };
-    if result.is_ok() {
-        note_successful_query(state);
     }
-    result
 }
 
 /// One of two normal outcomes from a signed query.
@@ -676,20 +716,49 @@ async fn handle_transport_error_if_any<T>(
                 .connected_at
                 .map(|t| t.elapsed().as_secs())
                 .unwrap_or(0);
-            let last_ok = state
+            let last_ok_secs = state
                 .last_successful_query_at
-                .map(|t| format!("{}s", t.elapsed().as_secs()))
-                .unwrap_or_else(|| "<never>".into());
+                .map(|t| t.elapsed().as_secs() as i64)
+                .unwrap_or(-1);
+            let last_ok_str = if last_ok_secs >= 0 {
+                format!("{}s", last_ok_secs)
+            } else {
+                "<never>".into()
+            };
+            // Compute final percentiles for this connection's window
+            // so the journal line + persistent log both show what
+            // the link latency looked like right before the drop.
+            let (p50, p95, p99) = compute_percentiles(&state.recent_latencies_ms);
             warn!(
                 "PersistentSession: connection lost — \
-                 held={}m{}s queries={} last_ok={}_ago drops_total={} reason={:#}",
+                 held={}m{}s queries={} last_ok={}_ago drops_total={} \
+                 p50/p95/p99={}/{}/{}ms reason={:#}",
                 held_secs / 60,
                 held_secs % 60,
                 state.queries_since_connect,
-                last_ok,
+                last_ok_str,
                 state.lifetime_drops,
+                p50,
+                p95,
+                p99,
                 e,
             );
+            // Persist the same data to /mutable/sentryusb-ble-disconnects.log
+            // so the bundle download includes drops from before the
+            // current journalctl rotation. Best-effort — if the
+            // write fails (filesystem RO, /mutable unmounted, etc.)
+            // we just keep going.
+            append_disconnect_log(
+                held_secs,
+                state.queries_since_connect,
+                last_ok_secs,
+                state.lifetime_drops,
+                p50,
+                p95,
+                p99,
+                &format!("{:#}", e),
+            );
+
             if let Some(conn) = state.conn.take() {
                 conn.close().await;
             }
@@ -702,6 +771,117 @@ async fn handle_transport_error_if_any<T>(
             // working query").
         }
     }
+}
+
+/// Append one row to the persistent disconnect log. CSV-ish format —
+/// timestamp first (RFC 3339 UTC for grep-friendliness), then
+/// space-separated `k=v` pairs. The bundle download includes the
+/// whole file so a tester pasting their bundle gives us the full
+/// drop history across days, not just whatever's left in journald.
+fn append_disconnect_log(
+    held_secs: u64,
+    queries: u32,
+    last_ok_secs: i64,
+    lifetime_drops: u32,
+    p50: u128,
+    p95: u128,
+    p99: u128,
+    reason: &str,
+) {
+    use std::io::Write;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    // Rotate first so the very first write into a freshly-large
+    // file still leaves the file under cap afterwards.
+    rotate_disconnect_log_if_needed();
+
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // RFC 3339 without an external dep — UTC, second precision.
+    // Format: "2026-05-25T18:01:39Z". Imperfect for sub-second
+    // resolution but easy to grep and we don't need ms here.
+    let ts = format_unix_iso8601(now_secs);
+
+    // Replace tabs/newlines in the reason string so each disconnect
+    // is exactly one line — important for grep + tail.
+    let reason_safe = reason.replace(['\n', '\r', '\t'], " ");
+
+    let line = format!(
+        "{} held={}s queries={} last_ok={}s drops_total={} \
+         p50={}ms p95={}ms p99={}ms reason=\"{}\"\n",
+        ts, held_secs, queries, last_ok_secs, lifetime_drops,
+        p50, p95, p99, reason_safe,
+    );
+
+    let result = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(DISCONNECT_LOG_PATH)
+        .and_then(|mut f| f.write_all(line.as_bytes()));
+
+    if let Err(e) = result {
+        // Don't propagate — the journalctl line above already has
+        // the same info. Just record at debug so we don't spam
+        // operators on first boot before /mutable is ready.
+        debug!(
+            "could not append to {} (best-effort): {}",
+            DISCONNECT_LOG_PATH, e
+        );
+    }
+}
+
+/// Keep most-recent half when the disconnect log exceeds the cap.
+/// Same pattern as the diag log — operational data, no need for an
+/// archive past the most recent few hundred drops.
+fn rotate_disconnect_log_if_needed() {
+    let meta = match std::fs::metadata(DISCONNECT_LOG_PATH) {
+        Ok(m) => m,
+        Err(_) => return, // file doesn't exist yet
+    };
+    if meta.len() < DISCONNECT_LOG_ROTATE_AT_BYTES {
+        return;
+    }
+    let raw = match std::fs::read(DISCONNECT_LOG_PATH) {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    let half = raw.len() / 2;
+    // Trim to next line boundary so we don't truncate mid-row.
+    let start = raw[half..]
+        .iter()
+        .position(|&b| b == b'\n')
+        .map(|p| half + p + 1)
+        .unwrap_or(half);
+    let _ = std::fs::write(DISCONNECT_LOG_PATH, &raw[start..]);
+}
+
+/// Tiny RFC-3339-ish formatter for the disconnect-log timestamp.
+/// We don't pull chrono into this crate just for one log line —
+/// hand-roll the format "YYYY-MM-DDTHH:MM:SSZ" from a unix epoch.
+fn format_unix_iso8601(secs: u64) -> String {
+    // Compute civil calendar from days-since-1970 using Howard Hinnant's
+    // algorithm (well-known, public domain).
+    let days = (secs / 86400) as i64;
+    let seconds_of_day = secs % 86400;
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    let h = seconds_of_day / 3600;
+    let mi = (seconds_of_day / 60) % 60;
+    let s = seconds_of_day % 60;
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        y, m, d, h, mi, s
+    )
 }
 
 /// Run a body-controller-state query through the held connection.
@@ -717,11 +897,9 @@ async fn handle_body_controller(
         .conn
         .as_mut()
         .context("ensure_connected returned without a connection")?;
-    let result = crate::body_controller::query(conn).await;
-    if result.is_ok() {
-        note_successful_query(state);
-    }
-    result
+    // Note: success-bookkeeping done by caller (see run_session_task)
+    // so latency timer covers the full command.
+    crate::body_controller::query(conn).await
 }
 
 async fn ensure_connected(state: &mut SessionState) -> Result<()> {
@@ -760,6 +938,10 @@ async fn ensure_connected(state: &mut SessionState) -> Result<()> {
     state.backoff = RECONNECT_BACKOFF_MIN;
     state.connected_at = Some(Instant::now());
     state.queries_since_connect = 0;
+    // Drop the previous connection's latency history — a new link
+    // negotiates fresh BLE params and the old distribution isn't
+    // representative. Percentiles will repopulate within ~25 queries.
+    state.recent_latencies_ms.clear();
     info!("PersistentSession: connected (held until link drops)");
     Ok(())
 }
@@ -767,28 +949,62 @@ async fn ensure_connected(state: &mut SessionState) -> Result<()> {
 /// Increment the per-connection query counter and, every
 /// `STATUS_LOG_EVERY_N_QUERIES`, emit a status line summarizing how
 /// long the current connection has been held + how many queries it
-/// has served. Operators can grep this to confirm the persistent
-/// slot is being held vs being re-grabbed each cycle.
-fn note_successful_query(state: &mut SessionState) {
+/// has served + p50/p95/p99 latency over the last
+/// `SAMPLES_FOR_PERCENTILES` queries. Operators can grep this to
+/// confirm the persistent slot is being held vs being re-grabbed
+/// each cycle, AND to spot early degradation (p95 climbing while
+/// queries still succeed is a leading indicator of a slot fight).
+fn note_successful_query(state: &mut SessionState, elapsed_ms: u128) {
     state.queries_since_connect = state.queries_since_connect.saturating_add(1);
     // Record the success time so the disconnect diagnostic can show
     // "last_ok=Xs ago" — distinguishes a clean drop (link was fine
     // until it suddenly wasn't) from a degraded link (queries were
     // already missing before the drop).
     state.last_successful_query_at = Some(Instant::now());
+
+    // Push into the sliding latency window, evict oldest if full.
+    if state.recent_latencies_ms.len() >= SAMPLES_FOR_PERCENTILES {
+        state.recent_latencies_ms.pop_front();
+    }
+    state.recent_latencies_ms.push_back(elapsed_ms);
+
     let n = state.queries_since_connect;
     if n == 1 || n % STATUS_LOG_EVERY_N_QUERIES == 0 {
         let uptime = state
             .connected_at
             .map(|t| t.elapsed().as_secs())
             .unwrap_or(0);
+        let (p50, p95, p99) = compute_percentiles(&state.recent_latencies_ms);
         info!(
-            "PersistentSession: held for {}m{}s, {} queries served on this connection",
+            "PersistentSession: held for {}m{}s, {} queries (latency p50/p95/p99 = {}/{}/{}ms over last {})",
             uptime / 60,
             uptime % 60,
-            n
+            n,
+            p50,
+            p95,
+            p99,
+            state.recent_latencies_ms.len(),
         );
     }
+}
+
+/// Compute approximate percentiles by sorting a copy of the latency
+/// window. O(n log n) but n=100 — runs <100µs even on a Pi Zero, and
+/// only fires every 25 queries. Returns (0, 0, 0) for empty input
+/// (cold start before any successful query).
+fn compute_percentiles(samples: &VecDeque<u128>) -> (u128, u128, u128) {
+    if samples.is_empty() {
+        return (0, 0, 0);
+    }
+    let mut sorted: Vec<u128> = samples.iter().copied().collect();
+    sorted.sort_unstable();
+    // Pick index via floor — for n=100, p50=index 50, p95=index 95,
+    // p99=index 99 (saturating at the last element for short windows).
+    let pick = |pct: f64| -> u128 {
+        let idx = ((sorted.len() as f64) * pct).floor() as usize;
+        sorted[idx.min(sorted.len() - 1)]
+    };
+    (pick(0.50), pick(0.95), pick(0.99))
 }
 
 async fn ensure_domain_session(state: &mut SessionState, domain: Domain) -> Result<()> {

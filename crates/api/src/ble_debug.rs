@@ -417,8 +417,23 @@ pub async fn get_ble_bundle(State(s): State<AppState>) -> Response {
     section(&mut out, "Adapter status");
     write_adapter_status(&mut out);
 
-    section(&mut out, "BLE LE parameters (sysfs)");
+    section(&mut out, "BLE LE parameters (sysfs — what we ask the kernel to use)");
     write_le_params(&mut out);
+
+    section(
+        &mut out,
+        "Negotiated connection parameters (per active connection)",
+    );
+    write_negotiated_conn_params(&mut out);
+
+    section(&mut out, "RSSI sources (try several — at least one usually works)");
+    write_rssi_sources(&mut out).await;
+
+    section(
+        &mut out,
+        "Persistent disconnect history (/mutable/sentryusb-ble-disconnects.log)",
+    );
+    write_disconnect_history(&mut out);
 
     section(&mut out, "hciconfig -a");
     write_hciconfig(&mut out).await;
@@ -489,12 +504,68 @@ fn bundle_header(out: &mut String) {
             format!("{}d {}h {}m", s / 86400, (s % 86400) / 3600, (s % 3600) / 60)
         })
         .unwrap_or_else(|| "<unknown>".into());
+
+    // Pi hardware model — distinguishes Pi 4 from Pi 5 etc. Lets us
+    // correlate "this drop pattern only happens on Pi 5" type issues
+    // when multiple testers send bundles. /proc/device-tree/model is
+    // NUL-terminated, hence the trim_matches.
+    let pi_model = std::fs::read_to_string("/proc/device-tree/model")
+        .map(|s| s.trim_matches('\0').trim().to_string())
+        .unwrap_or_else(|_| "<unknown>".into());
+
+    // Kernel version — bluez and BLE behavior shifts noticeably across
+    // kernel minor releases.
+    let kernel = std::process::Command::new("uname")
+        .arg("-r")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "<unknown>".into());
+
+    // bluetoothd version — bluez 5.66/5.72/etc handle LE link
+    // parameters differently. `bluetoothd --version` prints just a
+    // version string like "5.72".
+    let bluez_ver = std::process::Command::new("bluetoothd")
+        .arg("--version")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "<unknown>".into());
+
+    // Daemon binary mtime — tells us when the user last updated.
+    // Useful for "did this issue start after a recent update?"
+    let binary_mtime = std::fs::metadata("/root/bin/sentryusb-tesla-telemetry")
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| {
+            t.duration_since(std::time::UNIX_EPOCH).ok()
+        })
+        .and_then(|d| chrono::DateTime::from_timestamp(d.as_secs() as i64, 0))
+        .map(|dt| {
+            dt.with_timezone(&Local)
+                .format("%Y-%m-%d %H:%M:%S %Z")
+                .to_string()
+        })
+        .unwrap_or_else(|| "<unknown>".into());
+
+    // sentryusb-api version — matches the binary actually serving
+    // this bundle (different crate from the sampler, but a useful
+    // cross-check).
+    let api_ver = env!("CARGO_PKG_VERSION");
+
     out.push_str(&format!(
         "SentryUSB BLE diagnostic bundle\n\
-         generated: {}\n\
-         hostname:  {}\n\
-         uptime:    {}\n",
-        now, hostname, uptime
+         generated:      {}\n\
+         hostname:       {}\n\
+         uptime:         {}\n\
+         pi model:       {}\n\
+         kernel:         {}\n\
+         bluez:          {}\n\
+         api crate ver:  {}\n\
+         sampler binary: {} (mtime)\n",
+        now, hostname, uptime, pi_model, kernel, bluez_ver, api_ver, binary_mtime
     ));
 }
 
@@ -856,5 +927,244 @@ fn write_history_full(out: &mut String) {
         Err(_) => out.push_str(
             "(no history yet — file appears on first sampler tick after install)\n",
         ),
+    }
+}
+
+/// Walk /sys/kernel/debug/bluetooth/hci*/conn/ and dump the
+/// *negotiated* link parameters for each active connection. This is
+/// what actually governs the link — distinct from /sys/kernel/debug/
+/// bluetooth/hci*/conn_min_interval (the kernel default we tune via
+/// ExecStartPre). If the car forces shorter supervision_timeout
+/// during connection-parameter negotiation, this section will show
+/// 72 even when our requested-defaults section shows 600.
+fn write_negotiated_conn_params(out: &mut String) {
+    let mut any_adapter = false;
+    let adapters = match std::fs::read_dir("/sys/kernel/debug/bluetooth") {
+        Ok(d) => d,
+        Err(_) => {
+            out.push_str(
+                "  /sys/kernel/debug/bluetooth/ missing (debugfs not mounted).\n",
+            );
+            return;
+        }
+    };
+    for adapter in adapters.filter_map(|e| e.ok()) {
+        let name = adapter.file_name().to_string_lossy().to_string();
+        if !name.starts_with("hci") {
+            continue;
+        }
+        any_adapter = true;
+        let conn_root = adapter.path().join("conn");
+        let conns = match std::fs::read_dir(&conn_root) {
+            Ok(d) => d,
+            Err(_) => {
+                out.push_str(&format!(
+                    "[{}] no active connections (or {}/ unreadable)\n",
+                    name,
+                    conn_root.display()
+                ));
+                continue;
+            }
+        };
+        let mut handles: Vec<_> = conns.filter_map(|e| e.ok()).collect();
+        if handles.is_empty() {
+            out.push_str(&format!("[{}] no active connections\n", name));
+            continue;
+        }
+        handles.sort_by_key(|e| e.file_name());
+        for handle_entry in handles {
+            let handle = handle_entry.file_name().to_string_lossy().to_string();
+            out.push_str(&format!("[{} handle {}]\n", name, handle));
+            // Common keys exposed per connection in modern bluez/kernel.
+            // Not every kernel exposes every key — read each
+            // best-effort, show <missing> for absent ones rather than
+            // failing the whole section.
+            for key in [
+                "dst",
+                "state",
+                "type",
+                "conn_interval",
+                "conn_latency",
+                "supervision_timeout",
+                "rssi",
+                "tx_power",
+                "phy",
+                "le_features",
+            ] {
+                let path = handle_entry.path().join(key);
+                let val = std::fs::read_to_string(&path)
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_else(|_| "<missing>".into());
+                out.push_str(&format!("  {:<22} = {}\n", key, val));
+            }
+        }
+    }
+    if !any_adapter {
+        out.push_str("  no hci adapters present in debugfs\n");
+    }
+    out.push_str(
+        "\nNote: supervision_timeout / conn_interval here are the values\n\
+         the car and Pi NEGOTIATED for this specific connection. The\n\
+         previous section shows what the kernel was configured to ask\n\
+         for. If they don't match, the car rejected our preferred\n\
+         params and forced its own — common for supervision_timeout.\n",
+    );
+}
+
+/// Try every reasonable RSSI source for the currently-connected Tesla.
+/// Different Pi distros / bluez versions expose RSSI differently;
+/// showing all attempts means the tester doesn't need to know which
+/// path works on their setup.
+async fn write_rssi_sources(out: &mut String) {
+    // Source 1: peer addresses we can find via the active-conn debugfs.
+    // Lets the next two probes target a specific MAC. Multiple
+    // connections supported (a Pi might have onboard + USB adapter both
+    // connected to different cars in some edge cases).
+    let mut targets: Vec<(String, String)> = Vec::new(); // (adapter, mac)
+    if let Ok(adapters) = std::fs::read_dir("/sys/kernel/debug/bluetooth") {
+        for adapter in adapters.filter_map(|e| e.ok()) {
+            let aname = adapter.file_name().to_string_lossy().to_string();
+            if !aname.starts_with("hci") {
+                continue;
+            }
+            let conn_root = adapter.path().join("conn");
+            if let Ok(conns) = std::fs::read_dir(&conn_root) {
+                for handle in conns.filter_map(|e| e.ok()) {
+                    if let Ok(mac) = std::fs::read_to_string(handle.path().join("dst"))
+                    {
+                        let mac = mac.trim().to_string();
+                        if !mac.is_empty() {
+                            targets.push((aname.clone(), mac));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if targets.is_empty() {
+        out.push_str(
+            "  no active BLE connections detected — RSSI lookup needs a live\n  \
+             connection. If the sampler is paired + running, this means the\n  \
+             link was dropped right before the bundle was generated.\n",
+        );
+        return;
+    }
+
+    for (adapter, mac) in &targets {
+        out.push_str(&format!("[{} → {}]\n", adapter, mac));
+
+        // Source A: debugfs per-connection rssi file.
+        // Path: /sys/kernel/debug/bluetooth/hci0/conn/<handle>/rssi
+        // We already iterated handles above; re-find this MAC's handle
+        // for the read so the output is self-contained per peer.
+        let mut debugfs_rssi: Option<String> = None;
+        let adapter_dir = format!("/sys/kernel/debug/bluetooth/{}/conn", adapter);
+        if let Ok(handles) = std::fs::read_dir(&adapter_dir) {
+            for handle in handles.filter_map(|e| e.ok()) {
+                let dst = std::fs::read_to_string(handle.path().join("dst"))
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_default();
+                if dst.eq_ignore_ascii_case(mac) {
+                    if let Ok(r) =
+                        std::fs::read_to_string(handle.path().join("rssi"))
+                    {
+                        debugfs_rssi = Some(r.trim().to_string());
+                    }
+                    break;
+                }
+            }
+        }
+        out.push_str(&format!(
+            "  via debugfs (.../conn/*/rssi):  {}\n",
+            debugfs_rssi.as_deref().unwrap_or("<not exposed>"),
+        ));
+
+        // Source B: bluetoothctl info — newer, JSON-ish output.
+        let bctl = tokio::process::Command::new("bluetoothctl")
+            .args(["info", mac])
+            .output()
+            .await;
+        let bctl_rssi = match bctl {
+            Ok(o) if o.status.success() => {
+                let raw = String::from_utf8_lossy(&o.stdout);
+                raw.lines()
+                    .find_map(|l| {
+                        let l = l.trim();
+                        l.strip_prefix("RSSI:").map(|v| v.trim().to_string())
+                    })
+            }
+            _ => None,
+        };
+        out.push_str(&format!(
+            "  via bluetoothctl info:         {}\n",
+            bctl_rssi.as_deref().unwrap_or("<not exposed / cmd failed>"),
+        ));
+
+        // Source C: hcitool rssi (deprecated but often still works).
+        // Requires root — the api service runs as root so this is OK
+        // here, but document it for any future user trying the same.
+        let hcitool = tokio::process::Command::new("hcitool")
+            .args(["rssi", mac])
+            .output()
+            .await;
+        let hcitool_rssi = match hcitool {
+            Ok(o) if o.status.success() => {
+                let raw = String::from_utf8_lossy(&o.stdout);
+                // Output is "RSSI return value: -54"
+                raw.lines()
+                    .find_map(|l| {
+                        l.trim()
+                            .strip_prefix("RSSI return value:")
+                            .map(|v| v.trim().to_string())
+                    })
+            }
+            _ => None,
+        };
+        out.push_str(&format!(
+            "  via hcitool rssi:              {}\n",
+            hcitool_rssi.as_deref().unwrap_or("<not exposed / cmd failed>"),
+        ));
+    }
+
+    out.push_str(
+        "\nInterpretation:\n  \
+         * High signal + drop = slot eviction or interference\n  \
+         * Low signal + drop = legitimate range loss\n  \
+         * RSSI typically -40 (very strong) to -85 (weak); below -90\n    \
+           the link is usually unusable.\n",
+    );
+}
+
+/// Read the persistent disconnect log written by tesla_ble::manager
+/// on every drop. The bundle includes the whole file so trends
+/// across days are visible even after journald rotates. File rotates
+/// at 256 KB on its own.
+fn write_disconnect_history(out: &mut String) {
+    const PATH: &str = "/mutable/sentryusb-ble-disconnects.log";
+    match std::fs::read_to_string(PATH) {
+        Ok(raw) if raw.trim().is_empty() => {
+            out.push_str("(empty — no drops recorded yet on this install)\n");
+        }
+        Ok(raw) => {
+            // Newest-first for human reading. Lines are timestamped
+            // and one-line-each, so reversing is safe.
+            let mut lines: Vec<&str> = raw.lines().collect();
+            lines.reverse();
+            out.push_str(&format!(
+                "(showing newest first, total {} drops on record)\n\n",
+                lines.len()
+            ));
+            for line in lines {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+        Err(_) => {
+            out.push_str(
+                "(no disconnect log yet — file appears on first drop \
+                 after install)\n",
+            );
+        }
     }
 }
