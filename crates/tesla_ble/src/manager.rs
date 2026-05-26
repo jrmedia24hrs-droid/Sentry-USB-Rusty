@@ -47,6 +47,7 @@ use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use btleplug::api::Peripheral as _;
 use prost::Message;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::sleep;
@@ -194,6 +195,20 @@ struct SessionState {
     /// warning of a slot fight). Capped at SAMPLES_FOR_PERCENTILES
     /// entries; older values fall off the front.
     recent_latencies_ms: VecDeque<u128>,
+    /// RSSI observed when scanning for this connection's peer right
+    /// before connect. Modern bluez (5.x+) doesn't expose live RSSI
+    /// for active LE connections via any standard userspace API —
+    /// not debugfs, not D-Bus, not hcitool, not bluetoothctl. The
+    /// scan-time value is the only RSSI we can capture without
+    /// custom HCI socket code. Correlates well with connection
+    /// quality at the moment of connect (= when most slot races
+    /// happen) which is the failure mode we care most about.
+    last_scan_rssi: Option<i16>,
+    /// Peer MAC address of the most recently-opened connection.
+    /// Captured before `Connection::open` consumes the peripheral.
+    /// Written to the live status file so the bundle's "current
+    /// connection" section can show who we're talking to.
+    last_peer_mac: Option<String>,
 }
 
 /// How many successful queries to keep timing samples for. Picks the
@@ -214,6 +229,15 @@ const DISCONNECT_LOG_PATH: &str = "/mutable/sentryusb-ble-disconnects.log";
 /// 256 KB ≈ 2,500 disconnect lines, which is more history than a
 /// reasonable tester will ever accumulate.
 const DISCONNECT_LOG_ROTATE_AT_BYTES: u64 = 256 * 1024;
+
+/// Live BLE-session status file path. Atomically rewritten on every
+/// connect / disconnect with the current connection state, so the
+/// api crate's bundle handler (different process) can show "is the
+/// sampler connected RIGHT NOW, since when, to which MAC, with what
+/// scan-time RSSI" without parsing journalctl. Cross-process IPC
+/// via shared file works fine here — bytes written each event are
+/// ~200 and the api side just reads it.
+const STATUS_FILE_PATH: &str = "/mutable/sentryusb-ble-status.txt";
 
 /// Log a connection-status summary every this many successful
 /// queries. At Active-mode 15s cycles that's roughly every 6 minutes
@@ -248,6 +272,8 @@ impl PersistentSession {
             last_successful_query_at: None,
             lifetime_drops: 0,
             recent_latencies_ms: VecDeque::with_capacity(SAMPLES_FOR_PERCENTILES),
+            last_scan_rssi: None,
+            last_peer_mac: None,
         };
         tokio::spawn(run_session_task(state, cmd_rx));
         Self { cmd_tx }
@@ -729,10 +755,14 @@ async fn handle_transport_error_if_any<T>(
             // so the journal line + persistent log both show what
             // the link latency looked like right before the drop.
             let (p50, p95, p99) = compute_percentiles(&state.recent_latencies_ms);
+            let scan_rssi_str = state
+                .last_scan_rssi
+                .map(|r| r.to_string())
+                .unwrap_or_else(|| "?".into());
             warn!(
                 "PersistentSession: connection lost — \
                  held={}m{}s queries={} last_ok={}_ago drops_total={} \
-                 p50/p95/p99={}/{}/{}ms reason={:#}",
+                 p50/p95/p99={}/{}/{}ms scan_rssi={} reason={:#}",
                 held_secs / 60,
                 held_secs % 60,
                 state.queries_since_connect,
@@ -741,6 +771,7 @@ async fn handle_transport_error_if_any<T>(
                 p50,
                 p95,
                 p99,
+                scan_rssi_str,
                 e,
             );
             // Persist the same data to /mutable/sentryusb-ble-disconnects.log
@@ -756,6 +787,7 @@ async fn handle_transport_error_if_any<T>(
                 p50,
                 p95,
                 p99,
+                state.last_scan_rssi,
                 &format!("{:#}", e),
             );
 
@@ -765,6 +797,12 @@ async fn handle_transport_error_if_any<T>(
             state.domains.clear();
             state.connected_at = None;
             state.queries_since_connect = 0;
+            // Update the cross-process status file so the bundle
+            // shows "currently disconnected" + how long it's been.
+            // Note: we leave last_scan_rssi / last_peer_mac populated
+            // so the bundle can show the values for the connection
+            // we just lost.
+            write_status_file(state, ConnectionEvent::Disconnected);
             // Intentionally NOT resetting last_successful_query_at —
             // the value across the drop is useful for the next
             // diagnostic line ("reconnected after Xs gap since last
@@ -786,6 +824,7 @@ fn append_disconnect_log(
     p50: u128,
     p95: u128,
     p99: u128,
+    scan_rssi: Option<i16>,
     reason: &str,
 ) {
     use std::io::Write;
@@ -808,11 +847,15 @@ fn append_disconnect_log(
     // is exactly one line — important for grep + tail.
     let reason_safe = reason.replace(['\n', '\r', '\t'], " ");
 
+    let scan_rssi_str = scan_rssi
+        .map(|r| r.to_string())
+        .unwrap_or_else(|| "?".into());
+
     let line = format!(
         "{} held={}s queries={} last_ok={}s drops_total={} \
-         p50={}ms p95={}ms p99={}ms reason=\"{}\"\n",
+         scan_rssi={} p50={}ms p95={}ms p99={}ms reason=\"{}\"\n",
         ts, held_secs, queries, last_ok_secs, lifetime_drops,
-        p50, p95, p99, reason_safe,
+        scan_rssi_str, p50, p95, p99, reason_safe,
     );
 
     let result = std::fs::OpenOptions::new()
@@ -925,6 +968,13 @@ async fn ensure_connected(state: &mut SessionState) -> Result<()> {
         }
     };
 
+    // Capture RSSI + MAC BEFORE Connection::open consumes the
+    // peripheral. The address() call is cheap (no I/O) and gives us
+    // the BLE MAC the bundle handler needs to identify the peer in
+    // the live-status file.
+    let scan_rssi = scan_result.rssi;
+    let peer_mac = scan_result.peripheral.address().to_string();
+
     let conn = match Connection::open(scan_result.peripheral).await {
         Ok(c) => c,
         Err(e) => {
@@ -938,12 +988,63 @@ async fn ensure_connected(state: &mut SessionState) -> Result<()> {
     state.backoff = RECONNECT_BACKOFF_MIN;
     state.connected_at = Some(Instant::now());
     state.queries_since_connect = 0;
+    state.last_scan_rssi = scan_rssi;
+    state.last_peer_mac = Some(peer_mac);
     // Drop the previous connection's latency history — a new link
     // negotiates fresh BLE params and the old distribution isn't
     // representative. Percentiles will repopulate within ~25 queries.
     state.recent_latencies_ms.clear();
-    info!("PersistentSession: connected (held until link drops)");
+    info!(
+        "PersistentSession: connected (held until link drops) — peer={} scan_rssi={}",
+        state.last_peer_mac.as_deref().unwrap_or("?"),
+        state.last_scan_rssi
+            .map(|r| r.to_string())
+            .unwrap_or_else(|| "?".into()),
+    );
+    write_status_file(state, ConnectionEvent::Connected);
     Ok(())
+}
+
+/// Whether we just connected or just lost the connection. Drives
+/// the body of the status file the bundle reads.
+#[derive(Copy, Clone)]
+enum ConnectionEvent {
+    Connected,
+    Disconnected,
+}
+
+/// Atomically replace /mutable/sentryusb-ble-status.txt with one
+/// line describing the current session state. Best-effort — if
+/// /mutable isn't mounted (early boot, read-only rootfs) the bundle
+/// will just show "<missing>" for that section.
+///
+/// Format is plain text k=v so the bundle can include it verbatim
+/// and humans can grep it. Single line so it's atomic on POSIX
+/// (write of <PIPE_BUF bytes is atomic — well under any conceivable
+/// per-line size here).
+fn write_status_file(state: &SessionState, event: ConnectionEvent) {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let ts = format_unix_iso8601(now_secs);
+    let mac = state.last_peer_mac.as_deref().unwrap_or("?");
+    let rssi = state
+        .last_scan_rssi
+        .map(|r| r.to_string())
+        .unwrap_or_else(|| "?".into());
+    let line = match event {
+        ConnectionEvent::Connected => format!(
+            "state=connected since={} mac={} scan_rssi={} drops_total={}\n",
+            ts, mac, rssi, state.lifetime_drops,
+        ),
+        ConnectionEvent::Disconnected => format!(
+            "state=disconnected since={} last_mac={} last_scan_rssi={} drops_total={}\n",
+            ts, mac, rssi, state.lifetime_drops,
+        ),
+    };
+    let _ = std::fs::write(STATUS_FILE_PATH, line);
 }
 
 /// Increment the per-connection query counter and, every
