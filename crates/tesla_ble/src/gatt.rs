@@ -299,8 +299,34 @@ impl Connection {
             }
         }
         for chunk in chunks {
+            // WithResponse (was WithoutResponse): ATT_Write_Req +
+            // ATT_Write_Rsp round-trip per chunk instead of fire-
+            // and-forget ATT_Write_Cmd. tesla-control uses this
+            // (`noRsp=false` in go-ble's WriteCharacteristic
+            // — see vehicle-command/pkg/connector/ble/ble.go:121).
+            //
+            // Why we changed: tester btmon on a Rock Pi 4C+ showed
+            // our 6-chunk session-info request TX completing in
+            // 20ms but Tesla taking 14 seconds to send the FIRST
+            // response notification — almost certainly because the
+            // chip→Tesla path was losing/delaying our Write_Cmd
+            // chunks and Tesla had to wait for some timeout before
+            // assuming the request was complete. By that time our
+            // 10s round_trip already gave up, the connection got
+            // declared dead, and we cycled forever.
+            //
+            // WriteWithResponse forces Tesla to ACK each chunk before
+            // we send the next. Can't lose a chunk because the ACK is
+            // required to proceed. Adds ~50ms per chunk (= ~300ms
+            // for the 6-chunk session-info request) but that's a
+            // rounding error vs the 14s timeout failure mode.
+            //
+            // On the working setup (Pi 5 USB Realtek dongle) this
+            // is essentially neutral — the chunks were landing fine
+            // either way, the only cost is the per-chunk ACK
+            // round-trip which is fast.
             self.peripheral
-                .write(&self.tx_char, chunk, WriteType::WithoutResponse)
+                .write(&self.tx_char, chunk, WriteType::WithResponse)
                 .await
                 .context("BLE write")?;
         }
