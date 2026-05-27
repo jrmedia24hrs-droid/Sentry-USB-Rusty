@@ -360,17 +360,29 @@ impl Connection {
         // an explicit cap makes the failure mode "loud" instead of
         // "silently maxed out at the timeout boundary."
         //
-        // (Briefly bumped to 256 in 4836e6e while we thought the
-        // Rock Pi 4C+ tester's "desync_recoveries=5956 / no
-        // successful queries" was a chip-noise problem requiring
-        // huge recovery headroom. Root cause turned out to be our
-        // TX side using ATT_Write_Cmd (WriteWithoutResponse) —
-        // tesla-control uses ATT_Write_Req (WriteWithResponse) and
-        // works on that exact hardware. The desync storms were
-        // downstream of the 14-second TX-to-response gap that
-        // resulted, not a primary symptom. Reverted to 16 since
-        // healthy round_trips only see 0-2 recoveries.)
-        const MAX_DESYNCS: u32 = 16;
+        // History of the bouncing value:
+        //   * 16 (original) — based on early observations that
+        //     healthy stacks saw 0-2 recoveries per round_trip.
+        //   * 256 (4836e6e) — bumped when the Rock Pi 4C+ tester
+        //     was seeing 5956 recoveries/49min with 0 successful
+        //     queries. Turned out the ROOT cause was our TX side
+        //     using ATT_Write_Cmd (fixed in 4784302 by switching
+        //     to ATT_Write_Req); the desync storms were downstream
+        //     of Tesla taking 14s to respond.
+        //   * 16 (5b31df2) — reverted to original assuming
+        //     WriteWithResponse fixed the underlying issue
+        //     universally.
+        //   * 64 (this commit) — reality check: a SECOND tester
+        //     with a different chip stack hit the MAX_DESYNCS=16
+        //     cap during keep-awake IPC actions even WITH the
+        //     WriteWithResponse fix. Some chip+bluez combos are
+        //     genuinely noisy at the RX side independent of our
+        //     TX behavior. 64 gives 4× more headroom while still
+        //     surfacing pathological cases loudly (vs the wall-
+        //     clock timeout boundary at 10-15s).
+        //
+        // The wall-clock timeout remains the real safety net.
+        const MAX_DESYNCS: u32 = 64;
         let mut desyncs: u32 = 0;
         timeout(wait, async {
             loop {
