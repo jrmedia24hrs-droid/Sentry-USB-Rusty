@@ -76,9 +76,12 @@ The Rust rewrite of the original Go version. Same `sentryusb.conf`, faster serve
 On a Pi already running **Raspberry Pi OS Lite (64-bit)**:
 
 ```bash
+sudo apt update && sudo apt upgrade -y
 sudo -i
 curl -fsSL https://raw.githubusercontent.com/Sentry-Six/Sentry-USB-Rusty/main/install-pi.sh | bash
 ```
+
+> The `apt update && apt upgrade` step is required. Pi OS images bake in an apt cache from whenever the image was built; if Debian has shipped a point release since then, the cache points at `.deb` versions that no longer exist on the mirrors and the install will hit `404 Not Found` errors. Refreshing first avoids the round trip.
 
 Then open `http://sentryusb.local` in a browser and the setup wizard takes you the rest of the way.
 

@@ -53,11 +53,14 @@ Type the password you set in Pi Imager.
 Once you're in, run:
 
 ```bash
+sudo apt update && sudo apt upgrade -y
 sudo -i
 curl -fsSL https://raw.githubusercontent.com/Sentry-Six/Sentry-USB-Rusty/main/install-pi.sh | bash
 ```
 
-The installer takes 2–5 minutes. It downloads the Sentry USB binary, sets up the system service, installs mDNS, and renames the Pi to `sentryusb`. Your SSH session may drop near the end when the hostname changes — that's expected.
+> **Don't skip the `apt update && apt upgrade` step.** Pi OS images carry an apt cache from whenever the image was built. If Debian has published a point release since then, the cache points at `.deb` files that no longer exist on the mirrors and you'll see `404 Not Found` errors mid-install. The upgrade can take a couple of minutes — that's normal.
+
+The installer itself then takes 2–5 minutes. It downloads the Sentry USB binary, sets up the system service, installs mDNS, and renames the Pi to `sentryusb`. Your SSH session may drop near the end when the hostname changes — that's expected.
 
 ## 5. Open the web UI
 

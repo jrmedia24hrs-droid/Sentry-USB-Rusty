@@ -11,9 +11,12 @@ them up — no SSH, no config files.
 On a Pi already running Pi OS:
 
 ```bash
+sudo apt update && sudo apt upgrade -y
 sudo -i
 curl -fsSL https://raw.githubusercontent.com/Sentry-Six/Sentry-USB-Rusty/main/install-pi.sh | bash
 ```
+
+> Refresh the apt cache first — Pi OS images bake in package lists that go stale as Debian publishes point releases, and a stale cache makes the install hit `404` errors.
 
 Then open `http://sentryusb.local` and the [Setup Wizard](Setup-Wizard-Guide) takes you the rest of the way.
 
