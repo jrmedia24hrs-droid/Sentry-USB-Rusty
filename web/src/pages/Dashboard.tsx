@@ -801,8 +801,19 @@ function ActivityTile({
   // (used to be its own tile next door, but the dead space below
   // Activity made the grid look unbalanced). The hook is only
   // consumed here now.
+  //
+  // Mirror the old standalone card's behaviour: the inline UI only
+  // exposes start/stop affordances, not the Off/Manual/Auto picker
+  // (that lives in Settings → Device), so showing it when the user
+  // has chosen Off would be a useless dead section. `mode` from the
+  // hook is `null` while the preference is still loading and `""`
+  // when the user explicitly picked Off — collapse the section in
+  // both cases by gating on the active modes only. When mode flips
+  // to manual/auto in Settings, this re-renders and the section
+  // appears on its own.
   const keepAwake = useKeepAwake()
-  const keepAwakeVisible = keepAwake.mode != null
+  const keepAwakeVisible =
+    keepAwake.mode === "manual" || keepAwake.mode === "auto"
 
   const phase = archiveProgress
     ? ("archiving" as const)
