@@ -655,5 +655,26 @@ async fn configure_cifs_mount(env: &SetupEnv, emitter: &SetupEmitter) -> Result<
     );
     replace_fstab_entry("cifs", "/mnt/archive", &line)?;
     emitter.progress("Added CIFS mount to /etc/fstab");
+
+    // Optional music share — CIFS counterpart of the NFS music block
+    // above. archiveloop's `connect-archive.sh` mounts /mnt/musicarchive
+    // from this fstab entry and `copy-music.sh` rsyncs from there into
+    // music_disk.bin. `ro` because we only ever read the share; reuses
+    // the same credentials file as the cam share (matches the bash
+    // `cifs_archive/verify-and-configure-archive.sh` flow). Without
+    // this block, CIFS installs that set MUSIC_SHARE_NAME never get
+    // a fstab entry, /mnt/musicarchive is never created, and music
+    // sync silently never runs — only NFS users hit the working path.
+    let music_share = env.get("MUSIC_SHARE_NAME", "");
+    if !music_share.is_empty() {
+        std::fs::create_dir_all("/mnt/musicarchive").context("mkdir /mnt/musicarchive")?;
+        let music_escaped = music_share.replace(' ', "\\040");
+        let music_line = format!(
+            "//{}/{} /mnt/musicarchive cifs ro,noauto,credentials={},iocharset=utf8,file_mode=0777,dir_mode=0777,vers={} 0 0",
+            server, music_escaped, creds_path, vers
+        );
+        replace_fstab_entry("cifs", "/mnt/musicarchive", &music_line)?;
+        emitter.progress("Added CIFS music mount to /etc/fstab");
+    }
     Ok(())
 }
