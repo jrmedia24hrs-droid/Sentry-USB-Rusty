@@ -36,6 +36,12 @@ pub struct CloudStatus {
     pub cloud_base_url: String,
     pub pairing_state: PairingState,
     pub pairing_error: Option<String>,
+
+    /// Set when an on-disk credentials file existed at startup but
+    /// failed to load (corrupt JSON, partial write, wrong perms, etc.).
+    /// `paired` will be `false` in this case. UI should surface this
+    /// distinctly from "never paired" — the user needs to re-pair.
+    pub credentials_load_error: Option<String>,
 }
 
 pub struct CloudStateInner {
@@ -52,6 +58,8 @@ pub struct CloudStateInner {
     pub pairing_cancel: Mutex<Option<Arc<Notify>>>,
 
     pub last_upload_error: Mutex<Option<String>>,
+
+    pub credentials_load_error: Mutex<Option<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -84,6 +92,7 @@ impl CloudStateInner {
             pairing: Mutex::new(PairingProgress::default()),
             pairing_cancel: Mutex::new(None),
             last_upload_error: Mutex::new(None),
+            credentials_load_error: Mutex::new(None),
         }
     }
 
@@ -93,7 +102,29 @@ impl CloudStateInner {
                 let mut guard = self.creds.lock().await;
                 *guard = Some(creds);
             }
-            Err(_) => {}
+            Err(e) => {
+                // Distinguish "no credentials file" (normal new install) from
+                // "file exists but won't load" (corruption, partial write,
+                // wrong perms). The latter is the failure mode where the Pi
+                // silently appears unpaired while the cloud thinks it's still
+                // paired — surface it loudly so the user knows to re-pair.
+                if std::path::Path::new(&self.credentials_path).exists() {
+                    let msg = format!("{}", e);
+                    warn!(
+                        "cloud credentials file at `{}` exists but failed to load: {}. \
+                         Pi will appear unpaired; user must re-pair.",
+                        self.credentials_path, msg,
+                    );
+                    *self.credentials_load_error.lock().await = Some(msg);
+                    self.hub.broadcast(
+                        "cloud_status_changed",
+                        &serde_json::json!({
+                            "paired": false,
+                            "reason": "credentials_load_failed",
+                        }),
+                    );
+                }
+            }
         }
     }
 
@@ -117,6 +148,7 @@ impl CloudStateInner {
             .and_then(|s| chrono::DateTime::<Utc>::from_timestamp(s, 0));
 
         let last_upload_error = self.last_upload_error.lock().await.clone();
+        let credentials_load_error = self.credentials_load_error.lock().await.clone();
 
         match creds_guard.as_ref() {
             Some(c) => CloudStatus {
@@ -132,6 +164,7 @@ impl CloudStateInner {
                 cloud_base_url: c.cloud_base_url.clone(),
                 pairing_state: pairing_guard.state,
                 pairing_error: pairing_guard.error.clone(),
+                credentials_load_error: None,
             },
             None => CloudStatus {
                 paired: false,
@@ -146,6 +179,7 @@ impl CloudStateInner {
                 cloud_base_url: self.cloud_base_url.clone(),
                 pairing_state: pairing_guard.state,
                 pairing_error: pairing_guard.error.clone(),
+                credentials_load_error,
             },
         }
     }
@@ -178,6 +212,7 @@ impl CloudStateInner {
         drop(creds_guard);
 
         *self.last_upload_error.lock().await = None;
+        *self.credentials_load_error.lock().await = None;
 
         self.hub.broadcast(
             "cloud_status_changed",
@@ -190,6 +225,8 @@ impl CloudStateInner {
         sentryusb_cloud_crypto::credentials::save_atomic(&self.credentials_path, &new_creds)?;
         let mut guard = self.creds.lock().await;
         *guard = Some(new_creds);
+        drop(guard);
+        *self.credentials_load_error.lock().await = None;
         self.hub.broadcast(
             "cloud_status_changed",
             &serde_json::json!({ "paired": true }),
@@ -211,6 +248,7 @@ impl CloudStateInner {
         drop(guard);
 
         *self.last_upload_error.lock().await = Some("revoked".to_string());
+        *self.credentials_load_error.lock().await = None;
 
         self.hub.broadcast(
             "cloud_status_changed",

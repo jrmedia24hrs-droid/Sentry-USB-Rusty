@@ -8,6 +8,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 chrono = { workspace = true }
+tracing = { workspace = true }
 
 ring = "0.17"
 

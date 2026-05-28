@@ -34,6 +34,7 @@ pub async fn get_status(State(state): State<AppState>) -> impl IntoResponse {
         "cloudBaseUrl": snap.cloud_base_url,
         "pairingState": snap.pairing_state,
         "pairingError": snap.pairing_error,
+        "credentialsLoadError": snap.credentials_load_error,
     }))
 }
 
