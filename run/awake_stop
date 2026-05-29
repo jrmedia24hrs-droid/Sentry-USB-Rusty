@@ -52,11 +52,29 @@ BLE_LOCK="/tmp/ble_radio_owner"
 # Legacy lock path used by pre-v6 awake_start. Cleaned up
 # opportunistically below so it doesn't linger as a phantom lock.
 BLE_LOCK_LEGACY="/tmp/ble_keep_awake_active"
+# Lock owner string awake_start's fallback path writes when it actually
+# stops the GATT daemon. Must match awake_start's BLE_LOCK_OWNER. The
+# telemetry daemon writes "telemetry" instead, so an owner check lets us
+# distinguish "keep-awake stopped the GATT daemon" (restore needed) from
+# "telemetry daemon holds the radio for multi-role IPC" (nothing to
+# restore — awake_start took the fast path and stopped nothing).
+BLE_LOCK_OWNER="keep_awake"
 
 ble_restore_gatt_daemon() {
   local have_lock=0
+  # Only count the lock as ours if WE (keep_awake) wrote it. On the
+  # multi-role IPC path awake_start returns early without stopping the
+  # GATT daemon or taking the lock, so the lock at $BLE_LOCK is owned by
+  # the telemetry daemon ("telemetry"). Restoring on the bare existence
+  # of that lock printed a misleading "Restoring GATT daemon" line and
+  # deleted the running daemon's radio lock — neither correct, since
+  # nothing was stopped.
   if [ -e "$BLE_LOCK" ]; then
-    have_lock=1
+    local lock_owner
+    lock_owner=$(head -n1 "$BLE_LOCK" 2>/dev/null || echo "")
+    if [ "$lock_owner" = "$BLE_LOCK_OWNER" ]; then
+      have_lock=1
+    fi
   fi
   # Treat a stale legacy lock as a held lock for restore purposes —
   # otherwise an upgrade mid-session would leave the GATT daemon down

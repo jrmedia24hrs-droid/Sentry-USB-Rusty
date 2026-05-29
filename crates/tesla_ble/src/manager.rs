@@ -59,6 +59,15 @@ const QUERY_TIMEOUT: Duration = Duration::from_secs(15);
 const RECONNECT_BACKOFF_MIN: Duration = Duration::from_millis(1_500);
 const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(30);
 
+/// Drop and rebuild the cached BLE adapter after this many consecutive
+/// connect failures. A flappy-but-recoverable link reconnects via the
+/// reused adapter (success resets the counter, so the adapter is never
+/// rebuilt), but a genuinely wedged bluez session / hci reset surfaces
+/// as sustained failures — rebuilding then gets a fresh D-Bus
+/// connection to self-heal. Bounded at one rebuild per N failures so it
+/// can't reintroduce the per-reconnect Manager leak it exists to fix.
+const ADAPTER_REBUILD_AFTER: u32 = 5;
+
 /// Seconds added to the *estimated* car clock to produce the
 /// `expires_at` field. Tesla caps this at a few minutes (commands
 /// stamped too far in the future are rejected as a replay-prevention
@@ -199,6 +208,22 @@ struct SessionState {
     /// (stale notifications, unmatched broadcasts, chunked stragglers).
     /// Each event still produced a successful query.
     framing_desync_recoveries: u32,
+    /// Cached BLE adapter (btleplug Manager + its bluez D-Bus session),
+    /// created once and reused across reconnects. The old code built a
+    /// fresh `Manager::new()` on every `ensure_connected`, opening a new
+    /// D-Bus connection each time; on a flappy link those accumulate
+    /// until root hits the D-Bus per-UID connection ceiling (~256) and
+    /// every BLE op fails with "maximum number of active connections for
+    /// UID 0 has been reached" until the daemon restarts. A dropped GATT
+    /// connection doesn't kill the adapter/session, so reusing it across
+    /// reconnects is both correct and leak-free.
+    cached_adapter: Option<btleplug::platform::Adapter>,
+    /// Consecutive `ensure_connected` failures; reset to 0 on success.
+    /// At `ADAPTER_REBUILD_AFTER` we drop `cached_adapter` so a genuinely
+    /// wedged bluez session (daemon restart, hci reset) gets rebuilt —
+    /// bounded to one rebuild per N failures so it can't reintroduce the
+    /// per-reconnect Manager leak.
+    consecutive_connect_failures: u32,
 }
 
 /// Timing-sample window for the percentiles. 100 ≈ 5-10 min of
@@ -250,6 +275,8 @@ impl PersistentSession {
             last_scan_rssi: None,
             last_peer_mac: None,
             framing_desync_recoveries: 0,
+            cached_adapter: None,
+            consecutive_connect_failures: 0,
         };
         tokio::spawn(run_session_task(state, cmd_rx));
         Self { cmd_tx }
@@ -1137,14 +1164,50 @@ async fn handle_check_pairing(state: &mut SessionState) -> Result<PairingStatus>
     }
 }
 
+/// Record one `ensure_connected` failure. After `ADAPTER_REBUILD_AFTER`
+/// in a row, drop the cached adapter so the next attempt rebuilds it —
+/// self-heals a wedged bluez session without rebuilding (and leaking a
+/// D-Bus connection) on every reconnect.
+fn note_connect_failure(state: &mut SessionState) {
+    state.consecutive_connect_failures =
+        state.consecutive_connect_failures.saturating_add(1);
+    if state.consecutive_connect_failures >= ADAPTER_REBUILD_AFTER {
+        if state.cached_adapter.take().is_some() {
+            warn!(
+                "PersistentSession: {} consecutive connect failures — \
+                 rebuilding BLE adapter handle (possible bluez restart / hci reset)",
+                state.consecutive_connect_failures
+            );
+        }
+        state.consecutive_connect_failures = 0;
+    }
+}
+
 async fn ensure_connected(state: &mut SessionState) -> Result<()> {
     if state.conn.is_some() {
         return Ok(());
     }
 
-    let adapter = scan::adapter_by_name(state.adapter_name.as_deref())
-        .await
-        .context("locating BLE adapter")?;
+    // Reuse the cached adapter (and its bluez D-Bus session) across
+    // reconnects; only build a fresh one when we don't have it yet (or
+    // after it was dropped following sustained failures). Building a new
+    // Manager per reconnect leaked D-Bus connections — see
+    // `cached_adapter`.
+    let adapter = match state.cached_adapter.clone() {
+        Some(a) => a,
+        None => match scan::adapter_by_name(state.adapter_name.as_deref()).await {
+            Ok(a) => {
+                state.cached_adapter = Some(a.clone());
+                a
+            }
+            Err(e) => {
+                note_connect_failure(state);
+                sleep(state.backoff).await;
+                state.backoff = (state.backoff * 2).min(RECONNECT_BACKOFF_MAX);
+                return Err(e).context("locating BLE adapter");
+            }
+        },
+    };
     // 30s scan window matches what the one-shot examples use; covers
     // a car waking from sleep + advertising stabilizing.
     let scan_result = match scan::scan_for_vin(&adapter, &state.vin, Duration::from_secs(30)).await
@@ -1154,6 +1217,7 @@ async fn ensure_connected(state: &mut SessionState) -> Result<()> {
             // Connect failure — back off before letting the caller
             // retry. Subsequent failures double the wait; success
             // resets it.
+            note_connect_failure(state);
             sleep(state.backoff).await;
             state.backoff = (state.backoff * 2).min(RECONNECT_BACKOFF_MAX);
             return Err(e).context("scan failed");
@@ -1168,6 +1232,7 @@ async fn ensure_connected(state: &mut SessionState) -> Result<()> {
     let conn = match Connection::open(scan_result.peripheral).await {
         Ok(c) => c,
         Err(e) => {
+            note_connect_failure(state);
             sleep(state.backoff).await;
             state.backoff = (state.backoff * 2).min(RECONNECT_BACKOFF_MAX);
             return Err(e).context("connect failed");
@@ -1176,6 +1241,7 @@ async fn ensure_connected(state: &mut SessionState) -> Result<()> {
 
     state.conn = Some(conn);
     state.backoff = RECONNECT_BACKOFF_MIN;
+    state.consecutive_connect_failures = 0;
     state.connected_at = Some(Instant::now());
     state.queries_since_connect = 0;
     state.last_scan_rssi = scan_rssi;
