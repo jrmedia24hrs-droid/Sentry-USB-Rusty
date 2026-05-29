@@ -197,8 +197,9 @@ pub async fn setup_data_drive(env: &SetupEnv, emitter: &SetupEmitter) -> Result<
         &["-F", "-L", "mutable", &p1]).await.context("mkfs.ext4 failed")?;
 
     emitter.progress(&format!("Formatting backingfiles partition (xfs) on {}...", p2));
+    // -K: skip the default full-device TRIM (slow on large media, useless on a fresh partition).
     sentryusb_shell::run_with_timeout(op_timeout, "mkfs.xfs",
-        &["-f", "-m", "reflink=1", "-L", "backingfiles", &p2]).await.context("mkfs.xfs failed")?;
+        &["-f", "-K", "-m", "reflink=1", "-L", "backingfiles", &p2]).await.context("mkfs.xfs failed")?;
 
     emitter.progress("Partition formatting complete.");
 
@@ -333,12 +334,19 @@ pub async fn setup_sd_card(env: &SetupEnv, emitter: &SetupEmitter) -> Result<boo
     // Calculate mutable inodes: ~1 per 20000 sectors of backingfiles
     let mutable_inodes = bf_num_sectors / 20000;
 
+    // -K skips mkfs.xfs's default full-device TRIM. On a large, slow SD
+    // card (1 TB on a Pi 3) discarding the backingfiles partition takes
+    // minutes and trips the 30 s default command timeout; the discard is
+    // useless on a fresh partition anyway. Bound the format with an
+    // explicit timeout so a wedged card can't hang the wizard.
+    let op_timeout = Duration::from_secs(120);
     emitter.progress(&format!("Formatting backingfiles (xfs) on {}...", bf_dev));
-    sentryusb_shell::run("mkfs.xfs", &["-f", "-m", "reflink=1", "-L", "backingfiles", &bf_dev]).await
+    sentryusb_shell::run_with_timeout(op_timeout, "mkfs.xfs",
+        &["-f", "-K", "-m", "reflink=1", "-L", "backingfiles", &bf_dev]).await
         .context("mkfs.xfs failed")?;
 
     emitter.progress(&format!("Formatting mutable (ext4) on {}...", mut_dev));
-    sentryusb_shell::run(
+    sentryusb_shell::run_with_timeout(op_timeout,
         "mkfs.ext4", &["-F", "-N", &mutable_inodes.to_string(), "-L", "mutable", &mut_dev],
     ).await.context("mkfs.ext4 failed")?;
 
