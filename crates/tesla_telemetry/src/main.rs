@@ -284,6 +284,10 @@ async fn main() -> Result<()> {
     // Same gate for sentry mode (from `state closures`): any non-Off
     // value keeps the car awake. `None` → assume on.
     let mut last_sentry_mode: Option<sample::SentryMode> = None;
+    // Throttle for the "parked but staying Active" gate diagnostic so it
+    // logs ~once/min instead of every tick. Answers the common "why
+    // won't my car sleep" question by surfacing which signal pinned us.
+    let mut last_gate_log: Option<Instant> = None;
 
     // SIGTERM handler — release the radio on shutdown so the iOS
     // GATT daemon can come back up cleanly.
@@ -355,6 +359,7 @@ async fn main() -> Result<()> {
                 &mut ble_session,
                 &mut last_charging_state,
                 &mut last_sentry_mode,
+                &mut last_gate_log,
             ) => {
                 tokio::time::sleep(sleep).await;
             }
@@ -385,6 +390,7 @@ async fn tick(
     ble_session: &mut Option<sample_ble::SessionHandle>,
     last_charging_state: &mut Option<sample::ChargingState>,
     last_sentry_mode: &mut Option<sample::SentryMode>,
+    last_gate_log: &mut Option<Instant>,
 ) -> Duration {
     let cfg = match BleConfig::load() {
         Ok(c) => c,
@@ -446,6 +452,39 @@ async fn tick(
     // quieting would leave battery_pct / sentry_mode_state stale.
     let want_quiet = car_truly_asleep || parked_confirmed;
     let in_quiet_mode = want_quiet && !actively_charging && !sentry_on;
+
+    // Diagnostic: the car is parked/asleep but we're staying Active
+    // because charging or sentry says it has a reason to be awake. This
+    // is the #1 "why won't my car sleep?" question — surface which
+    // signal pinned us Active and, crucially, whether it's a real
+    // reading or the conservative unknown-default (`None` → assume on).
+    // A persistent `[DEFAULTED]` here means Tesla isn't reporting that
+    // field over BLE (it drops optional fields), so the car can never
+    // qualify for Quiet. Throttled to ~once/min.
+    if want_quiet && !in_quiet_mode {
+        let now = Instant::now();
+        let due = last_gate_log
+            .map(|t| now.duration_since(t) >= Duration::from_secs(60))
+            .unwrap_or(true);
+        if due {
+            *last_gate_log = Some(now);
+            let sentry_src = if last_sentry_mode.is_some() {
+                "read"
+            } else {
+                "DEFAULTED: no closures reading yet"
+            };
+            let charge_src = if last_charging_state.is_some() {
+                "read"
+            } else {
+                "DEFAULTED: no charge reading yet"
+            };
+            info!(
+                "gate: parked/asleep but staying Active — sentry_on={} [{}], \
+                 actively_charging={} [{}] (car only qualifies for Quiet when both are false)",
+                sentry_on, sentry_src, actively_charging, charge_src
+            );
+        }
+    }
 
     if in_quiet_mode {
         // Sleep-safe path: acquire the radio for the brief BC call, then
@@ -868,6 +907,11 @@ async fn tick(
             persist(conn, sample);
         }
 
+        // Live snapshot of the gate inputs for the BLE card (not the DB).
+        // Reflects this tick's charge/closures polls; "Poll now" forces an
+        // Active tick, so the card shows a fresh sentry/charge read.
+        write_gate_status_file(*last_sentry_mode, *last_charging_state);
+
         // Sleep until the next sub-sampler is due (usually drive, 15s).
         let next = schedule.next_due();
         let after = Instant::now();
@@ -965,6 +1009,34 @@ fn persist(conn: &Connection, sample: Sample) {
     } else {
         debug!("inserted telemetry sample (ts={ts}, source={source})");
     }
+}
+
+/// Live snapshot file for the BLE card. Holds the latest sentry-mode and
+/// charging-state the gate is working from, so the UI can show them (and
+/// "Poll now" surfaces a fresh read). Deliberately NOT persisted to the
+/// telemetry DB — it's a transient current-state file, overwritten each
+/// Active tick. `unknown` means we haven't gotten a value from the car
+/// yet (Tesla can omit these fields), which is itself the tell for "why
+/// won't my car sleep" — the gate assumes on when it can't read them.
+const GATE_STATUS_PATH: &str = "/mutable/sentryusb-ble-gate.txt";
+
+fn write_gate_status_file(
+    sentry: Option<sample::SentryMode>,
+    charging: Option<sample::ChargingState>,
+) {
+    let sentry_s = sentry
+        .map(|s| format!("{s:?}"))
+        .unwrap_or_else(|| "unknown".into());
+    let charging_s = charging
+        .map(|c| format!("{c:?}"))
+        .unwrap_or_else(|| "unknown".into());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let body =
+        format!("sentry_mode={sentry_s}\ncharging_state={charging_s}\nupdated={now}\n");
+    let _ = std::fs::write(GATE_STATUS_PATH, body);
 }
 
 /// No-op, kept for call-site stability.

@@ -497,6 +497,34 @@ fn read_radio_owner() -> Option<String> {
 
 /// GET /api/system/ble-latest-sample
 ///
+/// Live gate snapshot the telemetry daemon writes each Active tick —
+/// the latest sentry-mode and charging-state it's gating on. Not in the
+/// DB (it's transient current-state), so the latest-sample handler reads
+/// it from this file and folds it into the response. Path mirrors
+/// `GATE_STATUS_PATH` in the tesla_telemetry daemon.
+const GATE_STATUS_PATH: &str = "/mutable/sentryusb-ble-gate.txt";
+
+/// Parse `sentry_mode` / `charging_state` out of the live gate file.
+/// Returns `(None, None)` if the daemon hasn't written it yet. A value
+/// of `"unknown"` is preserved (not nulled) — it means the daemon hasn't
+/// read that field from the car, which is exactly what the user wants to
+/// see when diagnosing "why won't my car sleep".
+fn read_gate_status() -> (Option<String>, Option<String>) {
+    let Ok(body) = std::fs::read_to_string(GATE_STATUS_PATH) else {
+        return (None, None);
+    };
+    let mut sentry = None;
+    let mut charging = None;
+    for line in body.lines() {
+        if let Some(v) = line.strip_prefix("sentry_mode=") {
+            sentry = Some(v.trim().to_string());
+        } else if let Some(v) = line.strip_prefix("charging_state=") {
+            charging = Some(v.trim().to_string());
+        }
+    }
+    (sentry, charging)
+}
+
 /// Returns the most recent row from `telemetry_samples` so the UI can
 /// show the user exactly what the Pi is pulling from the car right
 /// now. Null fields just stay null in the response — e.g. a
@@ -628,6 +656,9 @@ pub async fn ble_latest_sample(
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
 
+    // Live sentry/charge from the daemon's gate file (not the DB).
+    let (sentry_mode, charging_state) = read_gate_status();
+
     match result {
         Some((
             ts,
@@ -658,6 +689,11 @@ pub async fn ble_latest_sample(
                 "tire_rr_psi": tire_rr_psi,
                 "odometer_mi": odometer_mi,
                 "location_name": location_name,
+                // Live gate inputs (sentry mode, charging state) from the
+                // daemon's snapshot file, not the DB. "unknown" means the
+                // daemon couldn't read the field from the car.
+                "sentry_mode": sentry_mode,
+                "charging_state": charging_state,
                 "source": source,
                 // Null if we've never seen a body-controller poll. The
                 // UI uses recent body-controller-but-stale-state to

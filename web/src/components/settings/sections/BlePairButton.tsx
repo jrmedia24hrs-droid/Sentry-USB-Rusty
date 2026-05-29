@@ -78,6 +78,10 @@ interface BleLatestSample {
   tire_rr_psi?: number | null
   odometer_mi?: number | null
   location_name?: string | null
+  /** Live gate inputs from the daemon's snapshot file (not the DB).
+   *  "unknown" means the daemon couldn't read the field from the car. */
+  sentry_mode?: string | null
+  charging_state?: string | null
   source?: string
   /** Age (seconds) of the most recent body-controller poll, or null
    *  if the sampler has never done one. Body-controller polls run
@@ -1059,6 +1063,18 @@ function TelemetryOutputPanel({
           )}
           {sample.location_name && (
             <Row label="Location" value={sample.location_name} />
+          )}
+          {sample.sentry_mode && (
+            <Row
+              label="Sentry"
+              value={sample.sentry_mode === "unknown" ? "Unknown" : sample.sentry_mode}
+            />
+          )}
+          {sample.charging_state && (
+            <Row
+              label="Charging"
+              value={sample.charging_state === "unknown" ? "Unknown" : sample.charging_state}
+            />
           )}
           <Row label="Interior temp" value={fmtTemp(sample.interior_temp_c, metric)} />
           <Row label="Exterior temp" value={fmtTemp(sample.exterior_temp_c, metric)} />
