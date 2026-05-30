@@ -452,6 +452,9 @@ pub async fn get_ble_bundle(State(s): State<AppState>) -> Response {
     section(&mut out, "Car observation");
     write_observation(&mut out, now);
 
+    section(&mut out, "Quiet-mode gate inputs (live, from sampler)");
+    write_gate_state(&mut out);
+
     section(&mut out, "Sample database (last 1 hour)");
     write_sample_db_extended(&mut out, &s, now).await;
 
@@ -937,6 +940,37 @@ fn write_history_full(out: &mut String) {
 /// signal in the bundle. The disconnect log shows history; the
 /// systemctl section shows the process; this section shows the BLE
 /// link itself.
+/// The live quiet-mode gate inputs the telemetry daemon snapshots each
+/// Active tick: sentry_mode, charging_state, shift_state. The gate only
+/// drops to sleep-safe polling when parked AND not charging AND sentry
+/// off, so when a tester asks "why won't my car sleep", these three are
+/// the answer. `shift_state=Unknown`/`absent` while parked is the known
+/// wedge — the park-confirmation counter only advances on a clear gear,
+/// and Tesla doesn't always report Park as an explicit gear. Pair this
+/// with the `gate: staying Active … parked_polls=N/3` line in the
+/// sampler journal below.
+fn write_gate_state(out: &mut String) {
+    const GATE_PATH: &str = "/mutable/sentryusb-ble-gate.txt";
+    match std::fs::read_to_string(GATE_PATH) {
+        Ok(s) if s.trim().is_empty() => {
+            out.push_str("  (gate file present but empty)\n");
+        }
+        Ok(s) => {
+            for line in s.lines() {
+                out.push_str("  ");
+                out.push_str(line.trim());
+                out.push('\n');
+            }
+        }
+        Err(_) => {
+            out.push_str(
+                "  (no gate file — sampler hasn't run since this feature was added,\n  \
+                 or the sampler binary on this Pi is older than the api binary)\n",
+            );
+        }
+    }
+}
+
 fn write_live_session_status(out: &mut String) {
     const STATUS_PATH: &str = "/mutable/sentryusb-ble-status.txt";
     match std::fs::read_to_string(STATUS_PATH) {
