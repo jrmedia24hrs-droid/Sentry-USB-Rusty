@@ -8,7 +8,7 @@
 <p align="center">
   <a href="https://github.com/Sentry-Six/Sentry-USB-Rusty/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/Sentry-Six/Sentry-USB-Rusty"></a>
   <a href="https://discord.gg/9QZEzVwdnt"><img alt="Discord" src="https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white"></a>
-  <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-PolyForm%20Noncommercial%201.0.0-blue.svg"></a>
 </p>
 
 <p align="center">
@@ -161,4 +161,11 @@ A Rust rewrite of the original Go [`Scottmg1/Sentry-USB`](https://github.com/Sco
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+PolyForm Noncommercial 1.0.0 — free for any noncommercial use; commercial use
+requires a separate license. See [LICENSE](LICENSE). Some bundled shell scripts
+are derived from [TeslaUSB](https://github.com/marcone/teslausb) and remain
+under the MIT License; see [NOTICE](NOTICE) for the file-by-file breakdown.
+
+This is source-available software, not open source — commercial use is not
+permitted under this license. To inquire about a commercial license, contact
+the authors.

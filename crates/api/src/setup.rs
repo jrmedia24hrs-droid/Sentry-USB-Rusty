@@ -403,8 +403,11 @@ pub async fn test_archive(
             );
             let _ = std::fs::create_dir_all(tmp_dir);
             let src = format!("{}:{}", server, export);
+            // soft + short timeo so an unreachable export fails the probe
+            // fast rather than hanging; nolock skips NLM, v3/tcp for NAS compat.
+            let opts = "nolock,soft,timeo=50,proto=tcp,vers=3";
             let res = sentryusb_shell::run_with_timeout(
-                timeout, "mount", &["-t", "nfs", &src, tmp_dir, "-o", "nolock,soft,timeo=50,proto=tcp,vers=3"],
+                timeout, "mount", &["-t", "nfs", &src, tmp_dir, "-o", opts],
             ).await;
             if res.is_ok() {
                 let _ = sentryusb_shell::run_with_timeout(

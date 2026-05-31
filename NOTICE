@@ -1,0 +1,112 @@
+Sentry-USB-Rusty
+Copyright 2025-2026 Jhoan Romero, Scott Vandereems, and Jason Perez
+
+This product is licensed under the PolyForm Noncommercial License 1.0.0 (see
+LICENSE), EXCEPT for the third-party and derived files listed below, which
+remain under their original MIT License. The PolyForm Noncommercial terms do
+NOT apply to those files; the MIT terms in section "MIT License" below do.
+
+If a file is not listed below, it is original work of the Sentry-USB-Rusty
+authors and is covered by the PolyForm Noncommercial License 1.0.0.
+
+================================================================================
+1. TeslaUSB-derived shell scripts  --  MIT License
+================================================================================
+
+The following files are derived from the TeslaUSB project
+(https://github.com/marcone/teslausb, originally https://github.com/cimryan/teslausb)
+and remain licensed under the MIT License reproduced below. They were
+identified by diffing each file against upstream TeslaUSB; all retain
+substantial verbatim or lightly-adapted upstream content.
+
+  check.sh
+  pi-gen-sources/prepare.sh
+  setup/generic/install.sh
+  tools/debian-resizefs.sh
+  tools/resize-image.sh
+
+  run/disable_gadget.sh
+  run/enable_gadget.sh
+  run/force_sync.sh
+  run/make_snapshot.sh
+  run/manage_free_space.sh
+  run/release_snapshot.sh
+
+  run/cifs_archive/archive-clips.sh
+  run/cifs_archive/archive-is-reachable.sh
+  run/cifs_archive/connect-archive.sh
+  run/cifs_archive/disconnect-archive.sh
+  run/cifs_archive/verify-and-configure-archive.sh
+  run/nfs_archive/archive-clips.sh
+  run/nfs_archive/archive-is-reachable.sh
+  run/nfs_archive/connect-archive.sh
+  run/nfs_archive/disconnect-archive.sh
+  run/nfs_archive/verify-and-configure-archive.sh
+  run/none_archive/archive-clips.sh
+  run/none_archive/archive-is-reachable.sh
+  run/none_archive/connect-archive.sh
+  run/none_archive/disconnect-archive.sh
+  run/none_archive/verify-and-configure-archive.sh
+  run/rclone_archive/archive-clips.sh
+  run/rclone_archive/archive-is-reachable.sh
+  run/rclone_archive/connect-archive.sh
+  run/rclone_archive/disconnect-archive.sh
+  run/rclone_archive/verify-and-configure-archive.sh
+  run/rsync_archive/archive-clips.sh
+  run/rsync_archive/archive-is-reachable.sh
+  run/rsync_archive/connect-archive.sh
+  run/rsync_archive/disconnect-archive.sh
+  run/rsync_archive/verify-and-configure-archive.sh
+
+  setup/pi/configure.sh
+  setup/pi/configure-ap.sh
+  setup/pi/configure-automount.sh
+  setup/pi/configure-samba.sh
+  setup/pi/configure-ssh.sh
+  setup/pi/create-backingfiles.sh
+  setup/pi/create-backingfiles-partition.sh
+  setup/pi/envsetup.sh
+  setup/pi/make-root-fs-readonly.sh
+  setup/pi/verify-configuration.sh
+
+The "MUSIC_SHARE_NAME" rsync helpers below replace the upstream stub but
+remain under MIT alongside their sibling archive scripts:
+
+  run/cifs_archive/copy-music.sh
+  run/nfs_archive/copy-music.sh
+  run/rsync_archive/copy-music.sh
+
+================================================================================
+2. Vendored npm dependencies  --  see web/node_modules
+================================================================================
+
+Files under web/node_modules/ are third-party packages installed by npm and
+are not part of this project's source. Each carries its own license (e.g.
+web/node_modules/flatted is ISC). node_modules should be excluded from
+distribution; build from package.json / package-lock.json instead.
+
+================================================================================
+MIT License  (applies to the TeslaUSB-derived files in section 1)
+================================================================================
+
+Copyright (c) 2018 cimryan
+Copyright (c) TeslaUSB contributors
+Copyright (c) 2025-2026 Jhoan Romero and Scott Vandereems
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
